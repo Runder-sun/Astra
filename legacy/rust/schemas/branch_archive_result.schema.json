@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "branch_archive_result.schema.json",
+  "title": "BranchArchiveResult",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "branch_id",
+    "batch_id",
+    "status",
+    "reason",
+    "archived_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "branch_archive_result.v1" },
+    "conformance_line": { "const": "M9.loser_cleanup" },
+    "branch_id": { "type": "string", "minLength": 1 },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "status": { "const": "archived" },
+    "reason": { "type": "string", "minLength": 1 },
+    "archived_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

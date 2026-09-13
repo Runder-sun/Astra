@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "remote_projection_snapshot.schema.json",
+  "title": "RemoteProjectionSnapshot",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_id",
+    "projection_state",
+    "regeneration_policy",
+    "runtime_descriptor",
+    "envelope_projection",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "projection_state": {
+      "type": "string",
+      "minLength": 1
+    },
+    "regeneration_policy": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime_descriptor": {
+      "$ref": "#/$defs/session_runtime_descriptor"
+    },
+    "envelope_projection": {
+      "$ref": "#/$defs/session_envelope_projection_v1"
+    },
+    "updated_at": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "session_runtime_descriptor": {
+      "title": "SessionRuntimeDescriptor",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "active_session_id",
+        "runtime_state",
+        "workspace_root"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "runtime_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "permission_mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "session_envelope_projection_v1": {
+      "title": "SessionEnvelopeProjectionV1",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "projection_id",
+        "project_id",
+        "source",
+        "active_session_id"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projection_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

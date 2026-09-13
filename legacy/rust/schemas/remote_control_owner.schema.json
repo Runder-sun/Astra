@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "remote_control_owner.schema.json",
+  "title": "RemoteControlOwner",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_id",
+    "owner_state",
+    "owner_id",
+    "control_lease",
+    "ownership_epoch",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "owner_state": {
+      "type": "string",
+      "minLength": 1
+    },
+    "owner_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "control_lease": {
+      "$ref": "#/$defs/control_lease"
+    },
+    "ownership_epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "updated_at": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "control_lease": {
+      "title": "ControlLease",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "lease_id",
+        "project_id",
+        "owner_id",
+        "lease_state",
+        "terminal_scope",
+        "expires_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "terminal_scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expires_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

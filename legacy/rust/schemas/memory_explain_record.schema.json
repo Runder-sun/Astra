@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memory_explain_record.schema.json",
+  "title": "MemoryExplainRecord",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "canonical_path",
+    "record_id",
+    "status",
+    "injection_decision",
+    "recall_reason",
+    "matched_via",
+    "source_refs",
+    "support_spans",
+    "pointer_hydration",
+    "confidence",
+    "superseded_by",
+    "contested_by",
+    "invalidation_reason",
+    "usage_count"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "conformance_line": { "type": "string", "const": "M8.memory_explain" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "record_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["candidate", "supported", "trusted", "contested", "superseded", "invalidated", "expired"]
+    },
+    "injection_decision": {
+      "type": "string",
+      "enum": ["auto_inject_allowed", "explain_visible_only"]
+    },
+    "recall_reason": { "type": "string", "minLength": 1 },
+    "matched_via": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "source_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "support_spans": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "pointer_hydration": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "superseded_by": { "type": "string" },
+    "contested_by": { "type": "string" },
+    "invalidation_reason": { "type": "string" },
+    "usage_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

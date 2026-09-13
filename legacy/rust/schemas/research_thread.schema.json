@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_thread.schema.json",
+  "title": "ResearchThread",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "thread_id",
+    "project_id",
+    "title",
+    "mission_frame_ref",
+    "active_stage_execution_id",
+    "active_deliberation_span_id",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_thread.v1" },
+    "conformance_line": { "const": "M10.research_runtime" },
+    "thread_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "mission_frame_ref": { "type": ["string", "null"] },
+    "active_stage_execution_id": { "type": ["string", "null"] },
+    "active_deliberation_span_id": { "type": ["string", "null"] },
+    "status": { "enum": ["active", "awaiting_gate", "archived", "abandoned"] },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

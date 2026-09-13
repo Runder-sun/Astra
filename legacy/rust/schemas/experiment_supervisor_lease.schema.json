@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment_supervisor_lease.schema.json",
+  "title": "ExperimentSupervisorLease",
+  "type": "object",
+  "required": [
+    "lease_id",
+    "run_id",
+    "owner_agent_id",
+    "state",
+    "claimed_at",
+    "heartbeat_at",
+    "stale_after_sec",
+    "pending_wake_count",
+    "last_summary"
+  ],
+  "properties": {
+    "lease_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "owner_agent_id": { "type": "string", "minLength": 1 },
+    "state": { "enum": ["active", "stale", "released", "reclaimed"] },
+    "claimed_at": { "type": "string", "minLength": 1 },
+    "heartbeat_at": { "type": "string", "minLength": 1 },
+    "stale_after_sec": { "type": "integer", "minimum": 1 },
+    "pending_wake_count": { "type": "integer", "minimum": 0 },
+    "last_summary": { "type": "string" },
+    "reclaimed_from": { "type": "string" }
+  },
+  "additionalProperties": false
+}

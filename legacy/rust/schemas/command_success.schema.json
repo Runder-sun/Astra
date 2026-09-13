@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "command_success.schema.json",
+  "title": "CommandSuccess",
+  "type": "object",
+  "required": ["ok", "command"],
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "command": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "data": {}
+  },
+  "additionalProperties": false
+}

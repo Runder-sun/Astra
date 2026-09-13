@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_publication_gate.schema.json",
+  "title": "SkillPublicationGate",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "gate_id",
+    "envelope_id",
+    "canonicality_policy",
+    "human_gate_required",
+    "human_gate_approved",
+    "decision"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "gate_id": { "type": "string", "minLength": 1 },
+    "envelope_id": { "type": "string", "minLength": 1 },
+    "canonicality_policy": { "type": "string", "minLength": 1 },
+    "human_gate_required": { "type": "boolean" },
+    "human_gate_approved": { "type": "boolean" },
+    "decision": { "enum": ["inspect", "execute", "reject"] },
+    "decided_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,9 @@
+{
+  "schema_version": "agent_tool_policy.v1",
+  "allowed_tools": [
+    "read_file",
+    "list_files",
+    "search",
+    "write_file"
+  ]
+}

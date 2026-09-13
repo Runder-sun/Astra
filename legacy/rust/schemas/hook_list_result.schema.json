@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hook_list_result.schema.json",
+  "title": "HookListResult",
+  "type": "object",
+  "required": ["hooks", "total_count"],
+  "properties": {
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["hook_id", "owner_plugin_id", "trigger", "source_path", "enabled"],
+        "properties": {
+          "hook_id": { "type": "string", "minLength": 1 },
+          "owner_plugin_id": { "type": "string", "minLength": 1 },
+          "trigger": { "type": "string", "minLength": 1 },
+          "source_path": { "type": "string", "minLength": 1 },
+          "enabled": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "total_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_evolution_candidate.schema.json",
+  "title": "SkillEvolutionCandidate",
+  "type": "object",
+  "required": ["schema_version", "conformance_line", "canonical_path", "retention_policy", "atomic_write_policy", "candidate_id", "cluster_id", "project_id", "skill_id", "title", "category", "trigger", "skill_artifact_path", "source_memory_ids", "support_refs", "verification_status", "publication_status", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": { "const": "skill.evolution_candidate.v1" },
+    "conformance_line": { "const": "M16.skill_evolution_candidate" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "atomic_write_policy": { "type": "string", "minLength": 1 },
+    "candidate_id": { "type": "string", "minLength": 1 },
+    "cluster_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "skill_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "category": { "type": "string", "minLength": 1 },
+    "trigger": { "type": "string", "minLength": 1 },
+    "skill_artifact_path": { "type": "string", "minLength": 1 },
+    "source_memory_ids": { "type": "array", "minItems": 2, "items": { "type": "string", "minLength": 1 } },
+    "support_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "verification_status": { "enum": ["pending", "verified", "rejected"] },
+    "publication_status": { "enum": ["not_submitted", "submitted_to_m11_governance"] },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

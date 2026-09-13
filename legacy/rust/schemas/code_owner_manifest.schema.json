@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "code_owner_manifest.schema.json",
+  "title": "CodeOwnerManifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source",
+    "active_runtime_root",
+    "active_command_registry",
+    "active_tool_registry",
+    "active_schema_registry",
+    "active_provider_layer",
+    "active_session_layer",
+    "legacy_paths",
+    "forbidden_duplicate_modules"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "active_runtime_root": { "type": "string" },
+    "active_command_registry": { "type": "string" },
+    "active_tool_registry": { "type": "string" },
+    "active_schema_registry": { "type": "string" },
+    "active_provider_layer": { "type": "string" },
+    "active_session_layer": { "type": "string" },
+    "legacy_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "forbidden_duplicate_modules": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false
+}

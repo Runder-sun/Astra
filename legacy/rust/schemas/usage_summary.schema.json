@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "usage_summary.schema.json",
+  "title": "UsageSummary",
+  "type": "object",
+  "required": [
+    "scope",
+    "input_tokens",
+    "output_tokens",
+    "tool_calls",
+    "estimated_cost",
+    "accounting_quality"
+  ],
+  "properties": {
+    "scope": { "type": "string" },
+    "input_tokens": { "type": "integer" },
+    "output_tokens": { "type": "integer" },
+    "tool_calls": { "type": "integer" },
+    "estimated_cost": { "type": "string" },
+    "accounting_quality": { "type": "string" }
+  },
+  "additionalProperties": false
+}

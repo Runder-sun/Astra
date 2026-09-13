@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "interactive_launch_result.schema.json",
+  "title": "InteractiveLaunchResult",
+  "type": "object",
+  "required": [
+    "session_id",
+    "project_id",
+    "workspace_root",
+    "preflight",
+    "launch_disposition",
+    "interactive_eligible"
+  ],
+  "properties": {
+    "session_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "preflight": { "$ref": "runtime_preflight_report.schema.json" },
+    "project_trace": { "type": "object" },
+    "profile_trace": { "$ref": "profile_resolution_trace.schema.json" },
+    "launch_disposition": { "type": "string", "minLength": 1 },
+    "interactive_eligible": { "type": "boolean" },
+    "reused_session_id": { "type": "string" }
+  },
+  "additionalProperties": false
+}

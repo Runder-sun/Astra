@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "canonicality_audit_report.schema.json",
+  "title": "CanonicalityAuditReport",
+  "type": "object",
+  "required": [
+    "ok",
+    "project_id",
+    "workspace_root",
+    "audit_mode",
+    "git_state",
+    "canonical_surface",
+    "code_owners",
+    "canonical_lineage",
+    "duplicate_active_docs",
+    "stale_docs",
+    "ambiguous_code_owners",
+    "untracked_public_files",
+    "orphan_generated_files",
+    "multiple_latest_candidates",
+    "stale_lineage_refs",
+    "superseded_public_artifacts",
+    "multiple_current_lineage_artifacts",
+    "stale_readme_claims",
+    "cleanup_proposals",
+    "blocking_violations"
+  ],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "project_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "audit_mode": { "type": "string", "minLength": 1 },
+    "git_state": { "$ref": "#/$defs/gitStateSnapshot" },
+    "canonical_surface": { "$ref": "#/$defs/canonicalSurfaceManifest" },
+    "code_owners": { "$ref": "#/$defs/codeOwnerManifest" },
+    "canonical_lineage": { "$ref": "#/$defs/canonicalLineageManifest" },
+    "duplicate_active_docs": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "stale_docs": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "ambiguous_code_owners": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "untracked_public_files": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "orphan_generated_files": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "multiple_latest_candidates": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "stale_lineage_refs": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "superseded_public_artifacts": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "multiple_current_lineage_artifacts": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "stale_readme_claims": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } },
+    "cleanup_proposals": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "blocking_violations": { "type": "array", "items": { "$ref": "#/$defs/auditRecord" } }
+  },
+  "$defs": {
+    "gitWorktreeRecord": {
+      "type": "object",
+      "required": ["path", "branch", "head_commit"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "branch": { "type": "string" },
+        "head_commit": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "gitStateSnapshot": {
+      "type": "object",
+      "required": [
+        "is_repository",
+        "workspace_root",
+        "branch",
+        "head_commit",
+        "base_branch",
+        "merge_base",
+        "dirty_files",
+        "staged_files",
+        "untracked_files",
+        "worktrees",
+        "ahead_count",
+        "behind_count"
+      ],
+      "properties": {
+        "is_repository": { "type": "boolean" },
+        "workspace_root": { "type": "string", "minLength": 1 },
+        "branch": { "type": "string" },
+        "head_commit": { "type": "string" },
+        "base_branch": { "type": "string" },
+        "merge_base": { "type": "string" },
+        "dirty_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "staged_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "untracked_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "worktrees": { "type": "array", "items": { "$ref": "#/$defs/gitWorktreeRecord" } },
+        "ahead_count": { "type": ["integer", "null"], "minimum": 0 },
+        "behind_count": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "canonicalSurfaceManifest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "source",
+        "active_status_doc",
+        "active_architecture_doc",
+        "active_implementation_plan",
+        "active_proof_packet",
+        "active_code_roots",
+        "active_schema_roots",
+        "archive_roots",
+        "external_surface_files",
+        "superseded_paths",
+        "forbidden_public_patterns"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "active_status_doc": { "type": "string" },
+        "active_architecture_doc": { "type": "string" },
+        "active_implementation_plan": { "type": "string" },
+        "active_proof_packet": { "type": "string" },
+        "active_code_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "active_schema_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "archive_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "external_surface_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "superseded_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "forbidden_public_patterns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "additionalProperties": false
+    },
+    "codeOwnerManifest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "source",
+        "active_runtime_root",
+        "active_command_registry",
+        "active_tool_registry",
+        "active_schema_registry",
+        "active_provider_layer",
+        "active_session_layer",
+        "legacy_paths",
+        "forbidden_duplicate_modules"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "active_runtime_root": { "type": "string" },
+        "active_command_registry": { "type": "string" },
+        "active_tool_registry": { "type": "string" },
+        "active_schema_registry": { "type": "string" },
+        "active_provider_layer": { "type": "string" },
+        "active_session_layer": { "type": "string" },
+        "legacy_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "forbidden_duplicate_modules": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "additionalProperties": false
+    },
+    "canonicalLineageNode": {
+      "type": "object",
+      "required": [
+        "artifact_id",
+        "family",
+        "role",
+        "path",
+        "status",
+        "generation",
+        "derived_from",
+        "evidence_refs"
+      ],
+      "properties": {
+        "artifact_id": { "type": "string", "minLength": 1 },
+        "family": { "type": "string", "minLength": 1 },
+        "role": { "type": "string" },
+        "path": { "type": "string" },
+        "status": { "type": "string", "minLength": 1 },
+        "generation": { "type": "string" },
+        "derived_from": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "evidence_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "additionalProperties": false
+    },
+    "canonicalLineageManifest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "source",
+        "current_generation",
+        "policy",
+        "nodes"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "current_generation": { "type": "string", "minLength": 1 },
+        "policy": { "type": "string", "minLength": 1 },
+        "nodes": { "type": "array", "items": { "$ref": "#/$defs/canonicalLineageNode" } }
+      },
+      "additionalProperties": false
+    },
+    "auditRecord": {
+      "type": "object",
+      "required": ["violation_type", "path", "detail", "severity", "recommended_action"],
+      "properties": {
+        "violation_type": { "type": "string", "minLength": 1 },
+        "path": { "type": "string" },
+        "detail": { "type": "string", "minLength": 1 },
+        "severity": { "type": "string", "minLength": 1 },
+        "recommended_action": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

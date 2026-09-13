@@ -1,0 +1,373 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smoke_result.schema.json",
+  "title": "SmokeResult",
+  "type": "object",
+  "required": ["overall_status", "preflight", "source_mutation_free"],
+  "properties": {
+    "overall_status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "preflight": {
+      "$ref": "#/$defs/runtimePreflightReport"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/doctorCheck"
+      }
+    },
+    "provider_trace": {
+      "$ref": "#/$defs/providerResolutionTrace"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "turn_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_log_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "transcript_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_mutation_free": {
+      "type": "boolean"
+    },
+    "mutated_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "doctorCheck": {
+      "type": "object",
+      "required": ["name", "status"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtimePreflightReport": {
+      "type": "object",
+      "required": ["overall_status", "ready"],
+      "properties": {
+        "overall_status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_trace": {
+          "$ref": "#/$defs/projectResolutionTrace"
+        },
+        "provider_status": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/doctorCheck"
+          }
+        },
+        "auth_status": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/doctorCheck"
+          }
+        },
+        "plugin_status": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/doctorCheck"
+          }
+        },
+        "hook_status": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/doctorCheck"
+          }
+        },
+        "mcp_status": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/doctorCheck"
+          }
+        },
+        "degraded_features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "recovery_hints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "ready": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerResolutionTrace": {
+      "type": "object",
+      "required": [
+        "resolved_provider",
+        "resolved_model",
+        "routed_by_prefix",
+        "degraded",
+        "sources"
+      ],
+      "properties": {
+        "requested_model": {
+          "type": "string"
+        },
+        "requested_provider": {
+          "type": "string"
+        },
+        "model_alias_applied": {
+          "type": "string"
+        },
+        "routed_by_prefix": {
+          "type": "boolean"
+        },
+        "resolved_provider": {
+          "type": "string"
+        },
+        "resolved_model": {
+          "type": "string"
+        },
+        "resolution_reason": {
+          "type": "string"
+        },
+        "degraded": {
+          "type": "boolean"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sources": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "auth_status": {
+          "type": "string"
+        },
+        "auth_source": {
+          "type": "string"
+        },
+        "auth_env_var": {
+          "type": "string"
+        },
+        "auth_shape": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "base_url_source": {
+          "type": "string"
+        },
+        "catalog_source": {
+          "type": "string"
+        },
+        "supported_models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "api_surface": {
+          "type": "string"
+        },
+        "api_surface_source": {
+          "type": "string"
+        },
+        "responses_tool_schema": {
+          "type": "string"
+        },
+        "responses_tool_schema_source": {
+          "type": "string"
+        },
+        "chat_completion_streaming": {
+          "type": "boolean"
+        },
+        "chat_completion_streaming_source": {
+          "type": "string"
+        },
+        "degraded_features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectResolutionTrace": {
+      "type": "object",
+      "required": ["resolution_source", "resolution_status"],
+      "properties": {
+        "requested_project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_project": {
+          "$ref": "#/$defs/projectRegistryEntry"
+        },
+        "current_pointer": {
+          "$ref": "#/$defs/currentProjectPointer"
+        },
+        "candidate_projects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/projectRegistryEntry"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectRegistryEntry": {
+      "type": "object",
+      "required": [
+        "project_id",
+        "workspace_root",
+        "workspace_hash",
+        "data_dir",
+        "last_accessed_at",
+        "init_state",
+        "active_session_id",
+        "open_branch_count",
+        "repo_health"
+      ],
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "data_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_accessed_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "init_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_session_id": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "open_branch_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "repo_health": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "currentProjectPointer": {
+      "type": "object",
+      "required": ["project_id", "workspace_root", "updated_at"],
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "repo_cleanup_proposal.schema.json",
+  "title": "RepoCleanupProposal",
+  "type": "object",
+  "required": [
+    "plan_id",
+    "dry_run",
+    "fingerprint",
+    "rollback_snapshot_ref",
+    "git_governance",
+    "proposed_actions",
+    "applied_actions",
+    "review_gates"
+  ],
+  "properties": {
+    "plan_id": { "type": "string", "minLength": 1 },
+    "dry_run": { "type": "boolean" },
+    "fingerprint": { "type": "string" },
+    "rollback_snapshot_ref": { "type": "string", "minLength": 1 },
+    "git_governance": { "$ref": "#/$defs/git_governance" },
+    "proposed_actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "applied_actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "review_gates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/gate" }
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "object",
+      "required": ["action_id", "action_type", "family", "target_path", "rationale"],
+      "properties": {
+        "action_id": { "type": "string", "minLength": 1 },
+        "action_type": { "type": "string", "minLength": 1 },
+        "family": { "type": "string", "minLength": 1 },
+        "target_path": { "type": "string", "minLength": 1 },
+        "destination_path": { "type": "string" },
+        "git_effect": { "type": "string" },
+        "rationale": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "gate": {
+      "type": "object",
+      "required": ["gate_id", "status", "detail"],
+      "properties": {
+        "gate_id": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "git_governance": {
+      "type": "object",
+      "required": [
+        "authority",
+        "workspace_root",
+        "is_repository",
+        "head_commit_before",
+        "branch_before",
+        "dirty_files_before",
+        "staged_files_before",
+        "untracked_files_before",
+        "expected_tracked_deletions",
+        "ignored_rollback_roots",
+        "post_apply_dirty_files",
+        "post_apply_staged_files",
+        "post_apply_untracked_files",
+        "commit_required",
+        "recommended_commit_message"
+      ],
+      "properties": {
+        "authority": { "const": "git_worktree_diff_is_canonical_cleanup_record" },
+        "workspace_root": { "type": "string", "minLength": 1 },
+        "is_repository": { "type": "boolean" },
+        "head_commit_before": { "type": "string" },
+        "branch_before": { "type": "string" },
+        "dirty_files_before": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "staged_files_before": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "untracked_files_before": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "expected_tracked_deletions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "ignored_rollback_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "post_apply_dirty_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "post_apply_staged_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "post_apply_untracked_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "commit_required": { "type": "boolean" },
+        "recommended_commit_message": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

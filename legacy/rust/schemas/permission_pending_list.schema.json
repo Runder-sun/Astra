@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "permission_pending_list.schema.json",
+  "title": "PermissionPendingList",
+  "type": "object",
+  "required": [
+    "requests",
+    "total_count"
+  ],
+  "properties": {
+    "requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "request_id",
+          "status"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "session_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "turn_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tool_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "permission_mode": {
+            "type": "string",
+            "enum": ["read-only", "workspace-write", "danger-full-access"]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "requested_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expires_at_ms": {
+            "type": ["integer", "null"],
+            "minimum": 0
+          },
+          "tool_input": {
+            "type": "object"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending"]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false
+}

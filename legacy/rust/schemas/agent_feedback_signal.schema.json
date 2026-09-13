@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_feedback_signal.schema.json",
+  "title": "AgentFeedbackSignal",
+  "type": "object",
+  "required": ["schema_version", "conformance_line", "canonical_path", "retention_policy", "atomic_write_policy", "signal_id", "signal_kind", "source_id", "target_lane", "polarity", "weight", "authority_boundary", "evidence_refs", "created_at"],
+  "properties": {
+    "schema_version": { "const": "feedback.agent_signal.v1" },
+    "conformance_line": { "const": "M18.feedback_signal" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "atomic_write_policy": { "type": "string", "minLength": 1 },
+    "signal_id": { "type": "string", "minLength": 1 },
+    "signal_kind": { "enum": ["memory_adoption", "skill_verification", "verifier_outcome"] },
+    "source_id": { "type": "string", "minLength": 1 },
+    "target_lane": { "type": "string", "minLength": 1 },
+    "polarity": { "enum": ["positive", "negative"] },
+    "weight": { "type": "number" },
+    "authority_boundary": { "const": "advisory_only" },
+    "evidence_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

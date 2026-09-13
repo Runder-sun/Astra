@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime_feature_status.schema.json",
+  "title": "RuntimeFeatureStatus",
+  "type": "object",
+  "required": [
+    "feature_id",
+    "feature_kind",
+    "status"
+  ],
+  "properties": {
+    "feature_kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "feature_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ready", "pending", "degraded", "blocked", "disabled"]
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error_code": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error_message": {
+      "type": "string",
+      "minLength": 1
+    },
+    "actionable_hint": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false
+}

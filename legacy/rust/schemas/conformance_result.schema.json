@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "conformance_result.schema.json",
+  "title": "ConformanceResult",
+  "type": "object",
+  "required": [
+    "scope",
+    "execution_mode",
+    "passed_families",
+    "failed_families",
+    "failure_refs"
+  ],
+  "properties": {
+    "scope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "execution_mode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "passed_families": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "failed_families": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "failure_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "additionalProperties": false
+}

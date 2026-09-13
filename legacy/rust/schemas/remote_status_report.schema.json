@@ -1,0 +1,1171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "remote_status_report.schema.json",
+  "title": "RemoteStatusReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_id",
+    "workspace_root",
+    "remote_ready",
+    "machine_identity",
+    "client_identity",
+    "binding",
+    "cursor",
+    "control_owner",
+    "machine_metadata",
+    "daemon_state",
+    "capability_matrix",
+    "offline_action_policy",
+    "switch_policy",
+    "feature_advertisement",
+    "projection",
+    "terminal_lease",
+    "lease",
+    "projection_regenerated",
+    "revocation_reason",
+    "revoked_at",
+    "workbench"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "remote_ready": {
+      "type": "boolean"
+    },
+    "machine_identity": {
+      "$ref": "#/$defs/machine_identity"
+    },
+    "client_identity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/remote_client_identity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "binding": {
+      "$ref": "#/$defs/remote_binding"
+    },
+    "cursor": {
+      "$ref": "#/$defs/remote_cursor"
+    },
+    "control_owner": {
+      "$ref": "#/$defs/remote_control_owner"
+    },
+    "machine_metadata": {
+      "$ref": "#/$defs/remote_machine_metadata"
+    },
+    "daemon_state": {
+      "$ref": "#/$defs/remote_daemon_state"
+    },
+    "capability_matrix": {
+      "$ref": "#/$defs/remote_capability_matrix"
+    },
+    "offline_action_policy": {
+      "$ref": "#/$defs/offline_action_policy"
+    },
+    "switch_policy": {
+      "$ref": "#/$defs/local_remote_switch_policy"
+    },
+    "feature_advertisement": {
+      "$ref": "#/$defs/remote_feature_advertisement"
+    },
+    "projection": {
+      "$ref": "#/$defs/remote_projection_snapshot"
+    },
+    "terminal_lease": {
+      "$ref": "#/$defs/remote_terminal_lease"
+    },
+    "lease": {
+      "$ref": "#/$defs/control_lease"
+    },
+    "projection_regenerated": {
+      "type": "boolean"
+    },
+    "revocation_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "revoked_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workbench": {
+      "$ref": "#/$defs/remote_workbench_projection"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "machine_identity": {
+      "title": "MachineIdentity",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "machine_id",
+        "status",
+        "key_algorithm",
+        "public_key_ref",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key_algorithm": {
+          "type": "string"
+        },
+        "public_key_ref": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_client_identity": {
+      "title": "RemoteClientIdentity",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "client_id",
+        "status",
+        "client_type",
+        "paired_at",
+        "machine_id"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "paired_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revoked_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_binding": {
+      "title": "RemoteBinding",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "workspace_root",
+        "status",
+        "binding_state",
+        "client_id",
+        "machine_id",
+        "scope",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_cursor": {
+      "title": "RemoteCursor",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "cursor_id",
+        "project_id",
+        "cursor_state",
+        "last_event_seq",
+        "ownership_epoch",
+        "replay_token",
+        "replay_policy",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cursor_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cursor_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_event_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ownership_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replay_token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "replay_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_control_owner": {
+      "title": "RemoteControlOwner",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "owner_state",
+        "owner_id",
+        "control_lease",
+        "ownership_epoch",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "control_lease": {
+          "$ref": "#/$defs/control_lease"
+        },
+        "ownership_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "$defs": {
+        "control_lease": {
+          "title": "ControlLease",
+          "type": "object",
+          "required": [
+            "schema_version",
+            "lease_id",
+            "project_id",
+            "owner_id",
+            "lease_state",
+            "terminal_scope",
+            "expires_at"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "lease_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "project_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "owner_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "lease_state": {
+              "type": "string",
+              "minLength": 1
+            },
+            "terminal_scope": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expires_at": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "remote_machine_metadata": {
+      "title": "RemoteMachineMetadata",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "machine_id",
+        "display_name",
+        "last_known_state",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_known_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_daemon_state": {
+      "title": "RemoteDaemonState",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "machine_id",
+        "daemon_state",
+        "last_shutdown_state",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "daemon_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_shutdown_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_capability_matrix": {
+      "title": "RemoteCapabilityMatrix",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "machine",
+        "project",
+        "session"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine": {
+          "$ref": "#/$defs/remote_capability_set"
+        },
+        "project": {
+          "$ref": "#/$defs/remote_capability_set"
+        },
+        "session": {
+          "$ref": "#/$defs/remote_capability_set"
+        }
+      },
+      "additionalProperties": false,
+      "$defs": {
+        "remote_capability_set": {
+          "title": "RemoteCapabilitySet",
+          "type": "object",
+          "required": [
+            "schema_version",
+            "scope",
+            "capabilities"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "offline_action_policy": {
+      "title": "OfflineActionPolicy",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "default_policy",
+        "allowed_actions",
+        "rejected_actions"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "default_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowed_actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rejected_actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "local_remote_switch_policy": {
+      "title": "LocalRemoteSwitchPolicy",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "active_plane",
+        "switch_policy",
+        "local_authority"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_plane": {
+          "type": "string",
+          "minLength": 1
+        },
+        "switch_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "local_authority": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_feature_advertisement": {
+      "title": "RemoteFeatureAdvertisement",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "substrate",
+        "relay_transport",
+        "attach",
+        "handoff",
+        "takeover",
+        "notify",
+        "permission_response",
+        "message_steering",
+        "workbench",
+        "revocation"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "substrate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "relay_transport": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attach": {
+          "type": "string",
+          "minLength": 1
+        },
+        "handoff": {
+          "type": "string",
+          "minLength": 1
+        },
+        "takeover": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notify": {
+          "type": "string",
+          "minLength": 1
+        },
+        "permission_response": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message_steering": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workbench": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revocation": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_projection_snapshot": {
+      "title": "RemoteProjectionSnapshot",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "projection_state",
+        "regeneration_policy",
+        "runtime_descriptor",
+        "envelope_projection",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projection_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "regeneration_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtime_descriptor": {
+          "$ref": "#/$defs/session_runtime_descriptor"
+        },
+        "envelope_projection": {
+          "$ref": "#/$defs/session_envelope_projection_v1"
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "$defs": {
+        "session_runtime_descriptor": {
+          "title": "SessionRuntimeDescriptor",
+          "type": "object",
+          "required": [
+            "schema_version",
+            "project_id",
+            "active_session_id",
+            "runtime_state",
+            "workspace_root"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "project_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "active_session_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "runtime_state": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reasoning_effort": {
+              "type": "string",
+              "minLength": 1
+            },
+            "permission_mode": {
+              "type": "string",
+              "minLength": 1
+            },
+            "branch": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace_root": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "session_envelope_projection_v1": {
+          "title": "SessionEnvelopeProjectionV1",
+          "type": "object",
+          "required": [
+            "schema_version",
+            "projection_id",
+            "project_id",
+            "source",
+            "active_session_id"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "projection_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "project_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "source": {
+              "type": "string",
+              "minLength": 1
+            },
+            "active_session_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "remote_terminal_lease": {
+      "title": "RemoteTerminalLease",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "terminal_lease_id",
+        "lease_state",
+        "policy"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "terminal_lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_capability_set": {
+      "title": "RemoteCapabilitySet",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "scope",
+        "capabilities"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "control_lease": {
+      "title": "ControlLease",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "lease_id",
+        "project_id",
+        "owner_id",
+        "lease_state",
+        "terminal_scope",
+        "expires_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "terminal_scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expires_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_workbench_projection": {
+      "title": "RemoteWorkbenchProjection",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "source",
+        "authoritative",
+        "updated_at",
+        "transport",
+        "sections",
+        "permissions",
+        "reviews",
+        "artifacts",
+        "memory",
+        "branches"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authoritative": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "transport": {
+          "$ref": "#/$defs/remote_workbench_transport"
+        },
+        "sections": {
+          "$ref": "#/$defs/remote_workbench_sections"
+        },
+        "permissions": {
+          "$ref": "#/$defs/remote_workbench_permission_summary"
+        },
+        "reviews": {
+          "$ref": "#/$defs/remote_workbench_count_summary"
+        },
+        "artifacts": {
+          "$ref": "#/$defs/remote_workbench_count_summary"
+        },
+        "memory": {
+          "$ref": "#/$defs/remote_workbench_count_summary"
+        },
+        "branches": {
+          "$ref": "#/$defs/remote_workbench_count_summary"
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_workbench_transport": {
+      "title": "RemoteWorkbenchTransport",
+      "type": "object",
+      "required": [
+        "mode",
+        "authority"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authority": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_workbench_sections": {
+      "title": "RemoteWorkbenchSections",
+      "type": "object",
+      "required": [
+        "project_status",
+        "sessions",
+        "permissions",
+        "reviews",
+        "artifacts",
+        "memory",
+        "branches"
+      ],
+      "properties": {
+        "project_status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessions": {
+          "type": "string",
+          "minLength": 1
+        },
+        "permissions": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviews": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifacts": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branches": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_workbench_permission_summary": {
+      "title": "RemoteWorkbenchPermissionSummary",
+      "type": "object",
+      "required": [
+        "pending_count",
+        "pending"
+      ],
+      "properties": {
+        "pending_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/remote_workbench_permission_request"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_workbench_permission_request": {
+      "title": "RemoteWorkbenchPermissionRequest",
+      "type": "object",
+      "required": [
+        "request_id",
+        "session_id",
+        "tool_name",
+        "target_path",
+        "permission_mode"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission_mode": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_workbench_count_summary": {
+      "title": "RemoteWorkbenchCountSummary",
+      "type": "object",
+      "required": [
+        "status",
+        "count"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "session_runtime_descriptor": {
+      "title": "SessionRuntimeDescriptor",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "active_session_id",
+        "runtime_state",
+        "workspace_root"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "runtime_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "permission_mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "session_envelope_projection_v1": {
+      "title": "SessionEnvelopeProjectionV1",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "projection_id",
+        "project_id",
+        "source",
+        "active_session_id"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projection_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

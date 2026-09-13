@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_output_publish_result.schema.json",
+  "title": "SkillOutputPublishResult",
+  "type": "object",
+  "required": [
+    "publication_state",
+    "published_envelope",
+    "publication_gate",
+    "artifact_family",
+    "canonical_surface_path"
+  ],
+  "properties": {
+    "publication_state": { "enum": ["candidate", "public_latest", "superseded"] },
+    "published_envelope": { "type": "object" },
+    "publication_gate": { "type": "object" },
+    "artifact_family": { "type": "object" },
+    "canonical_surface_path": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

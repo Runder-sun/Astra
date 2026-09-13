@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "search_batch_record.schema.json",
+  "title": "SearchBatchRecord",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "batch_id",
+    "project_id",
+    "objective",
+    "strategy",
+    "max_branches",
+    "base_commit",
+    "status",
+    "budget",
+    "branch_runs",
+    "lineage_path",
+    "created_at",
+    "canonicality_policy"
+  ],
+  "properties": {
+    "schema_version": { "const": "search_batch_record.v1" },
+    "conformance_line": { "const": "M9.evolutionary_branch_intelligence" },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "objective": { "type": "string", "minLength": 1 },
+    "strategy": { "enum": ["beam", "mcts", "evolutionary", "manual"] },
+    "max_branches": { "type": "integer", "minimum": 1, "maximum": 16 },
+    "base_commit": { "type": "string" },
+    "status": { "enum": ["running", "completed", "promoted", "archived"] },
+    "budget": {
+      "type": "object",
+      "required": ["max_branches", "max_evaluations", "stop_policy"],
+      "properties": {
+        "max_branches": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "max_evaluations": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "stop_policy": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "branch_runs": {
+      "type": "array",
+      "items": { "$ref": "branch_run_record.schema.json" }
+    },
+    "lineage_path": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "canonicality_policy": { "const": "hidden_until_director_promotion" }
+  },
+  "additionalProperties": false
+}

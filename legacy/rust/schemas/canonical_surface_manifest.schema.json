@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "canonical_surface_manifest.schema.json",
+  "title": "CanonicalSurfaceManifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source",
+    "active_status_doc",
+    "active_architecture_doc",
+    "active_implementation_plan",
+    "active_proof_packet",
+    "active_code_roots",
+    "active_schema_roots",
+    "archive_roots",
+    "external_surface_files",
+    "superseded_paths",
+    "forbidden_public_patterns"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "active_status_doc": { "type": "string" },
+    "active_architecture_doc": { "type": "string" },
+    "active_implementation_plan": { "type": "string" },
+    "active_proof_packet": { "type": "string" },
+    "active_code_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "active_schema_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "archive_roots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "external_surface_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "superseded_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "forbidden_public_patterns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false
+}

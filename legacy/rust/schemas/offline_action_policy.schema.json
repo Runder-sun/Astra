@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "offline_action_policy.schema.json",
+  "title": "OfflineActionPolicy",
+  "type": "object",
+  "required": ["schema_version", "default_policy", "allowed_actions", "rejected_actions"],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "default_policy": { "type": "string", "minLength": 1 },
+    "allowed_actions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "rejected_actions": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false
+}

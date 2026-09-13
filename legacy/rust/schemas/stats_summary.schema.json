@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stats_summary.schema.json",
+  "title": "StatsSummary",
+  "type": "object",
+  "required": [
+    "scope",
+    "session_count",
+    "active_session_count",
+    "project_count"
+  ],
+  "properties": {
+    "scope": { "type": "string" },
+    "session_count": { "type": "integer" },
+    "active_session_count": { "type": "integer" },
+    "project_count": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

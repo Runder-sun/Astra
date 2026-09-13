@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "remote_client_identity.schema.json",
+  "title": "RemoteClientIdentity",
+  "type": "object",
+  "required": ["schema_version", "client_id", "status", "client_type", "paired_at", "machine_id"],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "client_id": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "minLength": 1 },
+    "client_type": { "type": "string", "minLength": 1 },
+    "paired_at": { "type": "string", "minLength": 1 },
+    "machine_id": { "type": "string", "minLength": 1 },
+    "revoked_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "working_memory_record.schema.json",
+  "title": "WorkingMemoryRecord",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "canonical_path",
+    "retention_policy",
+    "atomic_write_policy",
+    "record_id",
+    "kind",
+    "content",
+    "support_refs",
+    "pinned",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "conformance_line": { "type": "string", "const": "M7.working_memory" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "atomic_write_policy": { "type": "string", "minLength": 1 },
+    "record_id": { "type": "string", "minLength": 1 },
+    "kind": { "type": "string", "minLength": 1 },
+    "content": { "type": "string", "minLength": 1 },
+    "support_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "pinned": { "type": "boolean" },
+    "status": { "type": "string", "enum": ["active", "evicted"] },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

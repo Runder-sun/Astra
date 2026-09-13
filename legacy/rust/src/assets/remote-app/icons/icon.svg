@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Astra Remote">
+  <rect width="512" height="512" rx="96" fill="#101214"/>
+  <path d="M144 358 244 126h36l100 232h-46l-22-54H212l-22 54h-46Zm84-92h68l-34-84-34 84Z" fill="#ef8838"/>
+  <path d="M116 390h280v34H116z" fill="#eeeae2" opacity=".88"/>
+</svg>

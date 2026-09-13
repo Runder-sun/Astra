@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "install_routes_report.schema.json",
+  "title": "InstallRoutesReport",
+  "type": "object",
+  "required": [
+    "platform",
+    "state_home",
+    "registry_root",
+    "pmcli_root",
+    "schema_root",
+    "providers",
+    "skills",
+    "mcp",
+    "plugins",
+    "hooks",
+    "remote"
+  ],
+  "properties": {
+    "platform": { "type": "string", "minLength": 1 },
+    "state_home": { "type": "string", "minLength": 1 },
+    "registry_root": { "type": "string", "minLength": 1 },
+    "pmcli_root": { "type": "string", "minLength": 1 },
+    "schema_root": { "type": "string", "minLength": 1 },
+    "providers": { "$ref": "#/$defs/stringArray" },
+    "skills": { "$ref": "#/$defs/stringArray" },
+    "mcp": { "$ref": "#/$defs/stringArray" },
+    "plugins": { "$ref": "#/$defs/stringArray" },
+    "hooks": { "$ref": "#/$defs/stringArray" },
+    "remote": { "$ref": "#/$defs/stringArray" }
+  },
+  "$defs": {
+    "stringArray": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false
+}

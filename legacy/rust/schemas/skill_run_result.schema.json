@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_run_result.schema.json",
+  "title": "SkillRunResult",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "runner_adapter",
+    "execution_status",
+    "exit_code",
+    "stdout",
+    "stderr",
+    "side_effect_audit",
+    "submit_result"
+  ],
+  "properties": {
+    "skill_id": { "type": "string", "minLength": 1 },
+    "runner_adapter": { "enum": ["local-command"] },
+    "execution_status": { "enum": ["succeeded"] },
+    "exit_code": { "type": "integer" },
+    "stdout": { "type": "string" },
+    "stderr": { "type": "string" },
+    "side_effect_audit": {
+      "type": "object",
+      "required": ["git_status_before", "git_status_after", "mutated_paths"],
+      "properties": {
+        "git_status_before": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "git_status_after": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mutated_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "submit_result": {
+      "type": "object",
+      "required": ["status", "envelope"],
+      "properties": {
+        "status": { "const": "candidate_recorded" },
+        "envelope": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

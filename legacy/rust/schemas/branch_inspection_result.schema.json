@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "branch_inspection_result.schema.json",
+  "title": "BranchInspectionResult",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "branch_run",
+    "search_batch",
+    "evaluation_packet",
+    "debate_trace",
+    "verifier_tournament",
+    "promotion_decision"
+  ],
+  "properties": {
+    "schema_version": { "const": "branch_inspection_result.v1" },
+    "conformance_line": { "const": "M9.branch_inspection" },
+    "branch_run": { "$ref": "branch_run_record.schema.json" },
+    "search_batch": { "type": ["object", "null"] },
+    "evaluation_packet": { "type": ["object", "null"] },
+    "debate_trace": { "type": ["object", "null"] },
+    "verifier_tournament": { "type": ["object", "null"] },
+    "promotion_decision": { "type": ["object", "null"] }
+  },
+  "additionalProperties": false
+}

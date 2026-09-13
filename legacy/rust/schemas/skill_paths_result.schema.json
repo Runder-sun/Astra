@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_paths_result.schema.json",
+  "title": "SkillPathsResult",
+  "type": "object",
+  "required": ["search_paths", "winners", "total_count"],
+  "properties": {
+    "search_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "winners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["skill_id", "winning_manifest", "source"],
+        "properties": {
+          "skill_id": { "type": "string", "minLength": 1 },
+          "winning_manifest": { "type": "string", "minLength": 1 },
+          "source": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "total_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

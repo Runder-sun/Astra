@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "promotion_decision.schema.json",
+  "title": "PromotionDecision",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "decision_id",
+    "branch_id",
+    "batch_id",
+    "status",
+    "decision",
+    "missing_gates",
+    "verifier_gate_status",
+    "merge_status",
+    "merged_paths",
+    "merge_commit",
+    "canonical_surface_policy",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "promotion_decision.v1" },
+    "conformance_line": { "const": "M9.director_promotion" },
+    "decision_id": { "type": "string", "minLength": 1 },
+    "branch_id": { "type": "string", "minLength": 1 },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["promoted", "blocked"] },
+    "decision": { "enum": ["promote_single_winner", "blocked"] },
+    "missing_gates": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "verifier_gate_status": { "enum": ["not_required", "passed"] },
+    "merge_status": {
+      "enum": ["merged", "no_public_diff", "director_decision_only"]
+    },
+    "merged_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "merge_commit": { "type": ["string", "null"] },
+    "canonical_surface_policy": { "const": "winner_only_public_surface" },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

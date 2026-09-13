@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_runtime_record.schema.json",
+  "title": "AgentRuntimeRecord",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "agent_id",
+    "task_packet_ref",
+    "lifecycle_status",
+    "created_at",
+    "updated_at",
+    "heartbeat_at",
+    "output_manifest_ref",
+    "trace_refs",
+    "stop_reason",
+    "failure_code"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "agent_id": { "type": "string", "minLength": 1 },
+    "runner_kind": { "type": "string", "minLength": 1 },
+    "runtime_identity_ref": { "type": "string", "minLength": 1 },
+    "role_kind": { "type": "string", "minLength": 1 },
+    "authority_scope": { "type": "string", "minLength": 1 },
+    "session_ref": { "type": "string", "minLength": 1 },
+    "task_packet_ref": { "type": "string", "minLength": 1 },
+    "lifecycle_status": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "heartbeat_at": { "type": "string", "minLength": 1 },
+    "output_manifest_ref": { "type": "string", "minLength": 1 },
+    "workspace_binding_ref": { "type": "string", "minLength": 1 },
+    "directive_ref": { "type": "string", "minLength": 1 },
+    "status_ref": { "type": "string", "minLength": 1 },
+    "trace_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "stop_reason": { "type": "string" },
+    "failure_code": { "type": "string" }
+  },
+  "additionalProperties": false
+}

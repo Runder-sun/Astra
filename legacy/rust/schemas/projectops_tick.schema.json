@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "projectops_tick.schema.json",
+  "title": "ProjectOpsTick",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "canonical_path",
+    "retention_policy",
+    "atomic_write_policy",
+    "tick_id",
+    "trigger",
+    "project_id",
+    "session_id",
+    "digest_candidate_id",
+    "started_at",
+    "finished_at",
+    "actions_taken",
+    "degraded_reasons"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "conformance_line": { "type": "string", "const": "M7.projectops_tick" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "atomic_write_policy": { "type": "string", "minLength": 1 },
+    "tick_id": { "type": "string", "minLength": 1 },
+    "trigger": {
+      "type": "string",
+      "enum": [
+        "turn_end",
+        "session_compacted",
+        "branch_adjudicated",
+        "review_resolved",
+        "run_completed",
+        "repo_drift_detected",
+        "scheduled_maintenance",
+        "manual_request"
+      ]
+    },
+    "project_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": ["string", "null"] },
+    "digest_candidate_id": { "type": ["string", "null"] },
+    "started_at": { "type": "string", "minLength": 1 },
+    "finished_at": { "type": "string", "minLength": 1 },
+    "actions_taken": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "degraded_reasons": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false
+}

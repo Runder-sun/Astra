@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_stage_execution.schema.json",
+  "title": "ResearchStageExecution",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "execution_id",
+    "stage_id",
+    "stage_class",
+    "parent_execution_id",
+    "root_execution_id",
+    "operation",
+    "trigger_reason",
+    "input_artifacts",
+    "output_artifacts",
+    "decision_record",
+    "change_envelope_ref",
+    "repair_targets",
+    "supersedes",
+    "m9_batch_id",
+    "human_gate",
+    "status",
+    "started_at",
+    "completed_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_stage_execution.v1" },
+    "conformance_line": { "const": "M10.research_runtime" },
+    "execution_id": { "type": "string", "minLength": 1 },
+    "stage_id": { "type": "string", "minLength": 1 },
+    "stage_class": {
+      "enum": [
+        "survey",
+        "idea_form",
+        "idea_refine",
+        "document",
+        "experiment_design",
+        "implement",
+        "experiment_run",
+        "result_to_claim",
+        "publish",
+        "repair"
+      ]
+    },
+    "parent_execution_id": { "type": ["string", "null"] },
+    "root_execution_id": { "type": "string", "minLength": 1 },
+    "operation": {
+      "enum": [
+        "advance",
+        "retry",
+        "repair",
+        "pivot",
+        "fork",
+        "supersede",
+        "abandon",
+        "human_override"
+      ]
+    },
+    "trigger_reason": { "type": "string", "minLength": 1 },
+    "input_artifacts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "output_artifacts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "decision_record": { "type": ["string", "null"] },
+    "change_envelope_ref": { "type": ["string", "null"] },
+    "repair_targets": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "supersedes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "m9_batch_id": { "type": ["string", "null"] },
+    "human_gate": { "type": ["string", "null"] },
+    "status": {
+      "enum": [
+        "active",
+        "completed",
+        "awaiting_gate",
+        "blocked",
+        "abandoned",
+        "waiting_for_m9_promotion",
+        "canonicality_refresh_pending"
+      ]
+    },
+    "started_at": { "type": "string", "minLength": 1 },
+    "completed_at": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

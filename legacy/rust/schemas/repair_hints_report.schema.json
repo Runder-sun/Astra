@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "repair_hints_report.schema.json",
+  "title": "RepairHintsReport",
+  "type": "object",
+  "required": ["overall_status", "components", "total_count"],
+  "properties": {
+    "overall_status": { "type": "string", "minLength": 1 },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["component", "status", "hints"],
+        "properties": {
+          "component": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "minLength": 1 },
+          "hints": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "total_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

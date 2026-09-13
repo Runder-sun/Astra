@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_record_result.schema.json",
+  "title": "ResearchRecordResult",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "record_kind",
+    "thread",
+    "stage_execution",
+    "deliberation_span",
+    "doc_frame_refresh_status",
+    "canonical_artifact_refs"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_record_result.v1" },
+    "conformance_line": { "const": "M10.research_runtime" },
+    "record_kind": { "enum": ["design", "plan", "result", "paper", "handoff"] },
+    "thread": { "type": "object" },
+    "stage_execution": { "type": "object" },
+    "deliberation_span": { "type": "object" },
+    "doc_frame_refresh_status": { "type": "string", "minLength": 1 },
+    "canonical_artifact_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "feedback_calibration_record.schema.json",
+  "title": "FeedbackCalibrationRecord",
+  "type": "object",
+  "required": ["schema_version", "conformance_line", "canonical_path", "retention_policy", "atomic_write_policy", "calibration_id", "authority_boundary", "signal_count", "positive_signal_count", "negative_signal_count", "routing_adjustments", "skill_recommendation_hints", "verifier_calibration_hints", "governance_limits", "created_at"],
+  "properties": {
+    "schema_version": { "const": "feedback.calibration_record.v1" },
+    "conformance_line": { "const": "M18.feedback_calibration" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "atomic_write_policy": { "type": "string", "minLength": 1 },
+    "calibration_id": { "type": "string", "minLength": 1 },
+    "authority_boundary": { "const": "advisory_only" },
+    "signal_count": { "type": "integer", "minimum": 0 },
+    "positive_signal_count": { "type": "integer", "minimum": 0 },
+    "negative_signal_count": { "type": "integer", "minimum": 0 },
+    "routing_adjustments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["target_lane", "adjustment_kind", "weight_delta", "reason", "evidence_refs"],
+        "properties": {
+          "target_lane": { "type": "string", "minLength": 1 },
+          "adjustment_kind": { "type": "string", "minLength": 1 },
+          "weight_delta": { "type": "number" },
+          "reason": { "type": "string", "minLength": 1 },
+          "evidence_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "skill_recommendation_hints": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "verifier_calibration_hints": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "governance_limits": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

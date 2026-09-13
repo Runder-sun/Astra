@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "branch_mutation_result.schema.json",
+  "title": "BranchMutationResult",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "mutation_id",
+    "branch_id",
+    "batch_id",
+    "status",
+    "mutation_source",
+    "command",
+    "before_commit",
+    "after_commit",
+    "changed_paths",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "branch_mutation_result.v1" },
+    "conformance_line": { "const": "M9.llm_branch_mutation" },
+    "mutation_id": { "type": "string", "minLength": 1 },
+    "branch_id": { "type": "string", "minLength": 1 },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "status": { "const": "mutated" },
+    "mutation_source": { "enum": ["llm_command_adapter"] },
+    "command": { "type": "string", "minLength": 1 },
+    "before_commit": { "type": "string" },
+    "after_commit": { "type": "string" },
+    "changed_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

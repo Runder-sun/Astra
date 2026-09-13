@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_manifest.schema.json",
+  "title": "SkillManifest",
+  "type": "object",
+  "required": ["skill_id", "manifest_path", "enabled"],
+  "properties": {
+    "skill_id": { "type": "string", "minLength": 1 },
+    "manifest_path": { "type": "string", "minLength": 1 },
+    "enabled": { "type": "boolean" },
+    "stage_compatibility": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "contract_path": { "type": "string", "minLength": 1 },
+    "runner_adapter": { "type": "string", "minLength": 1 },
+    "output_kinds": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false
+}

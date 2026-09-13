@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Astra · 研究工作台</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<aside class="sidebar"><a class="brand" href="/">Astra<span>研究工作台</span></a><button id="new" class="primary" type="button">＋ 新建研究</button><h2 class="eyebrow">本机任务</h2><nav id="jobs" aria-label="研究任务"><p class="muted">正在读取任务…</p></nav><div class="sidebar-bottom">官方 Codex 后端<br><strong>gpt-5.6-luna</strong><p>文件保存在本机。关闭页面不会停止研究。</p><button id="theme" type="button">切换深浅色</button></div></aside>
+<main>
+<header><span>研究 / 工作台</span><span id="connection" role="status">连接中</span></header>
+<div id="error" role="alert" hidden></div>
+<section id="create" hidden>
+<p class="eyebrow">从一个清晰的问题开始</p><h1>你想研究什么？</h1><p class="intro">说明问题、已有条件和期望交付。Astra 会规划工作、检查证据，并在遇到问题时修复或向你提问。</p>
+<form id="create-form"><label for="objective">研究目标与范围</label><textarea id="objective" rows="7" minlength="10" maxlength="10000" required placeholder="例如：比较均值和中位数在少量异常值下的表现。仅用 Python 标准库，在本机运行小规模实验，保留数据、代码和负面结果。"></textarea><button id="example" class="text-button" type="button">填入一个小规模复现实验</button><div class="form-options"><label>任务预算<select id="budget"><option value="24">24 个任务 · 短流程试跑</option><option value="64" selected>64 个任务 · 小规模研究</option><option value="144">144 个任务 · 更多修复空间</option></select></label><label class="checkbox"><input id="paper" type="checkbox">交付论文与 PDF</label></div><p class="muted">包含执行和审阅任务，额度用尽会暂停。真实运行会使用你的 Codex 订阅；请先在本机完成 Codex 登录。最终阶段保留确认步骤。</p><button class="primary" id="start" type="submit">开始研究</button></form>
+</section>
+<section id="research" hidden>
+<div class="heading"><div><p class="eyebrow" id="job-label">研究任务</p><h1 id="title">正在载入…</h1></div><button id="refresh" type="button">刷新</button></div>
+<details id="objective-detail"><summary>查看完整研究目标</summary><p id="full-objective"></p></details>
+<div class="summary"><article><span>执行状态</span><strong id="execution">—</strong></article><article><span>科学结论</span><strong id="outcome">尚未评估</strong></article><article><span>任务覆盖</span><strong id="coverage">尚未评估</strong></article></div>
+<section class="next"><p class="eyebrow">当前进展</p><p id="next-action"></p><p id="usage" class="muted"></p><button id="pause" type="button" hidden>暂停研究</button><div id="continue" hidden><label for="guidance">补充说明或回答（可选）</label><textarea id="guidance" rows="3" placeholder="系统需要你的判断时，在这里回答；也可以说明希望修复的具体问题。"></textarea><label>继续时的任务预算<select id="resume-budget"><option value="">保持原预算</option><option value="64">64 个任务</option><option value="144">144 个任务</option></select></label><button id="resume" class="primary" type="button">继续研究</button></div></section>
+<div class="workspace"><section class="stages"><h2>研究阶段</h2><p class="muted">按需要选择和回退，不是固定流水线。</p><div id="stages"></div></section><section class="detail"><div class="detail-heading"><h2 id="stage-title">阶段详情</h2><span class="badge" id="gate"></span></div><div id="stage-detail"></div></section></div>
+<details class="technical"><summary>任务目录与运行输出</summary><p id="directory"></p><pre id="output"></pre></details>
+</section>
+<footer>审阅通过表示交付符合验收要求，不等于假设成立。负面结果同样是研究结果。</footer>
+</main>
+</body></html>

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "event.schema.json",
+  "title": "KernelEventEnvelope",
+  "type": "object",
+  "required": [
+    "event_id",
+    "seq",
+    "event_name",
+    "phase",
+    "object_kind",
+    "object_id",
+    "timestamp",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "event_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["start", "update", "terminal"]
+    },
+    "terminal_outcome": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "cancelled", "blocked", "stale_conflict"]
+    },
+    "object_kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "object_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": ["string", "null"]
+    },
+    "project_id": {
+      "type": ["string", "null"]
+    },
+    "timestamp": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "terminal"
+          }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "required": ["terminal_outcome"]
+      },
+      "else": {
+        "not": {
+          "required": ["terminal_outcome"]
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

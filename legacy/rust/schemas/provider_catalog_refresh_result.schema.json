@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "provider_catalog_refresh_result.schema.json",
+  "title": "ProviderCatalogRefreshResult",
+  "type": "object",
+  "required": [
+    "requested_source",
+    "applied_source",
+    "catalog_version",
+    "total_count",
+    "providers"
+  ],
+  "properties": {
+    "requested_source": { "type": "string", "minLength": 1 },
+    "applied_source": {
+      "type": "string",
+      "enum": ["embedded", "file", "unsupported"]
+    },
+    "catalog_version": { "type": "string", "minLength": 1 },
+    "total_count": { "type": "integer", "minimum": 0 },
+    "providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/providerCatalogState" }
+    }
+  },
+  "$defs": {
+    "providerCatalogState": {
+      "type": "object",
+      "required": [
+        "provider_id",
+        "catalog_source",
+        "catalog_version",
+        "embedded",
+        "refreshable",
+        "model_count"
+      ],
+      "properties": {
+        "provider_id": { "type": "string", "minLength": 1 },
+        "catalog_source": {
+          "type": "string",
+          "enum": ["embedded", "file", "unsupported"]
+        },
+        "catalog_version": { "type": "string", "minLength": 1 },
+        "embedded": { "type": "boolean" },
+        "refreshable": { "type": "boolean" },
+        "last_refreshed_at": { "type": "string" },
+        "model_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

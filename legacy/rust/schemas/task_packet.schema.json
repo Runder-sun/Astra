@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "task_packet.schema.json",
+  "title": "TaskPacket",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "task_packet_id",
+    "agent_id",
+    "intent",
+    "role_profile",
+    "retention_policy",
+    "run_class",
+    "io_mode",
+    "resume_policy",
+    "replay_seed_ref",
+    "budget",
+    "scope",
+    "write_authority",
+    "success_criteria",
+    "output_manifest_required",
+    "review_gate_required",
+    "message",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "task_packet_id": { "type": "string", "minLength": 1 },
+    "agent_id": { "type": "string", "minLength": 1 },
+    "runner_kind": { "type": "string", "minLength": 1 },
+    "intent": { "type": "string", "minLength": 1 },
+    "role_profile": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "run_class": { "type": "string", "minLength": 1 },
+    "io_mode": { "type": "string", "minLength": 1 },
+    "resume_policy": { "type": "string", "minLength": 1 },
+    "replay_seed_ref": { "type": "string" },
+    "budget": {
+      "type": "object",
+      "required": ["max_turns", "max_runtime_ms"],
+      "properties": {
+        "max_turns": { "type": "integer", "minimum": 1 },
+        "max_runtime_ms": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "required": ["workspace_root", "allowed_paths"],
+      "properties": {
+        "workspace_root": { "type": "string", "minLength": 1 },
+        "allowed_paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "write_authority": { "type": "string", "minLength": 1 },
+    "success_criteria": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "output_manifest_required": { "type": "boolean" },
+    "review_gate_required": { "type": "boolean" },
+    "stage_task_contract": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "task_id",
+        "stage_execution_id",
+        "stage_id",
+        "task_type",
+        "worker_role",
+        "objective",
+        "required_output_artifact_type",
+        "required_output_fields",
+        "acceptance_checks",
+        "failure_signals",
+        "priority"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "stage_execution_id": { "type": "string", "minLength": 1 },
+        "stage_id": { "type": "string", "minLength": 1 },
+        "task_type": { "type": "string", "minLength": 1 },
+        "worker_role": { "type": "string", "minLength": 1 },
+        "objective": { "type": "string", "minLength": 1 },
+        "input_artifact_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "required_output_artifact_type": { "type": "string", "minLength": 1 },
+        "required_output_fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "acceptance_checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "failure_signals": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "depends_on_task_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "priority": { "type": "integer", "minimum": 0 },
+        "review_findings_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "blocker_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "review_target_task_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "review_target_evidence_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "supersedes_task_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "replacement_of_task_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "current_evidence_set_id": { "type": "string", "minLength": 1 },
+        "consumed_input_required": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "collaboration_protocol": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "protocol_id",
+        "main_agent_authority",
+        "runtime_authority",
+        "worker_authority",
+        "required_worker_capabilities",
+        "required_worker_output_sections",
+        "forbidden_worker_actions",
+        "artifact_flow",
+        "adoption_rule",
+        "review_rule",
+        "cleanup_rule"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "minLength": 1 },
+        "protocol_id": { "type": "string", "minLength": 1 },
+        "main_agent_authority": { "type": "string", "minLength": 1 },
+        "runtime_authority": { "type": "string", "minLength": 1 },
+        "worker_authority": { "type": "string", "minLength": 1 },
+        "required_worker_capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "required_worker_output_sections": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "forbidden_worker_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "artifact_flow": { "type": "string", "minLength": 1 },
+        "adoption_rule": { "type": "string", "minLength": 1 },
+        "review_rule": { "type": "string", "minLength": 1 },
+        "cleanup_rule": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "command": { "type": "string", "minLength": 1 },
+    "message": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

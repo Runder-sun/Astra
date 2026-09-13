@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_role_template.schema.json",
+  "title": "ResearchRoleTemplate",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "role_id",
+    "display_name",
+    "stage_affinity",
+    "authority_ceiling",
+    "always_include_tools",
+    "allowed_tool_patterns",
+    "denied_tool_patterns",
+    "lazy_runtime_policy"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_role_template.v1" },
+    "conformance_line": { "const": "M13.research_ux_middleware" },
+    "role_id": { "enum": ["planner", "researcher", "coder", "debugger", "analyst", "writer", "verifier", "operator"] },
+    "display_name": { "type": "string", "minLength": 1 },
+    "stage_affinity": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "authority_ceiling": { "type": "string", "minLength": 1 },
+    "always_include_tools": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "allowed_tool_patterns": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "denied_tool_patterns": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "lazy_runtime_policy": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

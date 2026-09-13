@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "git_state_snapshot.schema.json",
+  "title": "GitStateSnapshot",
+  "type": "object",
+  "required": [
+    "is_repository",
+    "workspace_root",
+    "branch",
+    "head_commit",
+    "base_branch",
+    "merge_base",
+    "dirty_files",
+    "staged_files",
+    "untracked_files",
+    "worktrees",
+    "ahead_count",
+    "behind_count"
+  ],
+  "properties": {
+    "is_repository": { "type": "boolean" },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "branch": { "type": "string" },
+    "head_commit": { "type": "string" },
+    "base_branch": { "type": "string" },
+    "merge_base": { "type": "string" },
+    "dirty_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "staged_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "untracked_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "worktrees": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "branch", "head_commit"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "branch": { "type": "string" },
+          "head_commit": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "ahead_count": { "type": ["integer", "null"], "minimum": 0 },
+    "behind_count": { "type": ["integer", "null"], "minimum": 0 }
+  },
+  "additionalProperties": false
+}

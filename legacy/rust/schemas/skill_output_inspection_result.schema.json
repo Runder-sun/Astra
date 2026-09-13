@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_output_inspection_result.schema.json",
+  "title": "SkillOutputInspectionResult",
+  "type": "object",
+  "required": ["envelope", "publication_state"],
+  "properties": {
+    "envelope": { "type": "object" },
+    "publication_state": { "enum": ["candidate", "public_latest", "superseded"] }
+  },
+  "additionalProperties": false
+}

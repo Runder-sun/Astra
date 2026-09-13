@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "remote_action_rejection.schema.json",
+  "title": "RemoteActionRejection",
+  "type": "object",
+  "required": ["schema_version", "action", "rejection_code", "reason", "retryable", "required_state", "current_state", "next_steps"],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "action": { "type": "string", "minLength": 1 },
+    "rejection_code": { "type": "string", "minLength": 1 },
+    "reason": { "type": "string", "minLength": 1 },
+    "retryable": { "type": "boolean" },
+    "required_state": { "type": "string", "minLength": 1 },
+    "current_state": { "type": "string", "minLength": 1 },
+    "next_steps": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "additionalProperties": false
+}

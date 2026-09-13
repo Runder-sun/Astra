@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trajectory_ingest_record.schema.json",
+  "title": "TrajectoryIngestRecord",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "canonical_path",
+    "retention_policy",
+    "atomic_write_policy",
+    "ingest_id",
+    "project_id",
+    "source_kind",
+    "source_agent_id",
+    "source_session_id",
+    "source_path",
+    "source_digest",
+    "normalized_format",
+    "ingest_status",
+    "segment_count",
+    "degraded_reasons",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "trajectory.ingest_record.v1" },
+    "conformance_line": { "type": "string", "const": "M15.trajectory_ingest" },
+    "canonical_path": { "type": "string", "minLength": 1 },
+    "retention_policy": { "type": "string", "minLength": 1 },
+    "atomic_write_policy": { "type": "string", "minLength": 1 },
+    "ingest_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "source_kind": {
+      "type": "string",
+      "enum": ["cli_session", "tui_session", "remote_session", "agent_runtime", "branch_run", "research_stage"]
+    },
+    "source_agent_id": { "type": "string" },
+    "source_session_id": { "type": "string" },
+    "source_path": { "type": "string", "minLength": 1 },
+    "source_digest": { "type": "string", "minLength": 1 },
+    "normalized_format": { "type": "string", "const": "jsonl.v1" },
+    "ingest_status": {
+      "type": "string",
+      "enum": ["pending_segmentation", "segmented", "segmentation_degraded", "failed", "superseded"]
+    },
+    "segment_count": { "type": "integer", "minimum": 0 },
+    "degraded_reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

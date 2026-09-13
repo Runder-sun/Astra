@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "doc_context_projection.schema.json",
+  "title": "DocContextProjection",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "projection_policy",
+    "project_id",
+    "generated_at",
+    "doc_frames",
+    "active_count",
+    "injected_count",
+    "omitted_active_count",
+    "stale_count",
+    "omitted_stale_count",
+    "evidence_refs"
+  ],
+  "properties": {
+    "schema_version": { "const": "doc_context_projection.v1" },
+    "conformance_line": { "const": "M7.docframe_context" },
+    "projection_policy": {
+      "const": "active_non_stale_docframes_after_mission_frame"
+    },
+    "project_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "doc_frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "doc_id",
+          "schema_version",
+          "source_path",
+          "title",
+          "doc_type",
+          "lifecycle",
+          "scope",
+          "summary",
+          "generated_by",
+          "updated_at"
+        ],
+        "properties": {
+          "doc_id": { "type": "string", "minLength": 1 },
+          "schema_version": { "type": "string", "minLength": 1 },
+          "source_path": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "doc_type": { "type": "string", "minLength": 1 },
+          "lifecycle": { "type": "string", "minLength": 1 },
+          "scope": { "type": "string", "minLength": 1 },
+          "milestone": { "type": "string" },
+          "summary": { "type": "string", "minLength": 1 },
+          "key_claims": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "decisions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "interfaces": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "next_actions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "non_goals": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "generated_by": { "type": "string", "minLength": 1 },
+          "updated_at": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "active_count": { "type": "integer", "minimum": 0 },
+    "injected_count": { "type": "integer", "minimum": 0 },
+    "omitted_active_count": { "type": "integer", "minimum": 0 },
+    "stale_count": { "type": "integer", "minimum": 0 },
+    "omitted_stale_count": { "type": "integer", "minimum": 0 },
+    "evidence_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false
+}

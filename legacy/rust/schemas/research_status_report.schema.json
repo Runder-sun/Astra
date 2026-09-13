@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_status_report.schema.json",
+  "title": "ResearchStatusReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "project_id",
+    "active_thread",
+    "active_stage_execution",
+    "active_deliberation_span",
+    "pending_operations",
+    "middleware_pending_gates",
+    "latest_middleware_packet",
+    "next_recommended_action"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_status_report.v1" },
+    "conformance_line": { "const": "M10.research_runtime" },
+    "project_id": { "type": "string", "minLength": 1 },
+    "active_thread": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+    "active_stage_execution": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+    "active_deliberation_span": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+    "pending_operations": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "middleware_pending_gates": { "type": "array", "items": { "$ref": "#/$defs/hitl_pending_gate" } },
+    "latest_middleware_packet": { "type": ["string", "null"] },
+    "next_recommended_action": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "hitl_pending_gate": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "conformance_line",
+        "gate_id",
+        "thread_id",
+        "stage_execution_id",
+        "kind",
+        "question",
+        "options",
+        "resume_policy",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "schema_version": { "const": "hitl_pending_gate.v1" },
+        "conformance_line": { "const": "M13.research_ux_middleware" },
+        "gate_id": { "type": "string", "minLength": 1 },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "stage_execution_id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["clarification", "approval", "recovery"] },
+        "question": { "type": "string", "minLength": 1 },
+        "options": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "resume_policy": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "answered", "cancelled", "expired"] },
+        "created_at": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mcp_test_result.schema.json",
+  "title": "MCPTestResult",
+  "type": "object",
+  "required": ["scope", "overall_status", "tested_count"],
+  "properties": {
+    "scope": { "type": "string", "minLength": 1 },
+    "overall_status": { "type": "string", "minLength": 1 },
+    "tested_count": { "type": "integer", "minimum": 0 },
+    "servers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["server_id", "status", "handshake_status", "tool_surface_ok"],
+        "properties": {
+          "server_id": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "minLength": 1 },
+          "handshake_status": { "type": "string", "minLength": 1 },
+          "tool_surface_ok": { "type": "boolean" },
+          "hints": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

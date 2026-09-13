@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "projectops_status_report.schema.json",
+  "title": "ProjectOpsStatusReport",
+  "type": "object",
+  "required": [
+    "project_id",
+    "leases",
+    "wake_events",
+    "cleanup_proposals",
+    "active_lease_count",
+    "stale_lease_count",
+    "pending_wake_count",
+    "escalated_wake_count",
+    "resolved_wake_count",
+    "pending_cleanup_count",
+    "blocked_cleanup_count",
+    "applied_cleanup_count"
+  ],
+  "properties": {
+    "project_id": { "type": "string", "minLength": 1 },
+    "leases": {
+      "type": "array",
+      "items": { "$ref": "experiment_supervisor_lease.schema.json" }
+    },
+    "wake_events": {
+      "type": "array",
+      "items": { "$ref": "wake_event.schema.json" }
+    },
+    "cleanup_proposals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cleanup_proposal_summary" }
+    },
+    "active_lease_count": { "type": "integer", "minimum": 0 },
+    "stale_lease_count": { "type": "integer", "minimum": 0 },
+    "pending_wake_count": { "type": "integer", "minimum": 0 },
+    "escalated_wake_count": { "type": "integer", "minimum": 0 },
+    "resolved_wake_count": { "type": "integer", "minimum": 0 },
+    "pending_cleanup_count": { "type": "integer", "minimum": 0 },
+    "blocked_cleanup_count": { "type": "integer", "minimum": 0 },
+    "applied_cleanup_count": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "cleanup_proposal_summary": {
+      "type": "object",
+      "required": [
+        "plan_id",
+        "status",
+        "rollback_snapshot_ref",
+        "git_authority",
+        "git_commit_required",
+        "expected_tracked_deletion_count",
+        "proposed_action_count",
+        "applied_action_count",
+        "move_to_archive_count",
+        "remove_count",
+        "canonical_repair_count",
+        "blocked_gate_count",
+        "recommended_command"
+      ],
+      "properties": {
+        "plan_id": { "type": "string", "minLength": 1 },
+        "status": {
+          "enum": ["pending_review", "blocked", "applied", "clean"]
+        },
+        "rollback_snapshot_ref": { "type": "string" },
+        "git_authority": { "const": "git_worktree_diff_is_canonical_cleanup_record" },
+        "git_commit_required": { "type": "boolean" },
+        "expected_tracked_deletion_count": { "type": "integer", "minimum": 0 },
+        "proposed_action_count": { "type": "integer", "minimum": 0 },
+        "applied_action_count": { "type": "integer", "minimum": 0 },
+        "move_to_archive_count": { "type": "integer", "minimum": 0 },
+        "remove_count": { "type": "integer", "minimum": 0 },
+        "canonical_repair_count": { "type": "integer", "minimum": 0 },
+        "blocked_gate_count": { "type": "integer", "minimum": 0 },
+        "recommended_command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

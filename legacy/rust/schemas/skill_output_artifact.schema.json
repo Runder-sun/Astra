@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_output_artifact.schema.json",
+  "title": "SkillOutputArtifact",
+  "type": "object",
+  "required": ["artifact_id", "artifact_path", "artifact_kind"],
+  "properties": {
+    "artifact_id": { "type": "string", "minLength": 1 },
+    "artifact_path": { "type": "string", "minLength": 1 },
+    "artifact_kind": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

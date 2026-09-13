@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime_preflight_report.schema.json",
+  "title": "RuntimePreflightReport",
+  "type": "object",
+  "required": ["overall_status", "ready"],
+  "properties": {
+    "overall_status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_trace": {
+      "$ref": "#/$defs/projectResolutionTrace"
+    },
+    "provider_status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/doctorCheck"
+      }
+    },
+    "auth_status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/doctorCheck"
+      }
+    },
+    "plugin_status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/doctorCheck"
+      }
+    },
+    "hook_status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/doctorCheck"
+      }
+    },
+    "mcp_status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/doctorCheck"
+      }
+    },
+    "degraded_features": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "recovery_hints": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "ready": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "doctorCheck": {
+      "type": "object",
+      "required": ["name", "status"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectResolutionTrace": {
+      "type": "object",
+      "required": ["resolution_source", "resolution_status"],
+      "properties": {
+        "requested_project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_project": {
+          "$ref": "#/$defs/projectRegistryEntry"
+        },
+        "current_pointer": {
+          "$ref": "#/$defs/currentProjectPointer"
+        },
+        "candidate_projects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/projectRegistryEntry"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectRegistryEntry": {
+      "type": "object",
+      "required": [
+        "project_id",
+        "workspace_root",
+        "workspace_hash",
+        "data_dir",
+        "last_accessed_at",
+        "init_state",
+        "active_session_id",
+        "open_branch_count",
+        "repo_health"
+      ],
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "data_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_accessed_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "init_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_session_id": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "open_branch_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "repo_health": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "currentProjectPointer": {
+      "type": "object",
+      "required": ["project_id", "workspace_root", "updated_at"],
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

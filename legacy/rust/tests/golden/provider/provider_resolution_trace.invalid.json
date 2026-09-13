@@ -1,0 +1,11 @@
+{
+  "resolved_provider": "openai",
+  "resolved_model": "gpt-4.1-mini",
+  "routed_by_prefix": false,
+  "degraded": false,
+  "sources": {
+    "model": "environment",
+    "provider": "model_catalog_match"
+  },
+  "unexpected": true
+}

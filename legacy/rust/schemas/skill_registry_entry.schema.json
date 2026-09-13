@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_registry_entry.schema.json",
+  "title": "SkillRegistryEntry",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "description",
+    "manifest_path",
+    "source",
+    "enabled",
+    "degraded"
+  ],
+  "properties": {
+    "skill_id": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "manifest_path": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "enabled": { "type": "boolean" },
+    "degraded": { "type": "boolean" },
+    "disabled_reason": { "type": "string", "minLength": 1 },
+    "stage_compatibility": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false
+}

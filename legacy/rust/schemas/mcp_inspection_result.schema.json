@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mcp_inspection_result.schema.json",
+  "title": "MCPInspectionResult",
+  "type": "object",
+  "required": [
+    "server_id",
+    "transport",
+    "tool_surface",
+    "disabled_tools",
+    "auth_source",
+    "timeout_ms",
+    "manifest_path",
+    "source"
+  ],
+  "properties": {
+    "server_id": { "type": "string", "minLength": 1 },
+    "transport": { "type": "string", "minLength": 1 },
+    "tool_surface": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "disabled_tools": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "auth_source": { "type": "string", "minLength": 1 },
+    "timeout_ms": { "type": "integer", "minimum": 0 },
+    "last_known_failure": { "type": "string", "minLength": 1 },
+    "manifest_path": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

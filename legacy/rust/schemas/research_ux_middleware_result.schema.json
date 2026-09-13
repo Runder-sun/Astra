@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_ux_middleware_result.schema.json",
+  "title": "ResearchUxMiddlewareResult",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "middleware_id",
+    "thread_id",
+    "stage_execution_id",
+    "role_template",
+    "tool_selection_trace",
+    "stage_reflection_packet",
+    "hitl_pending_gate",
+    "tool_error_recovery",
+    "human_gate_required",
+    "lazy_runtime_initialization",
+    "persisted_refs",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_ux_middleware_result.v1" },
+    "conformance_line": { "const": "M13.research_ux_middleware" },
+    "middleware_id": { "type": "string", "minLength": 1 },
+    "thread_id": { "type": "string", "minLength": 1 },
+    "stage_execution_id": { "type": "string", "minLength": 1 },
+    "role_template": { "$ref": "#/$defs/research_role_template" },
+    "tool_selection_trace": { "$ref": "#/$defs/tool_selection_trace" },
+    "stage_reflection_packet": { "$ref": "#/$defs/stage_reflection_packet" },
+    "hitl_pending_gate": {
+      "anyOf": [{ "$ref": "#/$defs/hitl_pending_gate" }, { "type": "null" }]
+    },
+    "tool_error_recovery": {
+      "anyOf": [{ "$ref": "#/$defs/tool_error_recovery" }, { "type": "null" }]
+    },
+    "human_gate_required": { "type": "boolean" },
+    "lazy_runtime_initialization": { "type": "string", "minLength": 1 },
+    "persisted_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "research_role_template": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "conformance_line",
+        "role_id",
+        "display_name",
+        "stage_affinity",
+        "authority_ceiling",
+        "always_include_tools",
+        "allowed_tool_patterns",
+        "denied_tool_patterns",
+        "lazy_runtime_policy"
+      ],
+      "properties": {
+        "schema_version": { "const": "research_role_template.v1" },
+        "conformance_line": { "const": "M13.research_ux_middleware" },
+        "role_id": {
+          "enum": [
+            "planner",
+            "researcher",
+            "coder",
+            "debugger",
+            "analyst",
+            "writer",
+            "verifier",
+            "operator"
+          ]
+        },
+        "display_name": { "type": "string", "minLength": 1 },
+        "stage_affinity": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "authority_ceiling": { "type": "string", "minLength": 1 },
+        "always_include_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "allowed_tool_patterns": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "denied_tool_patterns": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "lazy_runtime_policy": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "tool_selection_trace": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "conformance_line",
+        "selection_id",
+        "role_id",
+        "requested_tools",
+        "candidate_tools",
+        "selected_tools",
+        "filtered_tools",
+        "always_include_tools",
+        "selection_strategy",
+        "fallback_reason",
+        "authority_ceiling",
+        "created_at"
+      ],
+      "properties": {
+        "schema_version": { "const": "tool_selection_trace.v1" },
+        "conformance_line": { "const": "M13.research_ux_middleware" },
+        "selection_id": { "type": "string", "minLength": 1 },
+        "role_id": { "type": "string", "minLength": 1 },
+        "requested_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "candidate_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "selected_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "filtered_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "always_include_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "selection_strategy": { "type": "string", "minLength": 1 },
+        "fallback_reason": { "type": ["string", "null"] },
+        "authority_ceiling": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "stage_reflection_packet": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "conformance_line",
+        "packet_id",
+        "thread_id",
+        "stage_execution_id",
+        "role_id",
+        "intent_summary",
+        "completed",
+        "unmet_success_signals",
+        "skill_suggestions",
+        "stage_modifications",
+        "new_stages",
+        "todo_updates",
+        "next_action",
+        "created_at"
+      ],
+      "properties": {
+        "schema_version": { "const": "stage_reflection_packet.v1" },
+        "conformance_line": { "const": "M13.research_ux_middleware" },
+        "packet_id": { "type": "string", "minLength": 1 },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "stage_execution_id": { "type": "string", "minLength": 1 },
+        "role_id": { "type": "string", "minLength": 1 },
+        "intent_summary": { "type": "string", "minLength": 1 },
+        "completed": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "unmet_success_signals": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "skill_suggestions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "stage_modifications": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["stage", "change"],
+            "properties": {
+              "stage": { "type": "string", "minLength": 1 },
+              "change": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "new_stages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "title",
+              "goal",
+              "success_signals",
+              "what_to_run",
+              "expected_artifacts"
+            ],
+            "properties": {
+              "title": { "type": "string", "minLength": 1 },
+              "goal": { "type": "string", "minLength": 1 },
+              "success_signals": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "what_to_run": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "expected_artifacts": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "todo_updates": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "next_action": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "hitl_pending_gate": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "conformance_line",
+        "gate_id",
+        "thread_id",
+        "stage_execution_id",
+        "kind",
+        "question",
+        "options",
+        "resume_policy",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "schema_version": { "const": "hitl_pending_gate.v1" },
+        "conformance_line": { "const": "M13.research_ux_middleware" },
+        "gate_id": { "type": "string", "minLength": 1 },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "stage_execution_id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["clarification", "approval", "recovery"] },
+        "question": { "type": "string", "minLength": 1 },
+        "options": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "resume_policy": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "answered", "cancelled", "expired"] },
+        "created_at": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "tool_error_recovery": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "conformance_line",
+        "recovery_id",
+        "failed_tool",
+        "error_class",
+        "retryable",
+        "suggested_alternatives",
+        "human_gate_required",
+        "recovery_summary",
+        "created_at"
+      ],
+      "properties": {
+        "schema_version": { "const": "tool_error_recovery.v1" },
+        "conformance_line": { "const": "M13.research_ux_middleware" },
+        "recovery_id": { "type": "string", "minLength": 1 },
+        "failed_tool": { "type": "string", "minLength": 1 },
+        "error_class": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "suggested_alternatives": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "human_gate_required": { "type": "boolean" },
+        "recovery_summary": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

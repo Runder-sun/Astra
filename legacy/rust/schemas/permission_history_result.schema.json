@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "permission_history_result.schema.json",
+  "title": "PermissionHistoryResult",
+  "type": "object",
+  "required": [
+    "decisions",
+    "total_count"
+  ],
+  "properties": {
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "decision",
+          "request_id",
+          "resolved_at",
+          "status"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "decision": {
+            "type": "string",
+            "enum": ["approved", "denied", "expired"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["resolved"]
+          },
+          "session_id": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "turn_id": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "tool_name": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "permission_mode": {
+            "type": ["string", "null"],
+            "enum": ["read-only", "workspace-write", "danger-full-access", null]
+          },
+          "resolved_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "trace": {
+            "type": "object",
+            "required": [
+              "action",
+              "allowlist_match",
+              "approved",
+              "branch_boundary_ok",
+              "current_mode",
+              "destructive",
+              "reason",
+              "request_id",
+              "required_mode",
+              "tool_name",
+              "workspace_boundary_ok"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "tool_name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "action": {
+                "type": "string",
+                "minLength": 1
+              },
+              "requested_path": {
+                "type": ["string", "null"],
+                "minLength": 1
+              },
+              "required_mode": {
+                "type": "string",
+                "enum": ["read-only", "workspace-write", "danger-full-access"]
+              },
+              "current_mode": {
+                "type": "string",
+                "enum": ["read-only", "workspace-write", "danger-full-access"]
+              },
+              "allowlist_match": {
+                "type": "boolean"
+              },
+              "workspace_boundary_ok": {
+                "type": "boolean"
+              },
+              "branch_boundary_ok": {
+                "type": "boolean"
+              },
+              "destructive": {
+                "type": "boolean"
+              },
+              "approved": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false
+}

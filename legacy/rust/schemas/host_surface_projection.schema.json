@@ -1,0 +1,548 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "host_surface_projection.schema.json",
+  "title": "HostSurfaceProjection",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "projection_id",
+    "project_id",
+    "source",
+    "authority_model",
+    "updated_at",
+    "surfaces",
+    "pane_status",
+    "actions",
+    "remote",
+    "workbench",
+    "sessions",
+    "permissions",
+    "memory",
+    "branches",
+    "reviews",
+    "research",
+    "control_owner",
+    "control_lease_id",
+    "control_lease_state"
+  ],
+  "properties": {
+    "schema_version": { "const": "host_surface_projection.v1" },
+    "projection_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "source": { "const": "kernel_state_bundle_and_project_indexes" },
+    "authority_model": { "const": "kernel_authoritative_projection" },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "surfaces": {
+      "type": "object",
+      "required": ["local_tui", "web", "mobile", "semantic_lane", "terminal_lane"],
+      "additionalProperties": false,
+      "properties": {
+        "local_tui": { "$ref": "#/$defs/surface_capability" },
+        "web": { "$ref": "#/$defs/surface_capability" },
+        "mobile": { "$ref": "#/$defs/surface_capability" },
+        "semantic_lane": { "$ref": "#/$defs/surface_capability" },
+        "terminal_lane": { "$ref": "#/$defs/surface_capability" }
+      }
+    },
+    "pane_status": {
+      "type": "object",
+      "required": ["panes"],
+      "additionalProperties": false,
+      "properties": {
+        "panes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/host_pane" }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/host_surface_action" }
+    },
+    "remote": { "type": "object" },
+    "workbench": {
+      "type": "object",
+      "required": ["source", "branches", "memory", "permissions"],
+      "properties": {
+        "source": { "const": "kernel_state_bundle_and_project_indexes" },
+        "branches": { "$ref": "#/$defs/count_summary" },
+        "memory": { "$ref": "#/$defs/count_summary" },
+        "permissions": { "type": "object" }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "required": ["total_count", "recent"],
+      "properties": {
+        "total_count": { "type": "integer", "minimum": 0 },
+        "active_session_id": { "type": ["string", "null"], "minLength": 1 },
+        "recent": { "type": "array" }
+      }
+    },
+    "permissions": { "type": "object", "required": ["pending_count", "pending"] },
+    "memory": { "$ref": "#/$defs/count_summary" },
+    "branches": { "$ref": "#/$defs/count_summary" },
+    "reviews": { "$ref": "#/$defs/count_summary" },
+    "research": {
+      "type": "object",
+      "required": ["status", "pending_operations", "next_recommended_action"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "active_thread_id": { "type": ["string", "null"], "minLength": 1 },
+        "active_thread_title": { "type": ["string", "null"], "minLength": 1 },
+        "active_stage_id": { "type": ["string", "null"], "minLength": 1 },
+        "active_stage_class": { "type": ["string", "null"], "minLength": 1 },
+        "active_deliberation_mode": { "type": ["string", "null"], "minLength": 1 },
+        "open_questions": { "type": "array", "items": { "type": "string" } },
+        "agreed_decisions": { "type": "array", "items": { "type": "string" } },
+        "evidence_refs": { "type": "array", "items": { "type": "string" } },
+        "confidence": { "type": ["string", "null"], "minLength": 1 },
+        "pending_operations": { "type": "array", "items": { "type": "string" } },
+        "next_recommended_action": { "type": "string", "minLength": 1 },
+        "compact_research_line": { "type": "string" },
+        "active_question_label": { "type": "string" },
+        "stage_label": { "type": "string" },
+        "evidence_label": { "type": "string" },
+        "evidence_count": { "type": "integer", "minimum": 0 },
+        "open_gap_label": { "type": "string" },
+        "next_action_label": { "type": "string" },
+        "active_run_progress": { "type": "object" },
+        "goal_watch": { "type": "object" },
+        "watch_plan": { "$ref": "#/$defs/goal_watch_plan_projection" },
+        "watch_install_status": { "$ref": "#/$defs/goal_watch_install_status" },
+        "stage_decision_policy": { "$ref": "#/$defs/goal_stage_decision_policy_projection" },
+        "task_pool": { "$ref": "#/$defs/goal_task_pool_snapshot" },
+        "task_pool_maintenance": { "type": "object" },
+        "loop_closure": { "type": "object" },
+        "recovery_governance": { "type": ["object", "null"] },
+        "board": { "$ref": "#/$defs/research_board_projection" }
+      }
+    },
+    "control_owner": { "type": "string", "minLength": 1 },
+    "control_lease_id": { "type": "string", "minLength": 1 },
+    "control_lease_state": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "surface_capability": {
+      "type": "object",
+      "required": ["readiness", "transport", "authority"],
+      "additionalProperties": false,
+      "properties": {
+        "readiness": {
+          "type": "string",
+          "enum": ["projection_ready", "pairing_required"]
+        },
+        "transport": { "type": "string", "minLength": 1 },
+        "authority": { "type": "string", "minLength": 1 },
+        "degraded_reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "host_pane": {
+      "type": "object",
+      "required": [
+        "pane_id",
+        "status",
+        "source",
+        "default_visibility",
+        "data_ref",
+        "item_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pane_id": {
+          "type": "string",
+          "enum": [
+            "branch_review",
+            "conversation",
+            "diagnostics",
+            "diff_artifact",
+            "input_editor",
+            "memory",
+            "permission_overlay",
+            "research_dag",
+            "status_hud",
+            "tool_activity"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["available", "contract_ready", "not_implemented", "degraded"]
+        },
+        "source": { "type": "string", "minLength": 1 },
+        "default_visibility": {
+          "type": "string",
+          "enum": ["visible", "collapsible", "hidden"]
+        },
+        "data_ref": { "type": "string", "minLength": 1 },
+        "item_count": { "type": "integer", "minimum": 0 },
+        "degraded_reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "host_surface_action": {
+      "type": "object",
+      "required": ["action_id", "label", "surface", "gate", "enabled", "command"],
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "enum": [
+            "ack_hitl",
+            "advance_research_loop",
+            "approve_permission",
+            "decide_research_stage",
+            "deny_permission",
+            "inspect_memory",
+            "inspect_recovery_governance",
+            "interrupt_turn",
+            "open_artifact",
+            "open_research",
+            "open_research_board",
+            "open_routines",
+            "remote_attach",
+            "retry_routine_trigger",
+            "resize_terminal",
+            "steer_turn",
+            "submit_prompt",
+            "switch_session",
+            "terminal_attach",
+            "terminal_replay"
+          ]
+        },
+        "label": { "type": "string", "minLength": 1 },
+        "surface": {
+          "type": "string",
+          "enum": ["tui_web_mobile", "web_mobile", "web_mobile_tui"]
+        },
+        "gate": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean" },
+        "disabled_reason": { "type": "string", "minLength": 1 },
+        "control_contract": {
+          "type": "string",
+          "enum": [
+            "direct_runtime_cancellation",
+            "goal_tick_existing_authorities",
+            "notification_backed_interrupt_request",
+            "research_decide_existing_stage_gate",
+            "routine_retry_budget_and_backoff"
+          ]
+        },
+        "fallback_control_contract": {
+          "type": "string",
+          "enum": ["notification_backed_interrupt_request"]
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "requires_trigger_id": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "count_summary": {
+      "type": "object",
+      "required": ["status", "count"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "goal_watch_plan_projection": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "status",
+        "project_id",
+        "workspace_root",
+        "recommended_runner",
+        "install_mode",
+        "interval_ms",
+        "command",
+        "cron_expression",
+        "cron_line",
+        "systemd_user_unit",
+        "status_command",
+        "main_agent_instruction"
+      ],
+      "properties": {
+        "schema_version": { "const": "goal_watch_plan_projection.v1" },
+        "status": { "type": "string", "minLength": 1 },
+        "project_id": { "type": "string", "minLength": 1 },
+        "workspace_root": { "type": "string", "minLength": 1 },
+        "recommended_runner": { "type": "string", "minLength": 1 },
+        "install_mode": { "type": "string", "minLength": 1 },
+        "interval_ms": { "type": "integer", "minimum": 1 },
+        "command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "cron_expression": { "type": "string", "minLength": 1 },
+        "cron_line": { "type": "string", "minLength": 1 },
+        "systemd_user_unit": { "type": "string", "minLength": 1 },
+        "status_command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "main_agent_instruction": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "goal_watch_install_status": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "status",
+        "project_id",
+        "installed",
+        "record_path",
+        "cron_plan_path",
+        "systemd_plan_path",
+        "plan",
+        "next_recommended_action",
+        "warnings"
+      ],
+      "properties": {
+        "schema_version": { "const": "goal_watch_install_status.v1" },
+        "status": { "type": "string", "minLength": 1 },
+        "project_id": { "type": "string", "minLength": 1 },
+        "installed": { "type": "boolean" },
+        "record_path": { "type": "string", "minLength": 1 },
+        "cron_plan_path": { "type": "string", "minLength": 1 },
+        "systemd_plan_path": { "type": "string", "minLength": 1 },
+        "plan": { "$ref": "#/$defs/goal_watch_plan_projection" },
+        "install_record": { "$ref": "#/$defs/goal_watch_install_record" },
+        "system_install": { "$ref": "#/$defs/goal_watch_system_install_status" },
+        "health": { "type": "object" },
+        "next_recommended_action": { "type": "string", "minLength": 1 },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "goal_watch_install_record": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "status",
+        "project_id",
+        "workspace_root",
+        "automation_mode",
+        "install_mode",
+        "installed_at",
+        "executable_path",
+        "record_path",
+        "cron_plan_path",
+        "systemd_plan_path",
+        "command",
+        "cron_line",
+        "systemd_user_unit",
+        "system_marker",
+        "next_recommended_action"
+      ],
+      "properties": {
+        "schema_version": { "const": "goal_watch_install_record.v1" },
+        "status": { "type": "string", "minLength": 1 },
+        "project_id": { "type": "string", "minLength": 1 },
+        "workspace_root": { "type": "string", "minLength": 1 },
+        "automation_mode": { "type": "string", "minLength": 1 },
+        "install_mode": { "type": "string", "minLength": 1 },
+        "installed_at": { "type": "string", "minLength": 1 },
+        "executable_path": { "type": "string", "minLength": 1 },
+        "record_path": { "type": "string", "minLength": 1 },
+        "cron_plan_path": { "type": "string", "minLength": 1 },
+        "systemd_plan_path": { "type": "string", "minLength": 1 },
+        "command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "cron_line": { "type": "string", "minLength": 1 },
+        "systemd_user_unit": { "type": "string", "minLength": 1 },
+        "system_marker": { "type": "string", "minLength": 1 },
+        "applied_runner": { "type": "string", "minLength": 1 },
+        "applied_at": { "type": "string", "minLength": 1 },
+        "applied_artifact_path": { "type": "string", "minLength": 1 },
+        "next_recommended_action": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "goal_watch_system_install_status": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "runner",
+        "status",
+        "installed",
+        "marker",
+        "next_recommended_action"
+      ],
+      "properties": {
+        "schema_version": { "const": "goal_watch_system_install_status.v1" },
+        "runner": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "minLength": 1 },
+        "installed": { "type": "boolean" },
+        "marker": { "type": "string", "minLength": 1 },
+        "artifact_path": { "type": "string", "minLength": 1 },
+        "next_recommended_action": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "goal_stage_decision_policy_projection": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "automation_mode",
+        "status",
+        "auto_approvable_count",
+        "operator_gate_count",
+        "review_or_recovery_count",
+        "next_recommended_action",
+        "main_agent_instruction",
+        "decisions"
+      ],
+      "properties": {
+        "schema_version": { "const": "goal_stage_decision_policy_projection.v1" },
+        "automation_mode": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "minLength": 1 },
+        "auto_approvable_count": { "type": "integer", "minimum": 0 },
+        "operator_gate_count": { "type": "integer", "minimum": 0 },
+        "review_or_recovery_count": { "type": "integer", "minimum": 0 },
+        "next_recommended_action": { "type": "string", "minLength": 1 },
+        "main_agent_instruction": { "type": "string", "minLength": 1 },
+        "decisions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/goal_stage_decision_policy_item" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "goal_stage_decision_policy_item": {
+      "type": "object",
+      "required": [
+        "stage_execution_id",
+        "agent_id",
+        "risk_class",
+        "policy",
+        "operation",
+        "recommended_action_id",
+        "reason"
+      ],
+      "properties": {
+        "stage_execution_id": { "type": "string", "minLength": 1 },
+        "agent_id": { "type": "string", "minLength": 1 },
+        "risk_class": { "type": "string", "minLength": 1 },
+        "policy": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "recommended_action_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "goal_task_pool_snapshot": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "authority_model",
+        "source",
+        "project_id",
+        "automation_mode",
+        "summary",
+        "entries",
+        "next_recommended_action"
+      ],
+      "properties": {
+        "schema_version": { "const": "goal_task_pool_snapshot.v1" },
+        "authority_model": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "project_id": { "type": "string", "minLength": 1 },
+        "automation_mode": { "type": "string", "minLength": 1 },
+        "target_run": { "type": ["object", "null"] },
+        "summary": { "type": "object" },
+        "entries": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "next_recommended_action": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "research_board_projection": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "authority_model",
+        "source",
+        "project_id",
+        "automation_mode",
+        "buckets",
+        "entries",
+        "next_recommended_action"
+      ],
+      "properties": {
+        "schema_version": { "const": "research_board_projection.v1" },
+        "authority_model": { "const": "derived_from_existing_research_authorities" },
+        "source": { "type": "string", "minLength": 1 },
+        "project_id": { "type": "string" },
+        "active_thread_id": { "type": ["string", "null"] },
+        "active_stage_execution_id": { "type": ["string", "null"] },
+        "automation_mode": { "type": "string", "minLength": 1 },
+        "buckets": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/research_board_bucket" }
+        },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/research_board_entry" }
+        },
+        "next_recommended_action": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "research_board_bucket": {
+      "type": "object",
+      "required": ["bucket_id", "label", "description"],
+      "properties": {
+        "bucket_id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "research_board_entry": {
+      "type": "object",
+      "required": [
+        "entry_id",
+        "bucket_id",
+        "title",
+        "summary",
+        "status",
+        "source",
+        "write_authority"
+      ],
+      "properties": {
+        "entry_id": { "type": "string", "minLength": 1 },
+        "bucket_id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "status": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/research_board_entry_source" },
+        "write_authority": { "const": "read_only_projection" },
+        "action_policy": {
+          "type": ["string", "null"],
+          "enum": ["allowed", "requires_approval", "hard_blocked", null]
+        }
+      },
+      "additionalProperties": false
+    },
+    "research_board_entry_source": {
+      "type": "object",
+      "required": ["source_kind", "source_id"],
+      "properties": {
+        "source_kind": { "type": "string", "minLength": 1 },
+        "source_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

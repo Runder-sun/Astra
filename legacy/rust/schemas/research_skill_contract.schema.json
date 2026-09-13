@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_skill_contract.schema.json",
+  "title": "ResearchSkillContract",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "skill_id",
+    "compatible_stage_classes",
+    "required_outputs"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_skill_contract.v1" },
+    "conformance_line": { "enum": ["M10.research_runtime", "M11.skill_publication"] },
+    "skill_id": { "type": "string", "minLength": 1 },
+    "compatible_stage_classes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "required_outputs": {
+      "type": "array",
+      "items": { "enum": ["doc_frame", "change_envelope", "debate_packet", "report"] }
+    },
+    "allowed_output_kinds": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "plan",
+          "review",
+          "report",
+          "handoff",
+          "experiment_result",
+          "patch",
+          "dataset",
+          "figure",
+          "paper_section"
+        ]
+      }
+    },
+    "doc_frame_required": { "type": "boolean" },
+    "canonicality_policy": {
+      "enum": [
+        "private_only",
+        "candidate_only",
+        "requires_review",
+        "winner_only_public_surface"
+      ]
+    },
+    "human_gate_required": { "type": "boolean" },
+    "allowed_write_scopes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "runner_adapter": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

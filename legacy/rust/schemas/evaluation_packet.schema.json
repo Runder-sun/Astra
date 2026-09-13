@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evaluation_packet.schema.json",
+  "title": "EvaluationPacket",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "evaluation_id",
+    "branch_id",
+    "batch_id",
+    "base_commit",
+    "current_commit",
+    "stale_base",
+    "changed_paths",
+    "claimed_paths",
+    "test_commands",
+    "test_outcomes",
+    "schema_checks",
+    "canonicality_gate",
+    "reviewer_gate_status",
+    "objective_metric_delta",
+    "risk_score",
+    "blocking_issues",
+    "promotion_eligible",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "evaluation_packet.v1" },
+    "conformance_line": { "const": "M9.branch_evaluation" },
+    "evaluation_id": { "type": "string", "minLength": 1 },
+    "branch_id": { "type": "string", "minLength": 1 },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "base_commit": { "type": "string" },
+    "current_commit": { "type": "string" },
+    "stale_base": { "type": "boolean" },
+    "changed_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "claimed_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "test_commands": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "test_outcomes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evaluation_outcome" }
+    },
+    "schema_checks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evaluation_outcome" }
+    },
+    "canonicality_gate": { "$ref": "#/$defs/evaluation_outcome" },
+    "reviewer_gate_status": { "enum": ["requires_debate_trace", "passed", "blocked"] },
+    "objective_metric_delta": { "type": "number" },
+    "risk_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "blocking_issues": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "promotion_eligible": { "type": "boolean" },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "evaluation_outcome": {
+      "type": "object",
+      "required": ["name", "status", "detail"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["passed", "failed", "blocked", "skipped"] },
+        "detail": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

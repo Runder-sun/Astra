@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "research_stage_inspection.schema.json",
+  "title": "ResearchStageInspection",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "stage_execution",
+    "thread",
+    "deliberation_spans",
+    "decisions"
+  ],
+  "properties": {
+    "schema_version": { "const": "research_stage_inspection.v1" },
+    "conformance_line": { "const": "M10.research_runtime" },
+    "stage_execution": { "type": "object" },
+    "thread": { "type": "object" },
+    "deliberation_spans": { "type": "array", "items": { "type": "object" } },
+    "decisions": { "type": "array", "items": { "type": "object" } }
+  },
+  "additionalProperties": false
+}

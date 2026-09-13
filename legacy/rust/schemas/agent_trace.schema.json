@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_trace.schema.json",
+  "title": "AgentTrace",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "agent_id",
+    "trace_id",
+    "task_packet_ref",
+    "runtime_events",
+    "tool_actions",
+    "permission_decisions",
+    "output_records",
+    "final_status",
+    "created_at",
+    "trace_path"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "agent_id": { "type": "string", "minLength": 1 },
+    "trace_id": { "type": "string", "minLength": 1 },
+    "task_packet_ref": { "type": "string", "minLength": 1 },
+    "runtime_events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trace_event" }
+    },
+    "tool_actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trace_event" }
+    },
+    "permission_decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trace_event" }
+    },
+    "output_records": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trace_event" }
+    },
+    "final_status": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "trace_path": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "trace_event": {
+      "type": "object",
+      "required": ["event", "detail", "timestamp"],
+      "properties": {
+        "event": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" },
+        "timestamp": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

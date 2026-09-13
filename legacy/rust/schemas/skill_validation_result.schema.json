@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_validation_result.schema.json",
+  "title": "SkillValidationResult",
+  "type": "object",
+  "required": ["scope", "overall_status", "validated_count", "availability_records"],
+  "properties": {
+    "scope": { "type": "string", "minLength": 1 },
+    "overall_status": { "type": "string", "minLength": 1 },
+    "validated_count": { "type": "integer", "minimum": 0 },
+    "availability_records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "skill_id",
+          "enabled",
+          "degraded",
+          "disabled_reason",
+          "stage_compatibility",
+          "dependency_health",
+          "manifest_path"
+        ],
+        "properties": {
+          "skill_id": { "type": "string", "minLength": 1 },
+          "enabled": { "type": "boolean" },
+          "degraded": { "type": "boolean" },
+          "disabled_reason": { "type": "string" },
+          "stage_compatibility": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "dependency_health": { "type": "string", "minLength": 1 },
+          "manifest_path": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "degraded_skill_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["skill_id", "severity", "message"],
+        "properties": {
+          "skill_id": { "type": "string", "minLength": 1 },
+          "severity": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

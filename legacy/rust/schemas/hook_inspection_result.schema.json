@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hook_inspection_result.schema.json",
+  "title": "HookInspectionResult",
+  "type": "object",
+  "required": [
+    "hook_id",
+    "owner_plugin_id",
+    "trigger",
+    "source_path",
+    "timeout_policy",
+    "failure_policy",
+    "last_health_record"
+  ],
+  "properties": {
+    "hook_id": { "type": "string", "minLength": 1 },
+    "owner_plugin_id": { "type": "string", "minLength": 1 },
+    "trigger": { "type": "string", "minLength": 1 },
+    "source_path": { "type": "string", "minLength": 1 },
+    "timeout_policy": { "type": "string", "minLength": 1 },
+    "failure_policy": { "type": "string", "minLength": 1 },
+    "last_health_record": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

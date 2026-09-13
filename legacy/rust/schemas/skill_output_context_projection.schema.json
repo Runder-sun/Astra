@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill_output_context_projection.schema.json",
+  "title": "SkillOutputContextProjection",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_line",
+    "projection_policy",
+    "public_latest",
+    "evolved_recommendations",
+    "review_candidate_count",
+    "private_candidate_count",
+    "omitted_candidate_count"
+  ],
+  "properties": {
+    "schema_version": { "const": "skill_output_context_projection.v1" },
+    "conformance_line": { "const": "M11.skill_publication" },
+    "projection_policy": { "const": "public_latest_plus_verified_evolution_recommendations" },
+    "public_latest": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "envelope_id",
+          "artifact_id",
+          "artifact_path",
+          "doc_frame_ref",
+          "published_at"
+        ],
+        "properties": {
+          "envelope_id": { "type": "string", "minLength": 1 },
+          "artifact_id": { "type": "string" },
+          "artifact_path": { "type": "string" },
+          "doc_frame_ref": { "type": "string" },
+          "published_at": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "evolved_recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "candidate_id",
+          "cluster_id",
+          "skill_id",
+          "title",
+          "trigger",
+          "skill_artifact_path",
+          "verification_status",
+          "publication_status",
+          "recommendation_reason",
+          "support_refs"
+        ],
+        "properties": {
+          "candidate_id": { "type": "string", "minLength": 1 },
+          "cluster_id": { "type": "string", "minLength": 1 },
+          "skill_id": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "trigger": { "type": "string", "minLength": 1 },
+          "skill_artifact_path": { "type": "string", "minLength": 1 },
+          "verification_status": { "const": "verified" },
+          "publication_status": { "enum": ["not_submitted", "submitted_to_m11_governance"] },
+          "recommendation_reason": { "const": "verified_evolved_skill_candidate_advisory_only" },
+          "support_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "review_candidate_count": { "type": "integer", "minimum": 0 },
+    "private_candidate_count": { "type": "integer", "minimum": 0 },
+    "omitted_candidate_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

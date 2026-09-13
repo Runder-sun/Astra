@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_worktree_artifact_candidate_manifest.schema.json",
+  "title": "AgentWorktreeArtifactCandidateManifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "agent_id",
+    "authority_scope",
+    "adoption_status",
+    "workspace_binding_ref",
+    "source_workspace_root",
+    "worktree_path",
+    "git_head",
+    "status_entries",
+    "changed_paths",
+    "untracked_paths",
+    "generated_at"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "agent_id": { "type": "string", "minLength": 1 },
+    "authority_scope": { "type": "string", "minLength": 1 },
+    "adoption_status": { "type": "string", "minLength": 1 },
+    "workspace_binding_ref": { "type": "string", "minLength": 1 },
+    "source_workspace_root": { "type": "string", "minLength": 1 },
+    "worktree_path": { "type": "string", "minLength": 1 },
+    "git_head": { "type": "string", "minLength": 1 },
+    "status_entries": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "changed_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "untracked_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "patch_ref": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "machine_identity.schema.json",
+  "title": "MachineIdentity",
+  "type": "object",
+  "required": ["schema_version", "machine_id", "status", "key_algorithm", "public_key_ref", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "machine_id": { "type": "string" },
+    "status": { "type": "string", "minLength": 1 },
+    "key_algorithm": { "type": "string" },
+    "public_key_ref": { "type": "string" },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage_execution_map.schema.json",
+  "title": "StageExecutionMap",
+  "type": "object",
+  "required": ["schema_version", "conformance_line", "entries"],
+  "properties": {
+    "schema_version": { "const": "stage_execution_map.v1" },
+    "conformance_line": { "const": "M10.research_runtime" },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "stage_id",
+          "stage_class",
+          "allowed_operations",
+          "default_next_stage_id",
+          "requires_change_envelope",
+          "requires_human_gate",
+          "compatible_skill_stages"
+        ],
+        "properties": {
+          "stage_id": { "type": "string", "minLength": 1 },
+          "stage_class": { "type": "string", "minLength": 1 },
+          "allowed_operations": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "advance",
+                "retry",
+                "repair",
+                "pivot",
+                "fork",
+                "supersede",
+                "abandon",
+                "human_override"
+              ]
+            },
+            "minItems": 1
+          },
+          "default_next_stage_id": { "type": ["string", "null"] },
+          "requires_change_envelope": { "type": "boolean" },
+          "requires_human_gate": { "type": "boolean" },
+          "compatible_skill_stages": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
