@@ -371,8 +371,8 @@
     },
     {
       "path": "docs/homepage.css",
-      "sha256": "aedade321efef6ed84ed6d35598bbeaf7e60094cf284ad3ef30a669b44975b10",
-      "size": 7179
+      "sha256": "47649505e38c83a8af29ff4fbaa15a1bc39f7672f918b52cb7fe540f2a158918",
+      "size": 10047
     },
     {
       "path": "docs/homepage.js",
@@ -381,8 +381,8 @@
     },
     {
       "path": "docs/index.html",
-      "sha256": "7d548c52a19caf233fed5037ad903ab8967a3834e7cb9a25efc1effef0007913",
-      "size": 6558
+      "sha256": "da827477900cce178bbf84039d005c0323f141343f6f94a93b34b79b6d1ec592",
+      "size": 7229
     },
     {
       "path": "docs/superpowers/plans/2026-04-23-rust-kernel-pivot-bootstrap.md",
