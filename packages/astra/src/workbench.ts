@@ -3,13 +3,17 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { basename, extname, join, relative, resolve } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { assertAstraId } from "./contracts.ts";
+import { researchMilestones } from "./progress.ts";
+import { ResearchJob } from "./research.ts";
 import type { ResearchControlRequest } from "./research-control.ts";
 import { DEFAULT_STAGES } from "./stages.ts";
+import { JsonlAstraStore } from "./store.ts";
+import { readVersionedFile, taskWorkspacePath } from "./task-workspace.ts";
 import type { JobSnapshot } from "./types.ts";
 
 interface Entry {
@@ -47,9 +51,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				jobId: string;
 			};
 			assertAstraId(active.jobId, "job id");
-			return JSON.parse(
-				await readFile(join(entry.root, ".astra/jobs", active.jobId, "job.json"), "utf8"),
-			) as JobSnapshot;
+			return (await ResearchJob.open(new JsonlAstraStore(entry.root), active.jobId))?.state;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
@@ -153,9 +155,11 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 			}
 			const entry = entries.get(url.searchParams.get("id") ?? "");
 			if (req.method === "GET" && url.pathname === "/api/job" && entry) {
+				const state = await snapshot(entry);
 				json(200, {
 					...entry,
-					snapshot: await snapshot(entry),
+					snapshot: state,
+					milestones: state ? researchMilestones(state) : [],
 					running: Boolean(running.get(entry.id)?.child),
 					output: running.get(entry.id)?.output ?? "",
 					error: running.get(entry.id)?.error,
@@ -168,19 +172,24 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				const ref = url.searchParams.get("ref") ?? "";
 				const evidence = artifact && state?.evidence[artifact.evidenceId];
 				if (!artifact || !evidence?.refs.includes(ref)) throw new Error("文件不属于该成果的交付记录");
-				const jobRoot = await realpath(join(entry.root, ".astra/jobs", state!.frame.jobId));
-				const path = await realpath(resolve(entry.root, ref));
-				const inside = relative(jobRoot, path);
-				if (!inside || inside.startsWith("..") || resolve(jobRoot, inside) !== path)
-					throw new Error("文件不在任务目录内");
-				const info = await stat(path);
-				if (!info.isFile() || info.size > 32 * 1024 * 1024) throw new Error("文件不可下载或超过 32 MiB");
+				const task = state?.tasks[evidence.taskId];
+				if (!task) throw new Error("交付任务记录缺失");
+				const workspace = taskWorkspacePath(entry.root, task.jobId, task.id);
+				const path = resolve(ref.startsWith(".astra/") ? entry.root : workspace, ref);
+				const bytes = await readVersionedFile(
+					{ ...task, scope: { ...task.scope, workspaceRoot: entry.root } },
+					evidence,
+					ref,
+					path,
+					workspace,
+				);
+				if (!bytes || bytes.length > 32 * 1024 * 1024) throw new Error("文件不可下载或超过 32 MiB");
 				res.writeHead(200, {
 					"Content-Type": extname(path) === ".pdf" ? "application/pdf" : "application/octet-stream",
 					"Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(basename(path))}`,
 					"X-Content-Type-Options": "nosniff",
 				});
-				res.end(await readFile(path));
+				res.end(bytes);
 				return;
 			}
 			if (req.method !== "POST") {

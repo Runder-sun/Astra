@@ -13,7 +13,7 @@ const rootFiles = new Set([
 	"pi-test.bat", "pi-test.ps1", "pi-test.sh", "test.sh", "tsconfig.base.json", "tsconfig.json", "vitest.base.ts",
 ]);
 const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: root }).toString().split("\0").filter(Boolean);
-const added = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z", "packages/astra", "scripts/prepare-astra-source.mjs", "scripts/smoke-astra-package.mjs", "RELEASE_NOTES.md", "RELEASE_VALIDATION.md"], { cwd: root }).toString().split("\0").filter(Boolean);
+const added = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z", "packages/astra", "scripts/prepare-astra-source.mjs", "scripts/smoke-astra-package.mjs", "RELEASE_NOTES.md", "RELEASE_VALIDATION.md", "docs/index.html", "docs/homepage.css", "docs/homepage.js", "docs/.nojekyll", "docs/superpowers/reviews/2026-09-15-joint-review-fix-status.md"], { cwd: root }).toString().split("\0").filter(Boolean);
 // Offline compilation needs the validated catalog data normally excluded by Git.
 execFileSync(process.execPath, ["packages/ai/scripts/check-model-data.ts"], { cwd: root, stdio: "inherit" });
 const modelData = readdirSync(join(root, "packages/ai/src/providers/data"))

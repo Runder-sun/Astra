@@ -1,7 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { FIXTURE_PDF_SOURCE } from "./fixture-pdf.ts";
 
 export async function fetchAstraFixtureOpenAlex(_input: string | URL, _init?: RequestInit): Promise<Response> {
 	return new Response(
@@ -76,10 +78,13 @@ export function createAstraFixtureProvider(): ExtensionFactory {
 						content.manuscript = "paper-manuscript.md";
 					}
 					if (process.env.ASTRA_STAGE_ID === "paper-compile") {
-						writeFileSync(join(process.cwd(), "paper.pdf"), "%PDF-1.4\n% Astra fixture\n", "utf8");
-						writeFileSync(join(process.cwd(), "paper-build.log"), "fixture paper build passed\n", "utf8");
+						writeFileSync("paper-build.mjs", FIXTURE_PDF_SOURCE);
+						writeFileSync("paper-build.log", execFileSync(process.execPath, ["paper-build.mjs", "paper.pdf"]));
 						content.artifact = "paper.pdf";
 						content.buildLog = "paper-build.log";
+						content.source = "paper-build.mjs";
+						content.buildInputs = ["paper-build.mjs"];
+						content.command = "node paper-build.mjs paper.pdf";
 					}
 					const sourceStage = ["literature", "novelty", "paper-write", "research-review"].includes(
 						process.env.ASTRA_STAGE_ID ?? "",
@@ -103,6 +108,7 @@ export function createAstraFixtureProvider(): ExtensionFactory {
 								? [
 										{ kind: "artifact", ref: "paper.pdf", summary: "compiled fixture paper" },
 										{ kind: "log", ref: "paper-build.log", summary: "fixture paper build log" },
+										{ kind: "artifact", ref: "paper-build.mjs", summary: "editable fixture generator" },
 									]
 								: sourceStage
 									? sourceRefs
@@ -253,8 +259,9 @@ export function createAstraFixtureProvider(): ExtensionFactory {
 						!existsSync(searchContinuationMarker);
 					if (continueFixtureSearch)
 						writeFileSync(searchContinuationMarker, `${new Date().toISOString()}\n`, "utf8");
-					const routeAction =
-						stageId === "research-review"
+					const routeAction = process.env.ASTRA_REPAIR_OBLIGATION_ID
+						? "continue"
+						: stageId === "research-review"
 							? completionBlockers.length === 0
 								? "complete"
 								: "backtrack"

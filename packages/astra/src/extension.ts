@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionFactory, ToolCallEvent } 
 import { Type } from "typebox";
 import {
 	readTaskPacket,
+	taskStageContract,
 	writeMainDecisionManifest,
 	writeReviewerOutputManifest,
 	writeStagePlanManifest,
@@ -24,6 +25,7 @@ import {
 	runResearchControl,
 } from "./research-control.ts";
 import { JsonlAstraStore } from "./store.ts";
+import { readVersionedFile } from "./task-workspace.ts";
 import type {
 	AutomationLevel,
 	MainAgentDecisionManifest,
@@ -105,7 +107,6 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 		let researchControlStarted = false;
 		let taskToolCallCount = 0;
 		let literatureSearchCallCount = 0;
-		let researchReviewCanonicalReadCount = 0;
 		let terminalSubmissionCompleted = false;
 		pi.registerFlag("astra-research-control", {
 			description: "Run an Astra research control action through the Pi runtime",
@@ -288,17 +289,6 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					return { block: true, reason: "worker file tools must stay inside the isolated task workspace" };
 				}
 				if (current.role === "worker" && event.toolName === "read" && requestedPath !== "ASTRA_TASK_CONTEXT.json") {
-					if (packet.stageId === "research-review" && /^(?:\.\/)?canonical\/[^/]+\.json$/.test(requestedPath)) {
-						researchReviewCanonicalReadCount++;
-						if (researchReviewCanonicalReadCount > 3) {
-							taskToolCallCount--;
-							return {
-								block: true,
-								reason:
-									"Research-review may inspect at most three canonical digests. Use review-summary.json and submit the evidence audit.",
-							};
-						}
-					}
 					try {
 						const metadata = await stat(target);
 						if (metadata.isFile() && metadata.size > MAX_WORKER_DIRECT_READ_BYTES) {
@@ -320,14 +310,6 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			}
 			if (event.toolName === "bash") {
 				const command = String(input.command ?? "");
-				if (packet?.stageId === "research-review" && /\bcat\s+(?:[^\n]*\/)?canonical\//.test(command)) {
-					taskToolCallCount--;
-					return {
-						block: true,
-						reason:
-							"Research-review bash may not bypass the canonical digest limit. Use review-summary.json or bounded jq output.",
-					};
-				}
 				if (/\b(rm|git\s+(reset|clean)|sudo|mkfs|shutdown|mount|chroot)\b/.test(command)) {
 					return { block: true, reason: "Astra destructive command gate" };
 				}
@@ -439,7 +421,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 		]);
 		const missionCoverageParameter = Type.Union([Type.Literal("sufficient"), Type.Literal("insufficient")]);
 		const workerContentParameters =
-			process.env.ASTRA_STAGE_ID === "result-to-claim"
+			(process.env.ASTRA_REQUIRED_OUTPUT_TYPE ?? process.env.ASTRA_STAGE_ID) === "result-to-claim"
 				? Type.Object({
 						scientificOutcome: scientificOutcomeParameter,
 						missionCoverage: missionCoverageParameter,
@@ -449,15 +431,15 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 						missingEvidence: Type.Array(Type.Unknown(), { maxItems: 20 }),
 						conclusion: Type.String({ maxLength: 4_000 }),
 					})
-				: process.env.ASTRA_STAGE_ID === "research-review"
+				: (process.env.ASTRA_REQUIRED_OUTPUT_TYPE ?? process.env.ASTRA_STAGE_ID) === "research-review"
 					? Type.Object({
 							verdict: Type.String({ maxLength: 40 }),
 							scientificOutcome: scientificOutcomeParameter,
 							missionCoverage: missionCoverageParameter,
-							strengths: Type.Array(Type.String({ maxLength: 180 }), { maxItems: 3 }),
-							weaknesses: Type.Array(Type.String({ maxLength: 240 }), { maxItems: 5 }),
-							claimAudit: Type.Array(Type.String({ maxLength: 240 }), { maxItems: 5 }),
-							requiredRepairs: Type.Array(Type.String({ maxLength: 240 }), { maxItems: 5 }),
+							strengths: Type.Array(Type.String()),
+							weaknesses: Type.Array(Type.String()),
+							claimAudit: Type.Array(Type.String()),
+							requiredRepairs: Type.Array(Type.String()),
 						})
 					: Type.Unknown({ description: "Structured object containing every requiredOutputField" });
 
@@ -513,7 +495,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 						{
 							executionRoot: ctx.cwd,
 							sessionRef: `pi-session:${process.env.ASTRA_SESSION_ID ?? `${packet.jobId}:${packet.id}:${packet.attempt}`}`,
-							minSourceRefs: job.definitions[packet.stageId]?.minSourceRefs ?? 0,
+							minSourceRefs: taskStageContract(job.definitions[packet.stageId], packet).minSourceRefs ?? 0,
 						},
 					);
 				} catch (error) {
@@ -686,6 +668,71 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 		});
 
 		pi.registerTool({
+			name: "astra_read_research_object",
+			label: "Read research object",
+			description:
+				"Read a research object by job-owned ID, or its declared frozen UTF-8 file using fileRef. Results are paginated; arbitrary filesystem paths are not accepted.",
+			parameters: Type.Object({
+				id: Type.String({ minLength: 1 }),
+				fileRef: Type.Optional(Type.String({ minLength: 1 })),
+				offset: Type.Optional(Type.Integer({ minimum: 0 })),
+				limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 16000 })),
+			}),
+			async execute(_id, params, _signal, _update, ctx) {
+				const current = getState(ctx);
+				if (current.role !== "main-agent") return result("Only the main-agent session may read research objects");
+				const jobId = current.jobIdOverride ?? (await readActiveJobId(projectRoot(ctx)));
+				if (!jobId) return result("No active Astra research job");
+				const job = await ResearchJob.open(current.store, jobId);
+				if (!job) return result("No active Astra research job");
+				const collections = [
+					job.state.canonical,
+					job.state.evidence,
+					job.state.tasks,
+					job.state.reviews,
+					job.state.obligations,
+					job.state.stagePlans,
+					job.state.graph.nodes,
+					job.state.searchBatches,
+					job.state.candidateEvaluations,
+					job.state.routeDecisions,
+				];
+				const object = collections
+					.flatMap((collection) => Object.values(collection))
+					.find((value) => value.id === params.id);
+				if (!object) return result(`Unknown research object: ${params.id}`);
+				let serialized = JSON.stringify(object);
+				let sha256: string | undefined;
+				if (params.fileRef !== undefined) {
+					const evidence = job.state.evidence[job.state.canonical[params.id]?.evidenceId ?? params.id];
+					const file = evidence?.files?.find((entry) => entry.sourceRef === params.fileRef);
+					if (!evidence || !file || !evidence.refs.includes(file.sourceRef))
+						throw new Error("File must be a declared frozen evidence ref");
+					const task = job.state.tasks[evidence.taskId];
+					if (!task) throw new Error("Frozen evidence task is missing");
+					const bytes = await readVersionedFile(task, evidence, file.sourceRef, "", "");
+					if (!bytes) throw new Error("Frozen evidence file is missing");
+					serialized = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+					if (serialized.includes("\u0000"))
+						throw new Error("Read a text extraction or page preview instead of a binary file");
+					sha256 = file.sha256;
+				}
+				const offset = params.offset ?? 0;
+				const limit = params.limit ?? 16000;
+				const end = Math.min(serialized.length, offset + limit);
+				const page = {
+					id: params.id,
+					...(params.fileRef !== undefined ? { fileRef: params.fileRef, sha256 } : {}),
+					offset,
+					totalCharacters: serialized.length,
+					text: serialized.slice(offset, end),
+					...(end < serialized.length ? { nextOffset: end } : {}),
+				};
+				return result(JSON.stringify(page), page);
+			},
+		});
+
+		pi.registerTool({
 			name: "astra_submit_stage_plan",
 			label: "Submit stage plan",
 			description: "Persist a main-agent-authored plan containing scoped worker tasks.",
@@ -696,6 +743,9 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					Type.Object({
 						key: Type.String({ minLength: 1, maxLength: 80, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$" }),
 						objective: Type.String({ minLength: 10 }),
+						deliveryKind: Type.Optional(
+							Type.Union([Type.Literal("stage"), Type.Literal("local"), Type.Literal("synthesis")]),
+						),
 						hypothesis: Type.Optional(Type.String({ minLength: 5 })),
 						inputArtifactRefs: Type.Array(Type.String()),
 						requiredOutputFields: Type.Array(Type.String(), { minItems: 1 }),
@@ -774,7 +824,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					const missing = definition.requiredOutputFields.filter(
 						(field) => !task.requiredOutputFields.includes(field),
 					);
-					if (missing.length > 0) {
+					if (task.deliveryKind !== "local" && missing.length > 0) {
 						return result(
 							`Stage plan rejected: task ${task.key} omits fields ${missing.join(", ")}`,
 						) as AgentToolResult<unknown>;

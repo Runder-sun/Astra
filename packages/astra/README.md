@@ -115,6 +115,12 @@ checks validate the review contract, not the scientific truth of cited evidence.
 deliverables. Dynamic routing may skip irrelevant capabilities, but it cannot
 skip required artifacts.
 
+论文编译交付需要主机安装 Poppler 的 `pdfinfo`。预检要求可解析且至少一页的 PDF、非空编译日志、可编辑入口 `source`、完整本地输入清单 `buildInputs` 和编译命令；所有输入必须附带文件引用。解析器缺失会明确拒绝提交。预检不代替源码重编译、输入清单完整性审核或页面视觉审核。
+
+Pi 主代理可用 `astra_read_research_object` 按当前研究的对象编号分页读取完整结构化证据、审核和路线记录；提供声明的 `fileRef` 可读取经过哈希核验的冻结 UTF-8 文件，不接受任意路径。二进制材料需要文本提取或页面预览。整体审阅允许在任务预算内检查全部材料和主张，未核验部分必须明确报告。
+
+开放审核问题下，主代理先选择修复当前成果、回退上游或请求用户，不能直接推进或完成。回退后的修复任务使用当前有效上游，旧失败成果只作为明确声明的对照目标；原问题保留到重新审核和验收通过。
+
 Inside Pi interactive mode, `/research-board` shows questions, hypotheses,
 claims, objections, candidate scores, budget, and the next decision.
 `/research-guide <text>` records user guidance in the same canonical graph, and

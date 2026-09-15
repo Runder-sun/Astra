@@ -1,13 +1,18 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { promisify } from "node:util";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { FIXTURE_PDF_SOURCE } from "../src/fixture-pdf.ts";
+import { sourceReceiptFilename, writeSourceReceipt } from "../src/literature.ts";
 import type { TaskPacket } from "../src/types.ts";
 import { validateWorkerSubmission } from "../src/worker-submission.ts";
 
 const tempRoots: string[] = [];
 
 afterEach(async () => {
+	vi.unstubAllEnvs();
 	await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -45,6 +50,95 @@ function packet(root: string): TaskPacket {
 }
 
 describe("worker submission validation", () => {
+	it("parses compiled PDFs and requires the log, editable source and complete declared local inputs", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-paper-preflight-"));
+		tempRoots.push(root);
+		await writeFile(join(root, "build.mjs"), FIXTURE_PDF_SOURCE);
+		const build = await promisify(execFile)(process.execPath, ["build.mjs", "paper.pdf"], { cwd: root });
+		await writeFile(join(root, "build.log"), build.stdout);
+		const task = { ...packet(root), requiredOutputType: "paper-compile", requiredOutputFields: ["artifact"] };
+		const content = {
+			artifact: "paper.pdf",
+			command: "node build.mjs paper.pdf",
+			buildLog: "build.log",
+			source: "build.mjs",
+			buildInputs: ["build.mjs"],
+		};
+		const refs = [
+			{ kind: "artifact", ref: "paper.pdf", summary: "compiled" },
+			{ kind: "artifact", ref: "build.mjs", summary: "editable source" },
+			{ kind: "log", ref: "build.log", summary: "build log" },
+		];
+		const submit = (value: Record<string, unknown> = content) =>
+			validateWorkerSubmission(
+				task,
+				{ artifactType: "paper-compile", content: value, refs },
+				{ executionRoot: root, sessionRef: "test:paper" },
+			);
+		await expect(submit()).resolves.toBeDefined();
+		vi.stubEnv("PATH", root);
+		await expect(submit()).rejects.toThrow(/requires pdfinfo/);
+		vi.unstubAllEnvs();
+		await expect(submit({ ...content, command: "" })).rejects.toThrow(/command/);
+		await expect(submit({ ...content, buildLog: [] })).rejects.toThrow(/buildLog/);
+		await expect(submit({ ...content, source: "absent.tex" })).rejects.toThrow(/source/);
+		await expect(submit({ ...content, buildInputs: ["build.mjs", "missing.bib"] })).rejects.toThrow(/buildInputs/);
+		await expect(submit({ ...content, buildInputs: [] })).rejects.toThrow(/buildInputs/);
+		await writeFile(join(root, "build.log"), "");
+		await expect(submit()).rejects.toThrow(/empty/);
+		await writeFile(join(root, "build.log"), build.stdout);
+		await writeFile(join(root, "paper.pdf"), "%PDF-1.4\nnot an actual PDF\n%%EOF");
+		await expect(submit()).rejects.toThrow(/PDF/);
+	});
+	it.each([
+		"unassessed claim",
+		{ statement: "missing judgment" },
+		{ statement: "conditional", assessment: "supported-if-replicated" },
+	])("rejects a result claim without an explicit valid assessment: %j", async (claim) => {
+		const task = {
+			...packet("/tmp"),
+			requiredOutputType: "result-to-claim",
+			requiredOutputFields: ["claims", "scientificOutcome", "missionCoverage"],
+		};
+		await expect(
+			validateWorkerSubmission(
+				task,
+				{
+					artifactType: "result-to-claim",
+					content: { claims: [claim], scientificOutcome: "supported", missionCoverage: "sufficient" },
+					refs: [],
+				},
+				{ executionRoot: "/tmp", sessionRef: "test:claim" },
+			),
+		).rejects.toThrow(/claim.*assessment/);
+	});
+	it("requires a matching intact retrieval receipt for every cited source", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-source-receipt-"));
+		tempRoots.push(root);
+		const task = { ...packet(root), requiredOutputFields: ["content"] };
+		const sourceRef = "doi:10.1234/example";
+		const submission = {
+			artifactType: task.requiredOutputType,
+			content: { content: "bounded review" },
+			refs: [{ kind: "source", ref: sourceRef, summary: "metadata" }],
+		};
+		const options = { executionRoot: root, sessionRef: "pi-session:test", minSourceRefs: 1 };
+		await expect(validateWorkerSubmission(task, submission, options)).rejects.toThrow(/receipt/);
+		await writeSourceReceipt(
+			{ workspaceRoot: root, jobId: task.jobId, query: "example", limit: 1 },
+			{ sourceRef, title: "Example", authors: [] },
+			"fixture",
+			new Date().toISOString(),
+		);
+		await expect(validateWorkerSubmission(task, submission, options)).resolves.toMatchObject({
+			content: submission.content,
+		});
+		await writeFile(
+			join(root, ".astra/jobs", task.jobId, "sources", sourceReceiptFilename(sourceRef)!),
+			JSON.stringify({ sourceRef, record: { sourceRef, title: "fabricated" }, sha256: "invalid" }),
+		);
+		await expect(validateWorkerSubmission(task, submission, options)).rejects.toThrow(/receipt/);
+	});
 	it.each(["result-to-claim", "research-review"])(
 		"rejects unparseable outcome labels before reviewing %s",
 		async (artifactType) => {

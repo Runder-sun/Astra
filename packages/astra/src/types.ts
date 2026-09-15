@@ -105,6 +105,7 @@ export interface StageDefinition {
 }
 
 export interface StageState {
+	invalidatedBy?: string;
 	definitionId: string;
 	status: StageStatus;
 	executionId?: string;
@@ -117,6 +118,12 @@ export interface StageState {
 }
 
 export interface TaskPacket {
+	planId?: string;
+	repairChecks?: Array<{ issueId: string; criterion: string }>;
+	deliveryKind?: "stage" | "local" | "synthesis";
+	stageRevision?: number;
+	repairOfEvidenceId?: string;
+	version?: TaskVersion;
 	schemaVersion: "astra.task_packet.v1";
 	id: string;
 	jobId: string;
@@ -271,6 +278,7 @@ export interface MainAgentDecisionManifest {
 }
 
 export interface PlannedTask {
+	deliveryKind?: "stage" | "local" | "synthesis";
 	key: string;
 	objective: string;
 	inputArtifactRefs: string[];
@@ -315,6 +323,9 @@ export interface ProviderBackoffState {
 }
 
 export interface Evidence {
+	taskVersion?: TaskVersion;
+	files?: EvidenceFileVersion[];
+	versionHash?: string;
 	id: string;
 	taskId: string;
 	stageId: string;
@@ -331,6 +342,7 @@ export interface Evidence {
 }
 
 export interface Review {
+	targetVersionHash?: string;
 	id: string;
 	evidenceId: string;
 	reviewerTaskId?: string;
@@ -345,6 +357,16 @@ export interface Review {
 }
 
 export interface Obligation {
+	stageId?: string;
+	evidenceId?: string;
+	targetVersionHash?: string;
+	items?: Array<{
+		id: string;
+		criterion: string;
+		status: "open" | "resolved";
+		reviewId?: string;
+		evidenceId?: string;
+	}>;
 	id: string;
 	sourceReviewId: string;
 	description: string;
@@ -367,7 +389,9 @@ export interface CanonicalArtifact {
 		| "baseline_visible"
 		| "integration_verified"
 		| "active"
+		| "stale"
 		| "retired";
+	invalidatedBy?: string;
 	replacementOf?: string;
 	evidenceSnapshotHash?: string;
 	sourceSha256?: string;
@@ -518,6 +542,7 @@ export interface CanonicalResearchRoute {
 }
 
 export interface JobSnapshot {
+	stageDefinitions?: Record<string, StageDefinition>;
 	version: 1;
 	frame: MissionFrame;
 	stages: Record<string, StageState>;
@@ -547,6 +572,7 @@ export interface JobSnapshot {
 
 export type AstraEvent =
 	| { type: "job_created"; snapshot: JobSnapshot }
+	| { type: "task_version_recorded"; taskId: string; version: TaskVersion }
 	| { type: "lease_acquired"; lease: Lease }
 	| { type: "lease_released"; owner: string }
 	| { type: "stage_plan_recorded"; plan: StagePlanManifest }
@@ -558,6 +584,7 @@ export type AstraEvent =
 	| { type: "review_recorded"; review: Review }
 	| { type: "obligation_created"; obligation: Obligation }
 	| { type: "obligation_resolved"; obligationId: string; satisfiedBy: string }
+	| { type: "repair_item_resolved"; obligationId: string; itemId: string; reviewId: string; evidenceId: string }
 	| { type: "evidence_adopted"; artifact: CanonicalArtifact }
 	| { type: "canonical_artifact_materialized"; artifactId: string; materializationRef: string; targetSha256: string }
 	| { type: "canonical_artifact_status"; artifactId: string; status: CanonicalArtifact["status"] }
@@ -606,4 +633,30 @@ export interface StoredEvent {
 	timestamp: string;
 	jobId: string;
 	event: AstraEvent;
+}
+
+export type GitVersion =
+	| { status: "unavailable"; reason: string }
+	| {
+			status: "captured";
+			root: string;
+			head: string;
+			branch: string;
+			dirty: boolean;
+			patchSha256: string;
+			indexPatchSha256: string;
+			untracked: Array<{ path: string; sha256: string; mode: number }>;
+	  };
+
+export interface TaskVersion {
+	hash: string;
+	contractHash: string;
+	inputs: Array<{ ref: string; checksum: string }>;
+	git: GitVersion;
+	runtime: { node: string; platform: string; arch: string };
+}
+
+export interface EvidenceFileVersion {
+	sourceRef: string;
+	sha256: string;
 }

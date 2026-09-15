@@ -187,7 +187,7 @@ const STAGE_TEMPLATES: StageTemplate[] = [
 		id: "paper-compile",
 		label: "Compile the paper",
 		suggestedInputs: ["paper-write"],
-		fields: ["artifact", "command", "buildLog", "validation", "remainingWarnings"],
+		fields: ["artifact", "command", "buildLog", "source", "buildInputs", "validation", "remainingWarnings"],
 		checks: [
 			"compiled artifact exists",
 			"build log and validation are retained",

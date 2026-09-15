@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { FIXTURE_PDF_SOURCE } from "../../src/fixture-pdf.ts";
 
-// Protocol fixture only. These records do not establish scientific results or a valid PDF.
+// Protocol fixture only. The parseable PDF does not establish scientific results or publication quality.
 export const stages = ["validation", "literature", "idea", "novelty", "refine", "experiment-plan", "implement-solution", "run", "monitor", "result-to-claim", "paper-plan", "paper-write", "paper-compile", "research-review"];
 
 export function fullResearchOutput(schema) {
@@ -56,10 +57,15 @@ export function fullResearchOutput(schema) {
 		if (task.stageId === "paper-compile") {
 			const input = context.inputs.files.find(file => file.path.endsWith("paper/manuscript.md"));
 			if (!readFileSync(input.path, "utf8").includes("Offline fixture")) throw new Error("Manuscript not received");
-			emit("paper/paper.pdf", "%PDF-1.4\n% Offline fixture only\n");
-			emit("paper/build.log", "offline fixture delivery\n", "log");
+			emit("paper/build.mjs", FIXTURE_PDF_SOURCE);
+			const log = execFileSync(process.execPath, ["paper/build.mjs", "paper/paper.pdf"], { encoding: "utf8" });
+			refs.push({ kind: "artifact", ref: "paper/paper.pdf", summary: "Offline fixture PDF" });
+			emit("paper/build.log", log, "log");
 			content.artifact = "paper/paper.pdf";
 			content.buildLog = "paper/build.log";
+			content.source = "paper/build.mjs";
+			content.buildInputs = ["paper/build.mjs"];
+			content.command = "node paper/build.mjs paper/paper.pdf";
 		}
 		return { artifactType: task.requiredOutputType, contentJson: JSON.stringify(content), refs };
 	}
@@ -84,7 +90,7 @@ export function fullResearchOutput(schema) {
 		if (obligation) inputs.push(state.reviews[obligation.sourceReviewId].evidenceId);
 		const count = obligation ? 1 : stage.searchPolicy?.minCandidates ?? 1;
 		const round = Object.values(state.searchBatches).filter(batch => batch.stageId === stageId).length + 1;
-		return { tasks: Array.from({ length: count }, (_, index) => ({ key: `candidate-${index}`, objective: `Produce ${stageId} fixture ${index}`, inputArtifactRefs: inputs, requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, hypothesis: `Fixture round ${round} alternative ${index}` })), rationale: "Exercise the full research contract" };
+		return { tasks: Array.from({ length: count }, (_, index) => ({ key: `candidate-${index}`, deliveryKind: "stage", objective: `Produce ${stageId} fixture ${index}`, inputArtifactRefs: inputs, requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, hypothesis: `Fixture round ${round} alternative ${index}` })), rationale: "Exercise the full research contract" };
 	}
 	if (fields.decision) return { decision: "accept", rationale: "Reviewed fixture" };
 	if (fields.adopt) return { adopt: true, rationale: "Adopt fixture" };
@@ -93,6 +99,7 @@ export function fullResearchOutput(schema) {
 		const continueSearch = stageId === "idea" && batch.round === 1;
 		return { continueSearch, selectedCandidateId: continueSearch ? null : Object.keys(batch.candidates)[0], rationale: "Exercise continuation and selection" };
 	}
+	if (fields.routeAction && Object.values(state.obligations).some(issue => issue.status === "open" && issue.stageId === stageId)) return { routeAction: "continue", targetStageId: null, question: null, newQuestions: [], evidenceRefs: [], rationale: "Repair the open fixture findings" };
 	if (fields.routeAction) return { routeAction: stageId === "research-review" ? "complete" : "advance", targetStageId: stages[stages.indexOf(stageId) + 1] ?? null, question: null, newQuestions: [], evidenceRefs: Object.keys(state.canonical), rationale: "Advance the offline fixture" };
 	throw new Error("Unknown fixture schema");
 }

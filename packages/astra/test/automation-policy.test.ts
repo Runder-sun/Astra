@@ -264,21 +264,24 @@ describe("research automation policy", () => {
 				run: async (task) => ({ artifactType: task.requiredOutputType, content: { content: task.id }, refs: [] }),
 			},
 			reviewer: {
-				review: async (evidence) => ({
-					verdict: "pass",
-					findings: [],
-					score: 1,
-					criteria: [
-						{
-							criterion: "structured",
-							passed: true,
-							score: 1,
-							evidenceRefs: [`evidence:${evidence.id}`],
-							rationale: "verified",
-						},
-					],
-					verifiedRefs: [`evidence:${evidence.id}`],
-				}),
+				review: async (evidence) =>
+					evidence.type === "stage-plan"
+						? reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] })
+						: {
+								verdict: "pass",
+								findings: [],
+								score: 1,
+								criteria: [
+									{
+										criterion: "structured",
+										passed: true,
+										score: 1,
+										evidenceRefs: [`evidence:${evidence.id}`],
+										rationale: "verified",
+									},
+								],
+								verifiedRefs: [`evidence:${evidence.id}`],
+							},
 			},
 			mainAgent: { ...decisions, decideSearch },
 		});
@@ -429,18 +432,18 @@ describe("research automation policy", () => {
 
 		await fixture.supervisor.tick();
 
-		expect(fixture.worker.run).toHaveBeenCalledOnce();
+		expect(fixture.worker.run).not.toHaveBeenCalled();
 		expect(fixture.decisions.decideEvidence).not.toHaveBeenCalled();
 		expect(job.status().budget.turnsUsed).toBe(2);
 		expect(job.status().userGate).toMatchObject({ kind: "budget", limit: "maxTurns" });
 		await expect(job.resume()).rejects.toThrow("increase maxTurns");
 
-		await job.updateBudget({ maxTurns: 6 });
+		await job.updateBudget({ maxTurns: 7 });
 		await job.resume();
 		await fixture.supervisor.tick();
 
 		expect(job.state.stages.validation.lastRouteAction).toBe("continue");
-		expect(job.status().budget.turnsUsed).toBe(6);
+		expect(job.status().budget.turnsUsed).toBe(7);
 	});
 
 	it("does not create a reviewer TaskPacket after the global task budget is exhausted", async () => {
@@ -457,16 +460,16 @@ describe("research automation policy", () => {
 
 		await fixture.supervisor.tick();
 
-		expect(Object.keys(job.state.tasks)).toHaveLength(1);
+		expect(Object.keys(job.state.tasks)).toHaveLength(0);
 		expect(fixture.reviewer.review).not.toHaveBeenCalled();
 		expect(job.status().userGate).toMatchObject({ kind: "budget", limit: "maxTasks" });
 
-		await job.updateBudget({ maxTasks: 2 });
+		await job.updateBudget({ maxTasks: 3 });
 		await job.resume();
 		await fixture.supervisor.tick();
 
-		expect(fixture.reviewer.review).toHaveBeenCalledOnce();
-		expect(Object.keys(job.state.tasks)).toHaveLength(1);
+		expect(fixture.reviewer.review).toHaveBeenCalledTimes(2);
+		expect(Object.keys(job.state.tasks)).toHaveLength(2);
 		expect(job.state.stages.validation.lastRouteAction).toBe("continue");
 	});
 
@@ -644,14 +647,14 @@ describe("research automation policy", () => {
 			createdAt: new Date().toISOString(),
 		}));
 		const reviewer = {
-			review: vi
-				.fn()
-				.mockImplementationOnce(async (evidence) =>
-					reviewFixture(job, { evidenceId: evidence.id, verdict: "fail", findings: ["repair this evidence"] }),
-				)
-				.mockImplementationOnce(async (evidence) =>
-					reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] }),
-				),
+			review: vi.fn(async (evidence) => {
+				const fail = evidence.type !== "stage-plan" && Object.keys(job.state.obligations).length === 0;
+				return reviewFixture(job, {
+					evidenceId: evidence.id,
+					verdict: fail ? "fail" : "pass",
+					findings: fail ? ["repair this evidence"] : [],
+				});
+			}),
 		};
 		const supervisor = new ResearchSupervisor(job, store, {
 			owner: "supervisor-repair-evidence-set",
@@ -668,7 +671,7 @@ describe("research automation policy", () => {
 
 		await supervisor.tick();
 
-		expect(reviewer.review).toHaveBeenCalledTimes(2);
+		expect(reviewer.review).toHaveBeenCalledTimes(4);
 		expect(job.state.frame.openObligationIds).toHaveLength(0);
 		expect(job.state.stages.validation.lastRouteAction).toBe("continue");
 	});
@@ -747,7 +750,7 @@ describe("research automation policy", () => {
 
 			await first.supervisor.tick();
 
-			const originalTask = Object.values(job.state.tasks)[0];
+			const originalTask = Object.values(job.state.tasks).find((task) => task.role === "worker")!;
 			const firstBackoff = job.state.providerBackoff;
 			expect(job.status().paused).toBe(false);
 			expect(firstBackoff).toMatchObject({ attempt: 1, reason: "HTTP 429 rate limit exceeded" });

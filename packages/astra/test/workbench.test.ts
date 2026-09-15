@@ -1,10 +1,14 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "vitest";
+import { ResearchJob } from "../src/research.ts";
+import { JsonlAstraStore } from "../src/store.ts";
+import { taskWorkspacePath } from "../src/task-workspace.ts";
 import { startWorkbench } from "../src/workbench.ts";
+import { reviewFixture } from "./review-fixture.ts";
 
 const cleanup: Array<() => Promise<void>> = [];
 function forwardedStatus(url: string, headers: Record<string, string>, method = "GET"): Promise<number | undefined> {
@@ -19,6 +23,65 @@ function forwardedStatus(url: string, headers: Record<string, string>, method = 
 }
 afterEach(async () => {
 	for (const close of cleanup.splice(0).reverse()) await close();
+});
+
+it("downloads frozen evidence after original files change or disappear and rejects corrupt snapshots", async () => {
+	const root = await mkdtemp(join(tmpdir(), "astra-download-"));
+	cleanup.push(() => rm(root, { recursive: true, force: true }));
+	const job = await ResearchJob.create(new JsonlAstraStore(root), {
+		workspaceRoot: root,
+		objective: "download version",
+	});
+	const task = await job.dispatchTask({
+		stageId: "validation",
+		stageExecutionId: "validation",
+		role: "worker",
+		objective: "download version",
+		inputArtifactRefs: [],
+		requiredCanonicalArtifacts: [],
+		requiredOutputType: "validation",
+		requiredOutputFields: ["content"],
+		acceptanceChecks: ["verified"],
+		failureSignals: [],
+		dependencies: [],
+		scope: { workspaceRoot: root, allowedPaths: ["."] },
+		allowedTools: ["write"],
+		writeAuthority: "workspace-write",
+		budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 1000 },
+		reviewGateRequired: true,
+		resumePolicy: "resume-session",
+		successCriteria: ["verified"],
+	});
+	const workspace = taskWorkspacePath(root, task.jobId, task.id);
+	await mkdir(workspace, { recursive: true });
+	const ref = `.astra/jobs/${task.jobId}/workspaces/${task.id}/result.txt`;
+	await writeFile(join(root, ref), "reviewed bytes");
+	await job.setTaskStatus(task.id, "succeeded");
+	const evidence = await job.recordEvidence({
+		taskId: task.id,
+		stageId: task.stageId,
+		type: "validation",
+		refs: [ref],
+		content: { content: "verified" },
+	});
+	await job.recordReview(reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] }));
+	await job.decideEvidence(evidence.id, true);
+	const artifact = await job.adoptEvidence(evidence.id);
+	await writeFile(join(root, ".astra/active-job.json"), JSON.stringify({ jobId: task.jobId }));
+	const app = await startWorkbench({ root: join(root, "workbench"), watch: [root], port: 0 });
+	cleanup.push(() => new Promise<void>((ok, reject) => app.server.close((error) => (error ? reject(error) : ok()))));
+	const listing = (await (await fetch(`${app.url}/api/jobs`)).json()) as { jobs: Array<{ id: string }> };
+	const url = `${app.url}/api/file?${new URLSearchParams({ id: listing.jobs[0].id, artifact: artifact.id, ref })}`;
+	await writeFile(join(root, ref), "unreviewed replacement");
+	expect(await (await fetch(url)).text()).toBe("reviewed bytes");
+	await rm(join(root, ref));
+	expect(await (await fetch(url)).text()).toBe("reviewed bytes");
+	const frozen = join(root, ".astra/jobs", task.jobId, "versions/files", evidence.files![0].sha256);
+	await rm(frozen);
+	await writeFile(frozen, "corrupt");
+	expect((await fetch(url)).status).toBe(400);
+	await rm(frozen);
+	expect((await fetch(url)).status).toBe(400);
 });
 
 it("serves real state, isolates new runs, preserves read-only imports and pauses its own child", async () => {

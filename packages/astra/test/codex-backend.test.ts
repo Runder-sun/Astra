@@ -8,6 +8,7 @@ import * as codingAgent from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexResearchAdapters } from "../src/codex-adapters.ts";
 import { CodexAppServerRunner } from "../src/codex-app-server.ts";
+import { FIXTURE_PDF_SOURCE } from "../src/fixture-pdf.ts";
 import { fetchAstraFixtureOpenAlex } from "../src/fixture-provider.ts";
 import { runAstra } from "../src/launcher.ts";
 import { ResearchJob } from "../src/research.ts";
@@ -205,15 +206,27 @@ describe("Codex research backend", () => {
 			});
 			const cwd = join(root, ".astra", "jobs", task.jobId, "workspaces", task.id);
 			await mkdir(cwd, { recursive: true });
-			await writeFile(join(cwd, "paper.pdf"), "Offline permission fixture, not a research PDF");
+			await writeFile(join(cwd, "build.mjs"), FIXTURE_PDF_SOURCE);
+			const buildLog = execFileSync(process.execPath, ["build.mjs", "paper.pdf"], { cwd, encoding: "utf8" });
+			await writeFile(join(cwd, "build.log"), buildLog);
 			vi.stubEnv("ASTRA_FAKE_CODEX_MODE", "ok");
 			vi.stubEnv("ASTRA_FAKE_CODEX_LOG", join(root, "requests.jsonl"));
 			vi.stubEnv(
 				"ASTRA_FAKE_CODEX_OUTPUT",
 				JSON.stringify({
 					artifactType: "paper-compile",
-					contentJson: JSON.stringify({ artifact: "paper.pdf" }),
-					refs: [{ kind: "artifact", ref: "paper.pdf", summary: "Offline permission fixture" }],
+					contentJson: JSON.stringify({
+						artifact: "paper.pdf",
+						source: "build.mjs",
+						buildInputs: ["build.mjs"],
+						buildLog: "build.log",
+						command: "node build.mjs paper.pdf",
+					}),
+					refs: [
+						{ kind: "artifact", ref: "paper.pdf", summary: "Offline permission fixture" },
+						{ kind: "artifact", ref: "build.mjs", summary: "Editable fixture source" },
+						{ kind: "log", ref: "build.log", summary: "Fixture build output" },
+					],
 				}),
 			);
 			const adapters = new CodexResearchAdapters(
@@ -618,14 +631,19 @@ describe("Codex research backend", () => {
 			});
 			expect(Object.keys(job.state.canonical)).toHaveLength(1);
 			const sessions = Object.values(job.state.sessions);
-			expect(sessions.map((session) => session.role).sort()).toEqual(["main-agent", "reviewer", "worker"]);
+			expect(sessions.map((session) => session.role).sort()).toEqual([
+				"main-agent",
+				"reviewer",
+				"reviewer",
+				"worker",
+			]);
 			expect(sessions.every((session) => session.status === "completed")).toBe(true);
-			expect(new Set(sessions.map((session) => session.sessionId)).size).toBe(3);
+			expect(new Set(sessions.map((session) => session.sessionId)).size).toBe(4);
 			const calls = (await readFile(join(root, "requests.jsonl"), "utf8"))
 				.trim()
 				.split("\n")
 				.map((line) => JSON.parse(line) as { method?: string; params?: { model?: string } });
-			expect(calls.filter((call) => call.method === "thread/start")).toHaveLength(3);
+			expect(calls.filter((call) => call.method === "thread/start")).toHaveLength(4);
 			expect(calls.filter((call) => call.method === "thread/resume")).toHaveLength(3);
 			expect(
 				calls

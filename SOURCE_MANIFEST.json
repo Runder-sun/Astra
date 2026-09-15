@@ -36,8 +36,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "e2efb1855940622accb670b280e076b9e67ea958c09e30617fa1ac45e1dd223a",
-      "size": 5807
+      "sha256": "9cd3d2b543c1e4caeb55130c19b11c54de00a40fdb3d6ee9aa3d8d27604d3a3d",
+      "size": 5963
     },
     {
       "path": "RELEASE_NOTES.md",
@@ -58,6 +58,11 @@
       "path": "biome.json",
       "sha256": "9fbed5ac7226f18f2d3dd4941d3b234d3cad1fd9f23e29a2a103478900a40ab3",
       "size": 903
+    },
+    {
+      "path": "docs/.nojekyll",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
     },
     {
       "path": "docs/deep_study/00-study-plan.md",
@@ -365,6 +370,21 @@
       "size": 15588
     },
     {
+      "path": "docs/homepage.css",
+      "sha256": "aedade321efef6ed84ed6d35598bbeaf7e60094cf284ad3ef30a669b44975b10",
+      "size": 7179
+    },
+    {
+      "path": "docs/homepage.js",
+      "sha256": "5a241ee9b68d3de4e60200cad302130844da1bec7dbd875beae880cb24491c9e",
+      "size": 470
+    },
+    {
+      "path": "docs/index.html",
+      "sha256": "7d548c52a19caf233fed5037ad903ab8967a3834e7cb9a25efc1effef0007913",
+      "size": 6558
+    },
+    {
       "path": "docs/superpowers/plans/2026-04-23-rust-kernel-pivot-bootstrap.md",
       "sha256": "ad4414078989aee5eb1e216338aacc3d53c5e441b18f2456bd5d02400c4e7ee1",
       "size": 3622
@@ -513,6 +533,11 @@
       "path": "docs/superpowers/reviews/2026-08-14-pi-native-astra-completion-audit.md",
       "sha256": "10f86197b93aa5d7250a9ecb823c24e08cc531a477fb1dea527b50cec915935a",
       "size": 4213
+    },
+    {
+      "path": "docs/superpowers/reviews/2026-09-15-joint-review-fix-status.md",
+      "sha256": "71e777fcda400961cc6f0f8c65626344e9800977317fa65bf8ebd65f86b488a3",
+      "size": 7473
     },
     {
       "path": "docs/superpowers/specs/2026-04-27-m9-evolutionary-branch-intelligence-design.md",
@@ -5371,8 +5396,8 @@
     },
     {
       "path": "packages/astra/README.md",
-      "sha256": "0034907db1a4a96668ef2485314922daf1e164fc5f98fbf368850006cbfa1fd2",
-      "size": 24928
+      "sha256": "b1d5ca325aa58d9ea1d0a391e066b45c4472de2cee34d84d268fa4d39ce5a800",
+      "size": 25977
     },
     {
       "path": "packages/astra/REVIEW_REPAIR_AUDIT.md",
@@ -5431,8 +5456,8 @@
     },
     {
       "path": "packages/astra/skills/astra/paper-compile.md",
-      "sha256": "c905708ae1e97c40d148b90f6cf1d9213c142969892a633aa3cd67ca87a9de64",
-      "size": 1611
+      "sha256": "d13d727cd64b98b5e1fab2268d21ec06aea5f6bdf5b97d23961c329061df4fcd",
+      "size": 2207
     },
     {
       "path": "packages/astra/skills/astra/paper-plan.md",
@@ -5451,8 +5476,8 @@
     },
     {
       "path": "packages/astra/skills/astra/research-review.md",
-      "sha256": "ac5a95b5c481fc0cc48403867219f2dae9714dec93ff478251c99930f0ebae27",
-      "size": 2734
+      "sha256": "5fb803b57cfd959ea2863374111482f43a1eaf5a708bf0d87085b0b9e8e6240b",
+      "size": 2836
     },
     {
       "path": "packages/astra/skills/astra/result-to-claim.md",
@@ -5481,8 +5506,8 @@
     },
     {
       "path": "packages/astra/src/codex-adapters.ts",
-      "sha256": "52a67e32abcdac1d69aae19f0e9f2c5c664011e856cce8033c5a070451a8a414",
-      "size": 29790
+      "sha256": "c78b7701de9d34a441b4af7781f85c271f13d3206d9112992cf31a39a5c01424",
+      "size": 30799
     },
     {
       "path": "packages/astra/src/codex-app-server.ts",
@@ -5491,8 +5516,8 @@
     },
     {
       "path": "packages/astra/src/codex-schemas.ts",
-      "sha256": "c4e305fbdc94dac14e872adc0221f5a789954d726b7eeb5345a88a670fb48843",
-      "size": 3134
+      "sha256": "637de5e00b956bf4e50e848d0486ca141a497541c0a844d7f93984574cc41b25",
+      "size": 3240
     },
     {
       "path": "packages/astra/src/codex-web-sources.ts",
@@ -5501,18 +5526,23 @@
     },
     {
       "path": "packages/astra/src/contracts.ts",
-      "sha256": "6d10404d486eeb3f3ca5ea5bfd4bf2b01d04654b47bfe4c4dd09a10113bebf13",
-      "size": 10020
+      "sha256": "b00eee769c553e80edc643c3e969594fc7e831d3f93439d7ad89204b1a0f8702",
+      "size": 11528
     },
     {
       "path": "packages/astra/src/extension.ts",
-      "sha256": "367d02fc44230d242303af9e11acdba5db0b963a27b15117aa9819b239517a49",
-      "size": 52419
+      "sha256": "8b40aae5c9a430edd715eaa6f8c26a988fcb49489c1fe8fd0382cfa23ff40166",
+      "size": 54832
+    },
+    {
+      "path": "packages/astra/src/fixture-pdf.ts",
+      "sha256": "fbbb3a005e8e8a27c5d37eace305a2078100c7aa6b24ea3ba7683c83be39a860",
+      "size": 1184
     },
     {
       "path": "packages/astra/src/fixture-provider.ts",
-      "sha256": "e4bb9f8899d2a9386b101eb3a54b99e7ffc793ca9e7938ca98770fa250173e6c",
-      "size": 13105
+      "sha256": "85a981632a19441a226e370a874225117797fe755fb28fa7aeabea50c655d345",
+      "size": 13486
     },
     {
       "path": "packages/astra/src/index.ts",
@@ -5545,9 +5575,34 @@
       "size": 2344
     },
     {
+      "path": "packages/astra/src/paper-delivery.ts",
+      "sha256": "661a118e53308efbf01e056d80ef2b8de8d7b680902da705372f0fbefe14a7c5",
+      "size": 3010
+    },
+    {
+      "path": "packages/astra/src/pause-control.ts",
+      "sha256": "f5078ceef08523746c9ed2cc69cc9d2c3153c28c9c51750042f6ee37ea0bc52d",
+      "size": 1337
+    },
+    {
       "path": "packages/astra/src/pi-child-session.ts",
-      "sha256": "363664b200caeaf361ddd509c64b21873d4c88158994345686fa9884638e5cea",
-      "size": 48396
+      "sha256": "4377e0f031514ab600e89629adb2379ba022a2e5793c61820b005083314fa44d",
+      "size": 50484
+    },
+    {
+      "path": "packages/astra/src/plan-review.ts",
+      "sha256": "f368f12fda0a8917f3616978aa901a80fa5b7a4d207785a03fb1f04eb9ae7296",
+      "size": 4585
+    },
+    {
+      "path": "packages/astra/src/progress.ts",
+      "sha256": "16546b32bfd69ec01e31ae108708e746b045cadfc241db7940b0d2ce3d901b4a",
+      "size": 2265
+    },
+    {
+      "path": "packages/astra/src/project-version.ts",
+      "sha256": "eb2e5237a6aa06abd3cbc66e75c3cf745956150ddb2bcc48114acd283ddda738",
+      "size": 3551
     },
     {
       "path": "packages/astra/src/provider-errors.ts",
@@ -5561,18 +5616,18 @@
     },
     {
       "path": "packages/astra/src/research-control.ts",
-      "sha256": "dbdd0922e92d6d027f50b97bff131a43145ae55b01878a50ce7267115adc7d7e",
-      "size": 13922
+      "sha256": "51442403df87707b0a8db932b91e84afb5eb2634d2a8041bf9337d2bd99ebbb6",
+      "size": 14471
     },
     {
       "path": "packages/astra/src/research-graph.ts",
-      "sha256": "bac22dbd9a039f6c366295ecc3565e16eff9b51b4b8a8f64e5aa6be325b40593",
-      "size": 3532
+      "sha256": "43f2a91de0dedca27ee412bcf6e4ef1880942df5405cffd47c0acedcf06cb56f",
+      "size": 3562
     },
     {
       "path": "packages/astra/src/research.ts",
-      "sha256": "20b3798263c906aa075eb44209745ef548ffdc98a41b771c3b2deef2b86d1887",
-      "size": 81667
+      "sha256": "f5a94b5ccca4e37027aaa81ae984bdf24d38472574a0ba9356a2bdc6e177a76a",
+      "size": 101587
     },
     {
       "path": "packages/astra/src/review-validation.ts",
@@ -5581,28 +5636,28 @@
     },
     {
       "path": "packages/astra/src/stages.ts",
-      "sha256": "4910ecd2bcddef47bf196faa88fe13eb525b6530d4fea46302bad32860cdc9e2",
-      "size": 9403
+      "sha256": "6176e84127e21d12f91a13b278d438584810b1a7e19da8e73325f63cfe742542",
+      "size": 9428
     },
     {
       "path": "packages/astra/src/store.ts",
-      "sha256": "bc04b37338e6ffd1472850768f3bd864ab011f3ddb847e75f2b4be1c502f7a27",
-      "size": 6709
+      "sha256": "f399416dd749d84f696265af38afe7e538b96e74a7adc984ce52ec9daf29cb1e",
+      "size": 6814
     },
     {
       "path": "packages/astra/src/supervisor.ts",
-      "sha256": "8c79b1e35a8a0e21a7fe089ff112a6adc92ee2b44284cdc609d0975f121dacc4",
-      "size": 25932
+      "sha256": "d3abf644896f26fca2f85962ab9dd2e0ad5e6d2158a5823c6acc52ac4ef42be9",
+      "size": 32478
     },
     {
       "path": "packages/astra/src/task-workspace.ts",
-      "sha256": "3a7546b20c40a5f20decb1ceb7307bf78ac8eddedf50bbb4af42d59abae9f893",
-      "size": 15132
+      "sha256": "2dd38ea66d14a1b5a17edc7539d60e0dfffc0175ca526a6cf5fd2129c95b17f7",
+      "size": 18513
     },
     {
       "path": "packages/astra/src/types.ts",
-      "sha256": "b342b1b189d713b31424bfafa7def2d844a05618b9b324b827fd85c72a99143b",
-      "size": 16561
+      "sha256": "372d35bc2d20881d3dbcdc14c8366b4e9db0e8ab16936d74c976d85ff4513331",
+      "size": 18014
     },
     {
       "path": "packages/astra/src/workbench-runner.ts",
@@ -5611,18 +5666,18 @@
     },
     {
       "path": "packages/astra/src/workbench.ts",
-      "sha256": "be29ecafc4b250c9c610e2a5d21a5c986d0d1f2acf4162006dc0b12cd1064773",
-      "size": 11615
+      "sha256": "35167b52bf80b832be90cd49074f338f2a055dd46a182e4526b4f001d80ea833",
+      "size": 11907
     },
     {
       "path": "packages/astra/src/worker-submission.ts",
-      "sha256": "d177f037603bd6d3f4a64faaf1dc64053caa8139f33abab6395d55b6eaa0e5b0",
-      "size": 5787
+      "sha256": "650901280e676e8ddc47b7d6fc756ea9613fd1eb5630dcd2a07aa27a8b3d56c9",
+      "size": 6370
     },
     {
       "path": "packages/astra/test/automation-policy.test.ts",
-      "sha256": "1616db405cb551734cdde2fab1adfb29b9e19b744e20fee65ba025206d75d8ca",
-      "size": 34192
+      "sha256": "591617d810021e1a6862cad7da758ef0755b9ebbb707914e20902eee04e5a8dc",
+      "size": 34384
     },
     {
       "path": "packages/astra/test/codex-app-server.test.ts",
@@ -5631,13 +5686,18 @@
     },
     {
       "path": "packages/astra/test/codex-backend.test.ts",
-      "sha256": "86166ed2e1701dc25c445d20d8841a17e840e11f5a4dfb84a7c48ad6b94bb261",
-      "size": 29029
+      "sha256": "f26074bf96c30dbd16eb4876e972e3061f5a4b2d24fbd67073a8ae648015c40a",
+      "size": 29569
     },
     {
       "path": "packages/astra/test/codex-web-sources.test.ts",
       "sha256": "6647464a9cf592548f23ca274589ebe0aaeb101a3589d68dbc281376400707f6",
       "size": 2644
+    },
+    {
+      "path": "packages/astra/test/event-recovery.test.ts",
+      "sha256": "1ab0f155d9d3ffec58d8b1cea1960659fd31258105c465bc9d0c307c2b13b9cc",
+      "size": 3134
     },
     {
       "path": "packages/astra/test/extension-control.test.ts",
@@ -5646,8 +5706,8 @@
     },
     {
       "path": "packages/astra/test/extension-task-budget.test.ts",
-      "sha256": "bf90d1b0bf9cfeec6315902be4560532e77e71759e7a815efa31a882854b432a",
-      "size": 23046
+      "sha256": "42b32ec4e3d7ce95b96470cb07c07864da248be6075e81363ac27315ce849e27",
+      "size": 25456
     },
     {
       "path": "packages/astra/test/fixture-provider.test.ts",
@@ -5656,13 +5716,13 @@
     },
     {
       "path": "packages/astra/test/fixtures/codex-app-server.mjs",
-      "sha256": "3e54d2123dbb44499c5944611dfd9a144112144ff0bc1cb943585d72433a1b2c",
-      "size": 12233
+      "sha256": "d2f6dafb5c4a7eed0012a5eaadb80274690b6463cc42661afe29d1c0a5f68f9c",
+      "size": 12256
     },
     {
       "path": "packages/astra/test/fixtures/codex-full-research.mjs",
-      "sha256": "b52ab59446108e3e4b30b3b77d3a2bc0465c8694447b52a551f7c7a06358b02b",
-      "size": 7416
+      "sha256": "30d6ce47ce017e790c02cc92d15ae00e1930692e8144a30818e373915657648f",
+      "size": 8105
     },
     {
       "path": "packages/astra/test/fixtures/workbench-runner.mjs",
@@ -5680,14 +5740,24 @@
       "size": 3633
     },
     {
+      "path": "packages/astra/test/local-task-flow.test.ts",
+      "sha256": "a3393706315552bae57bf7da434b38bf21f0ddcba5befdc742239f7e4264fd2c",
+      "size": 14775
+    },
+    {
+      "path": "packages/astra/test/pause-control.test.ts",
+      "sha256": "48cfb3bd80c6c40f59021cec55cdf816b5cd98e1792dacea0683a73f9fd6f0da",
+      "size": 2832
+    },
+    {
       "path": "packages/astra/test/pi-inner-loop.test.ts",
       "sha256": "1287d160a3f7bfedb0bc98d9cb071c6dda7ba12bb906a11edf2584693ef335cf",
       "size": 5151
     },
     {
       "path": "packages/astra/test/pi-skill-loading.test.ts",
-      "sha256": "75783107e9fbe8462798aef2b56871e9c617dc26b41759aac977e6c699ae8457",
-      "size": 16387
+      "sha256": "5ec2d35be3b99c265c0267f92e82780953f703a71e608698fc38ba56dfff8ee4",
+      "size": 16596
     },
     {
       "path": "packages/astra/test/pi-worker-resource-env.test.ts",
@@ -5696,8 +5766,8 @@
     },
     {
       "path": "packages/astra/test/repair-acceptance.test.ts",
-      "sha256": "ffde2a48bc7fc537be7e9d45aee6786af97f578e6631f047b4c25e35726187ff",
-      "size": 9159
+      "sha256": "96451f0a02ef47ea155e7d153d5f93a2f4536a553329467d5970307b9a4b3a6a",
+      "size": 17551
     },
     {
       "path": "packages/astra/test/research-control.test.ts",
@@ -5711,8 +5781,8 @@
     },
     {
       "path": "packages/astra/test/research.test.ts",
-      "sha256": "143f4581b147346c15774c8796930a0bceeda222d1bd64afd45c987e298e7dc7",
-      "size": 30462
+      "sha256": "9f76a14b7a191ee266135baa731b924bfcc2db1a9ccf4aaef7bf700fd773e04e",
+      "size": 31313
     },
     {
       "path": "packages/astra/test/review-contract.test.ts",
@@ -5731,28 +5801,33 @@
     },
     {
       "path": "packages/astra/test/stage-planning.test.ts",
-      "sha256": "de0b09b4295bdfda5c31bb87a5b9c11d9505d5a23592e0a0dcfd46ab4c39d4f7",
-      "size": 24119
+      "sha256": "121a10c16b95f85c8d915fb5612be355c63ed99da90ce091540df416de82aea2",
+      "size": 24161
     },
     {
       "path": "packages/astra/test/supervisor-backoff.test.ts",
-      "sha256": "cb07a5317d8f4105adda7a9b42057be0819cac1db9b838892d5145f892b6da95",
-      "size": 2497
+      "sha256": "6918c488c1f98d92d729276b32eab38a75ac0bcb4caff706377771222e07831c",
+      "size": 4966
     },
     {
       "path": "packages/astra/test/task-workspace-flow.test.ts",
-      "sha256": "5842c730cc5c0fa2d3dacaaca850cb1e49e57610c8e55d26f27e0a930e83f093",
-      "size": 7473
+      "sha256": "2293a923ac986be5dad8e2f76e72ca770b3c786da0f32c1fc2037b3821a479e8",
+      "size": 10122
+    },
+    {
+      "path": "packages/astra/test/version-foundation.test.ts",
+      "sha256": "5b3824718e5dc594266447d0e317bd8696361d7d533bfe38e80500483845ab4d",
+      "size": 10816
     },
     {
       "path": "packages/astra/test/workbench.test.ts",
-      "sha256": "1b9b3730964fd2e2d43889a1b550d8aece2551656c26955d404df9f0226b9ca4",
-      "size": 4468
+      "sha256": "4d964431041ce2022b09841f5733b12cbacbc806f6ccfbed09485b02f5f7535f",
+      "size": 7394
     },
     {
       "path": "packages/astra/test/worker-submission.test.ts",
-      "sha256": "8d43fff2a20a5e2c3c6f3353e9228ed67b2726bbd6a240addebef76790d61b02",
-      "size": 12421
+      "sha256": "3be1ef5606eff6d550b339d17f5cb3042d6c69cf38d471d781f17e78aeadd517",
+      "size": 16770
     },
     {
       "path": "packages/astra/tsconfig.build.json",
@@ -5766,8 +5841,8 @@
     },
     {
       "path": "packages/astra/web/app.js",
-      "sha256": "4899165940403468ca8f1a8d5e24cb21a97fc02ce51bdc4773d74853a9e2ea0d",
-      "size": 11840
+      "sha256": "527684301603f1e18e8ad5cfa203033afc81c4e88583a7346001c7bf3465cbfe",
+      "size": 15820
     },
     {
       "path": "packages/astra/web/index.html",
@@ -5776,8 +5851,8 @@
     },
     {
       "path": "packages/astra/web/style.css",
-      "sha256": "8a13dfc87d72cb96f3073fd805bb6435ba1223911bf5cdb494d4ca143efe4d19",
-      "size": 6783
+      "sha256": "3ced32fb5e0bccca241386701838ce9c97980d73bd62defd89d8ad4b70e20368",
+      "size": 7083
     },
     {
       "path": "packages/client/CHANGELOG.md",
@@ -10191,8 +10266,8 @@
     },
     {
       "path": "scripts/prepare-astra-source.mjs",
-      "sha256": "9473d00edb97ed0ac0bd5a8934933f2ea457d201658a51eb1cda03575f71c82d",
-      "size": 3032
+      "sha256": "fe2ec3d4c46a566523bd0f799d0f2c2c6cac3f56e14cf2b8692b49d087eed83f",
+      "size": 3176
     },
     {
       "path": "scripts/profile-coding-agent-node.mjs",

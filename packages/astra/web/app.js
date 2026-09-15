@@ -4,6 +4,7 @@ const outcomes = { pending: "尚未评估", supported: "得到支持", "partiall
 let token = "";
 let selected = "";
 let stageId = "";
+let evidenceId = "";
 let stages = [];
 let current;
 let creating = false;
@@ -23,7 +24,37 @@ function renderDetails() {
 	el("stage-title").textContent = names[stageId] || stageId;
 	el("gate").textContent = `至少 ${definition?.qualityPolicy?.minPassingReviews || 1} 次通过 · ≥ 0.8`;
 	const panel = el("stage-detail"); panel.replaceChildren();
-	const evidence = Object.values(state.evidence).filter(item => item.stageId === stageId).sort((a,b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const milestone = current.milestones?.find(item => item.stageId === stageId);
+	if (milestone) {
+		panel.append(node("h3", `阶段里程碑 · 第 ${milestone.revision} 版`));
+		if (milestone.invalidatedBy) panel.append(node("p", `上游成果已变更，本阶段需要重新验证。失效来源：${milestone.invalidatedBy}`, "warning"));
+		const latestPlan = milestone.plans.at(-1);
+		panel.append(node("p", `计划审核：${!latestPlan ? "尚未规划" : latestPlan.status === "passed" ? "已通过" : latestPlan.status === "failed" ? "未通过，等待修订" : latestPlan.status === "stale" ? "上下文已变化，需重新审核" : "等待独立审核"}`));
+		const timeline = node("ol", undefined, "milestones");
+		const labels = { ready: "待执行", running: "执行中", succeeded: "执行结束，等待交付", failed: "执行失败", blocked: "受阻", candidate: "待审核或采纳", accepted: "已接受", rejected: "未接受" };
+		const kinds = { local: "局部任务", synthesis: "阶段综合", stage: "完整阶段交付" };
+		for (const delivery of milestone.deliveries) {
+			const row = node("li"); row.append(node("strong", `${kinds[delivery.kind]} · ${labels[delivery.status] || delivery.status}`), node("p", delivery.objective));
+			row.append(node("p", `审核：${delivery.reviews.length ? delivery.reviews.map(review => review.verdict === "pass" ? "通过" : "未通过").join(" / ") : "尚无记录"}`, "muted"));
+			if (delivery.version) { const version = node("details"); version.append(node("summary", "查看成果版本"), node("p", `成果：${delivery.evidenceId}`), node("p", `版本：${delivery.version}`), node("p", delivery.codeVersion ? `代码提交：${delivery.codeVersion}` : "未记录 Git 提交")); row.append(version); }
+			timeline.append(row);
+		}
+		if (!milestone.deliveries.length) panel.append(node("p", "计划审核通过后，执行任务会出现在这里。", "muted"));
+		panel.append(timeline, node("p", `正式成果：${milestone.status === "stale" ? "已失效，等待重新验证" : milestone.status === "adopted" ? "已采纳" : "尚未采纳"}`));
+		for (const plan of milestone.plans) {
+			const details = node("details"); details.append(node("summary", `计划 ${plan.id} · ${plan.status === "passed" ? "通过" : plan.status === "failed" ? "未通过" : plan.status === "stale" ? "需重审" : "待审"}`));
+			for (const review of plan.reviews) for (const check of review.criteria || []) details.append(node("p", `${check.passed ? "通过" : "待修订"} · ${check.criterion}：${check.rationale}`, check.passed ? "muted" : "warning"));
+			panel.append(details);
+		}
+		for (const issue of milestone.repairs) {
+			const details = node("details"); details.append(node("summary", `修复清单 · ${issue.status === "resolved" ? "全部关闭" : "仍有未关闭项"}`));
+			for (const item of issue.items || []) { details.append(node("p", `${item.status === "resolved" ? "已核验" : "待修复"} · ${item.criterion}`, item.status === "resolved" ? "good" : "warning")); if (item.reviewId) details.append(node("p", `验收记录：${item.reviewId}；成果：${item.evidenceId}`, "muted")); }
+			panel.append(details);
+		}
+	}
+	const candidates = Object.values(state.evidence).filter(item => item.stageId === stageId && item.type !== "stage-plan").sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+	const evidence = candidates.find(item => item.id === evidenceId) || candidates[0];
+	if (candidates.length > 1) { const label = node("label", "选择要检查的交付"); const selector = node("select"); for (const item of candidates) { const option = node("option", `${item.type} · ${item.createdAt} · ${item.id}`); option.value = item.id; option.selected = item.id === evidence.id; selector.append(option); } selector.onchange = () => { evidenceId = selector.value; renderDetails(); }; label.append(selector); panel.append(label); }
 	const task = evidence && state.tasks[evidence.taskId];
 	const reviews = evidence ? Object.values(state.reviews).filter(review => review.evidenceId === evidence.id).sort((a,b) => b.createdAt.localeCompare(a.createdAt)) : [];
 	const review = reviews[0];
@@ -67,7 +98,7 @@ function renderJob() {
 	el("coverage").textContent = outcomes[state.frame.missionCoverage] || state.frame.missionCoverage;
 	const active = Object.values(state.sessions).filter(session => session.status === "running").at(-1);
 	el("next-action").textContent = state.paused ? state.frame.userGate?.question || state.frame.userGate?.reason || state.frame.nextAction : active ? `${names[state.frame.activeStageId]}：${active.role === "reviewer" ? "正在独立审阅证据" : active.role === "worker" ? "正在执行任务" : "正在规划下一步"}` : state.frame.nextAction;
-	el("usage").textContent = `已创建 ${Object.keys(state.tasks).length} / ${state.frame.budget.maxTasks} 个任务 · 已用 ${state.budgetUsage?.turnsUsed || 0} / ${state.frame.budget.maxTurns} 轮 · ${state.frame.openObligationIds.length} 项待修复问题`;
+	el("usage").textContent = `已创建 ${Object.keys(state.tasks).length} / ${state.frame.budget.maxTasks} 个任务 · 已用 ${state.budgetUsage?.turnsUsed || 0} / ${state.frame.budget.maxTurns} 轮 · ${state.frame.openObligationIds.reduce((count,id) => count + (state.obligations[id]?.items?.filter(item => item.status === "open").length ?? 1), 0)} 项待修复问题`;
 	el("continue").hidden = current.readonly || !state.paused || current.running;
 	el("pause").hidden = current.readonly || !current.running;
 	el("directory").textContent = current.root;
@@ -78,8 +109,8 @@ function renderJob() {
 		const button = node("button", undefined, `stage${stageId === definition.id ? " active" : ""}`); button.type = "button";
 		button.append(node("span", names[definition.id] || definition.id));
 		const adopted = state.canonicalRoute.stageArtifactIds[definition.id];
-		button.append(node("small", adopted ? "已采用" : state.frame.activeStageId === definition.id ? "当前" : "未采用"));
-		button.onclick = () => { stageId = definition.id; renderJob(); }; el("stages").append(button);
+		button.append(node("small", state.stages[definition.id]?.invalidatedBy ? "需重验" : adopted ? "已采用" : state.frame.activeStageId === definition.id ? "当前" : "未采用"));
+		button.onclick = () => { stageId = definition.id; evidenceId = ""; renderJob(); }; el("stages").append(button);
 	}
 	renderDetails();
 }

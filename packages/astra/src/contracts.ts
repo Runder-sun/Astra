@@ -6,12 +6,30 @@ import type {
 	ReviewerOutputManifest,
 	ReviewPacket,
 	ReviewTrace,
+	StageDefinition,
 	StagePlanManifest,
 	TaskPacket,
 	WorkerOutputManifest,
 } from "./types.ts";
 
 const ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
+/** Local work is reviewed against its own contract; stage policy still supplies budgets and review thresholds. */
+export const TASK_DELIVERY_INSTRUCTIONS =
+	"Use deliveryKind=stage for a complete capability result, local for a bounded subtask with its own fields and checks, and synthesis for one complete capability result combining all accepted local evidence IDs. Local tasks are independently reviewed against their task contract, which overrides full-stage field requirements. Never mix local and complete deliveries in one plan. For a stage-plan review, audit the proposed plan against its frozen planning criteria, not the unexecuted scientific results. The planner must address prior plan-review findings before submitting a new plan. Search candidates must use stage. Repairs preserve the failed task's delivery kind, fields, checks and inputs. Once local work is accepted, plan one synthesis after all local reviews and repairs finish; synthesis must satisfy the full capability contract and is independently reviewed before adoption.";
+
+export function taskStageContract(definition: StageDefinition, task: TaskPacket): StageDefinition {
+	return task.deliveryKind === "local" || task.requiredOutputType === "stage-plan"
+		? {
+				...definition,
+				outputArtifactType: task.requiredOutputType,
+				requiredOutputFields: task.requiredOutputFields,
+				acceptanceChecks: task.acceptanceChecks,
+				failureSignals: task.failureSignals,
+				minSourceRefs: 0,
+			}
+		: definition;
+}
 
 export function assertAstraId(value: string, label: string): void {
 	if (!ID_PATTERN.test(value)) throw new Error(`${label} contains unsafe characters: ${value}`);

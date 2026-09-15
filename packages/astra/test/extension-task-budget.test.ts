@@ -106,6 +106,87 @@ async function setup(role: "worker" | "reviewer" = "worker"): Promise<{ fixture:
 }
 
 describe("Astra TaskPacket inner-loop controls", () => {
+	it("lets the main agent page through full evidence by owned ID without accepting file paths", async () => {
+		const { task, fixture: workerFixture } = await setup();
+		const root = workerFixture.context.cwd;
+		const job = await ResearchJob.open(new JsonlAstraStore(root), task.jobId);
+		if (!job) throw new Error("research job missing");
+		const sourceRoot = join(root, ".astra", "jobs", task.jobId, "workspaces", task.id);
+		await mkdir(sourceRoot, { recursive: true });
+		await writeFile(join(sourceRoot, "result.csv"), "value\n42\n");
+		await job.setTaskStatus(task.id, "succeeded");
+		const evidence = await job.recordEvidence({
+			taskId: task.id,
+			stageId: task.stageId,
+			type: task.requiredOutputType,
+			content: { raw: `${"x".repeat(32000)}exact-evidence-tail` },
+			refs: ["result.csv"],
+		});
+		vi.stubEnv("ASTRA_ROLE", "main-agent");
+		const fixture = createFixture(createAstraExtension({ jobId: task.jobId, role: "main-agent" }), root);
+		const read = fixture.tools.get("astra_read_research_object");
+		if (!read) throw new Error("controlled research reader missing");
+		let combined = "";
+		let offset = 0;
+		do {
+			const response = await read.execute(
+				"read-object",
+				{ id: evidence.id, offset, limit: 16000 },
+				undefined,
+				undefined,
+				fixture.context,
+			);
+			const page = response.details as { text: string; nextOffset?: number; totalCharacters: number };
+			expect(page.text.length).toBeLessThanOrEqual(16000);
+			combined += page.text;
+			offset = page.nextOffset ?? -1;
+		} while (offset >= 0);
+		expect(JSON.parse(combined)).toEqual(evidence);
+		await writeFile(join(sourceRoot, "result.csv"), "value\n999\n");
+		const filePage = await read.execute(
+			"read-file",
+			{ id: evidence.id, fileRef: "result.csv" },
+			undefined,
+			undefined,
+			fixture.context,
+		);
+		expect(filePage.details).toMatchObject({ text: "value\n42\n", sha256: evidence.files?.[0].sha256 });
+		await expect(
+			read.execute(
+				"read-unknown-file",
+				{ id: evidence.id, fileRef: "../../job.json" },
+				undefined,
+				undefined,
+				fixture.context,
+			),
+		).rejects.toThrow(/frozen/);
+		const frozen = join(root, ".astra", "jobs", task.jobId, "versions", "files", evidence.files![0].sha256);
+		await rm(frozen);
+		await writeFile(frozen, "corrupt");
+		await expect(
+			read.execute(
+				"read-corrupt-file",
+				{ id: evidence.id, fileRef: "result.csv" },
+				undefined,
+				undefined,
+				fixture.context,
+			),
+		).rejects.toThrow(/integrity/);
+		const missing = await read.execute("read-path", { id: "../../job.json" }, undefined, undefined, fixture.context);
+		expect(missing.content[0]).toMatchObject({ text: expect.stringContaining("Unknown research object") });
+		const workerRead = workerFixture.tools.get("astra_read_research_object");
+		if (!workerRead) throw new Error("controlled research reader missing");
+		vi.stubEnv("ASTRA_ROLE", "worker");
+		const denied = await workerRead.execute(
+			"worker-read",
+			{ id: evidence.id },
+			undefined,
+			undefined,
+			workerFixture.context,
+		);
+		expect(denied.content[0]).toMatchObject({ text: expect.stringContaining("Only the main-agent") });
+	});
+
 	it("rejects incomplete main-agent decisions before writing a terminal manifest", async () => {
 		const root = await mkdtemp(join(tmpdir(), "astra-main-decision-"));
 		tempRoots.push(root);
@@ -334,7 +415,7 @@ describe("Astra TaskPacket inner-loop controls", () => {
 		expect(rejected.content[0]).toMatchObject({ text: expect.stringContaining("exactly one complete repair task") });
 	});
 
-	it("registers a bounded output schema for research-review workers", async () => {
+	it("allows research-review findings beyond the former item limits", async () => {
 		const root = await mkdtemp(join(tmpdir(), "astra-review-output-schema-"));
 		tempRoots.push(root);
 		vi.stubEnv("ASTRA_PROJECT_ROOT", root);
@@ -349,10 +430,10 @@ describe("Astra TaskPacket inner-loop controls", () => {
 			};
 		};
 
-		expect(schema.properties.content.properties.strengths?.maxItems).toBe(3);
-		expect(schema.properties.content.properties.weaknesses?.maxItems).toBe(5);
-		expect(schema.properties.content.properties.claimAudit?.items?.maxLength).toBe(240);
-		expect(schema.properties.content.properties.requiredRepairs?.maxItems).toBe(5);
+		for (const field of ["strengths", "weaknesses", "claimAudit", "requiredRepairs"]) {
+			expect(schema.properties.content.properties[field]?.maxItems).toBeUndefined();
+			expect(schema.properties.content.properties[field]?.items?.maxLength).toBeUndefined();
+		}
 	});
 
 	it("marks a successful worker submission as terminal for the Pi loop", async () => {
@@ -471,7 +552,7 @@ describe("Astra TaskPacket inner-loop controls", () => {
 		});
 	});
 
-	it("limits research-review workers to three canonical digest reads", async () => {
+	it("allows all canonical digests within the task budget", async () => {
 		const { fixture, task } = await setup();
 		const handler = fixture.handlers.get("tool_call");
 		if (!handler) throw new Error("tool_call handler was not registered");
@@ -486,7 +567,7 @@ describe("Astra TaskPacket inner-loop controls", () => {
 			await writeFile(join(fixture.context.cwd, "canonical", `${name}.json`), `{"id":"${name}"}\n`);
 		}
 
-		for (const name of ["a", "b", "c"]) {
+		for (const name of ["a", "b", "c", "d", "e", "f", "g", "h"]) {
 			await expect(
 				handler(
 					{
@@ -499,19 +580,6 @@ describe("Astra TaskPacket inner-loop controls", () => {
 				),
 			).resolves.toBeUndefined();
 		}
-		for (const name of ["d", "e", "f", "g", "h"]) {
-			await expect(
-				handler(
-					{
-						type: "tool_call",
-						toolCallId: `read-${name}`,
-						toolName: "read",
-						input: { path: `canonical/${name}.json` },
-					} as ExtensionEvent,
-					fixture.context,
-				),
-			).resolves.toMatchObject({ block: true, reason: expect.stringContaining("at most three canonical digests") });
-		}
 		await expect(
 			handler(
 				{
@@ -522,18 +590,7 @@ describe("Astra TaskPacket inner-loop controls", () => {
 				} as ExtensionEvent,
 				fixture.context,
 			),
-		).resolves.toMatchObject({ block: true, reason: expect.stringContaining("may not bypass") });
-		await expect(
-			handler(
-				{
-					type: "tool_call",
-					toolCallId: "bounded-bash",
-					toolName: "bash",
-					input: { command: "jq -c . review-summary.json" },
-				} as ExtensionEvent,
-				fixture.context,
-			),
-		).resolves.toBeUndefined();
+		).resolves.toMatchObject({ block: true, terminate: true });
 	});
 
 	it("allows a reviewer to call its terminal submission tool", async () => {

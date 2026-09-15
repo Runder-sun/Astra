@@ -3,6 +3,8 @@ import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "
 import { join } from "node:path";
 import type { AstraEvent, JobSnapshot, StoredEvent } from "./types.ts";
 
+export class ResearchJobLockedError extends Error {}
+
 export interface AstraStore {
 	loadSnapshot(jobId: string): Promise<JobSnapshot | undefined>;
 	append(jobId: string, event: AstraEvent): Promise<StoredEvent>;
@@ -94,12 +96,12 @@ export class JsonlAstraStore implements AstraStore {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 				const holder = await this.readJobLock(jobId);
 				if (holder && processIsAlive(holder.pid)) {
-					throw new Error(`research supervisor lock held by ${holder.owner} (pid ${holder.pid})`);
+					throw new ResearchJobLockedError(`research supervisor lock held by ${holder.owner} (pid ${holder.pid})`);
 				}
 				if (!holder) {
 					const lockStat = await stat(path).catch(() => undefined);
 					if (lockStat && Date.now() - lockStat.mtimeMs < 30_000) {
-						throw new Error("research supervisor lock held by an initializing process");
+						throw new ResearchJobLockedError("research supervisor lock held by an initializing process");
 					}
 				}
 				await rm(path, { force: true });
@@ -172,7 +174,7 @@ export class MemoryAstraStore implements AstraStore {
 
 	async withJobLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T> {
 		const holder = this.jobLocks.get(jobId);
-		if (holder) throw new Error(`research supervisor lock held by ${holder}`);
+		if (holder) throw new ResearchJobLockedError(`research supervisor lock held by ${holder}`);
 		this.jobLocks.set(jobId, owner);
 		try {
 			return await operation();

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Astra：面向个人研究者的开源自动研究工作台。从问题与文献到实验、审阅和论文，让研究过程与证据可追踪。">
+  <meta name="theme-color" content="#111918">
+  <title>Astra — 让研究的每一步，都有据可循</title>
+  <link rel="stylesheet" href="homepage.css">
+</head>
+<body>
+  <a class="skip" href="#main">跳转到内容</a>
+  <header class="nav wrap">
+    <a class="brand" href="#" aria-label="Astra 首页"><span class="mark" aria-hidden="true">A</span> astra<span class="brand-dot">.</span></a>
+    <nav aria-label="主导航"><a href="#approach">研究流程</a><a href="#start">开始使用</a><a href="https://github.com/Runder-sun/Astra">GitHub <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="signal" aria-hidden="true"></span> OPEN RESEARCH · EXPERIMENTAL</p>
+        <h1>让研究的每一步，<br><em>都有据可循。</em></h1>
+        <p class="lead">从一个问题，到可检查的研究成果。Astra 将文献、实验、证据与审阅连接起来，让你把精力留给真正值得探索的问题。</p>
+        <div class="actions"><a class="button primary" href="#start">开始一次研究 <span aria-hidden="true">↗</span></a><a class="text-link" href="https://github.com/Runder-sun/Astra/tree/main/packages/astra">阅读文档 <span aria-hidden="true">→</span></a></div>
+        <p class="hero-note">开源 · 本机工作台 · Pi / 官方 Codex 后端</p>
+      </div>
+      <div class="research-map" aria-label="研究工作流示意，并非实时任务">
+        <div class="map-header"><span>RESEARCH MAP</span><span class="map-label">流程示意</span></div>
+        <div class="map-origin"><span class="mini-label">01 / QUESTION</span><h2>先把问题问清楚</h2><p>目标、边界与可证伪的判断标准</p></div>
+        <div class="map-branch"><div><span class="mini-label">02 / EXPLORE</span><h3>文献与候选方案</h3><p>查找来源 · 比较假设</p></div><div><span class="mini-label">03 / TEST</span><h3>实现与实验</h3><p>执行方案 · 保留结果</p></div></div>
+        <div class="review-line"><span class="review-dot" aria-hidden="true"></span><span>独立审阅</span><span class="review-return">发现问题 → 修复 → 再审核</span></div>
+        <div class="map-result"><span class="mini-label">04 / EVIDENCE</span><h3>结论必须回到证据</h3><p>保留支持、反驳与尚不确定的结果。</p></div>
+        <div class="map-footer"><span>版本记录贯穿全过程</span><span aria-hidden="true">↳ 可追溯</span></div>
+      </div>
+    </section>
+    <div class="principle wrap"><span>BUILT FOR RESEARCH</span><p>流程完成，不等于假设成立。</p><span class="principle-detail">负面结果也值得被准确保留。</span></div>
+    <section class="section wrap" id="approach">
+      <div class="section-heading"><p class="eyebrow">THE APPROACH</p><h2>不是只得到一个答案。<br>而是看清答案如何形成。</h2></div>
+      <div class="features">
+        <article><span class="feature-number">01</span><h3>按问题组织研究</h3><p>主代理规划任务与路线，工作代理负责执行。支持文献、方案、实验和论文等研究能力，按当前证据决定下一步。</p><a href="https://github.com/Runder-sun/Astra/blob/main/packages/astra/README.md">了解工作方式 →</a></article>
+        <article><span class="feature-number">02</span><h3>让审核落到具体材料</h3><p>独立会话依据冻结标准审阅产物。未通过的项目保留为修复事项；修复后重新核验，不能用一句“已完成”代替证据。</p><a href="https://github.com/Runder-sun/Astra/blob/main/packages/astra/REVIEW_REPAIR_AUDIT.md">阅读审核说明 →</a></article>
+        <article><span class="feature-number">03</span><h3>保留过程与版本</h3><p>记录任务、结果、决定和文件快照。上游成果变更会使相关下游结果失效，让旧结论不会悄悄成为新研究的依据。</p><a href="https://github.com/Runder-sun/Astra/blob/main/docs/superpowers/reviews/2026-09-15-joint-review-fix-status.md">查看修复进度 →</a></article>
+      </div>
+    </section>
+    <section class="start-section" id="start"><div class="wrap start-grid">
+      <div><p class="eyebrow">YOUR NEXT QUESTION</p><h2>从一个小问题开始。</h2><p class="lead">建议先做一次有明确边界的小预算研究。通过本机工作台观察任务、检查证据，并在需要时调整方向。</p><p class="requirements">源码运行需要 Node.js 22.19 或更高版本。Codex 后端需要已安装并登录的官方 Codex CLI；论文 PDF 预检需要 Poppler 的 <code>pdfinfo</code>。</p><a class="text-link" href="https://github.com/Runder-sun/Astra/releases">下载实验版附件 ↗</a></div>
+      <div class="terminal"><div class="terminal-top"><span>SOURCE QUICKSTART</span><button type="button" id="copy-command">复制命令</button></div><pre><code id="commands">git clone https://github.com/Runder-sun/Astra.git
+cd Astra
+npm ci --ignore-scripts
+npm run build:offline
+export ASTRA_CODEX_MODEL=gpt-5.6-luna
+node packages/astra/src/workbench.ts --root ./research --port 4319</code></pre><p>启动后，在本机浏览器打开 <code>http://127.0.0.1:4319</code>。</p><span id="copy-status" role="status" aria-live="polite"></span></div>
+    </div></section>
+    <section class="status-section wrap" id="status"><div><p class="eyebrow">PROJECT STATUS</p><h2>开放实验，也开放边界。</h2></div><div><p>Astra 目前是实验版。软件回归通过不代表研究结论正确，也不代表已经具备完整的自主科研能力。</p><p>决策的独立审核、长期实验接管、完整环境复现，以及真实模型全研究验收仍在完善。GitHub 源码持续更新；发行附件有各自的版本与验证范围。</p><a class="text-link" href="https://github.com/Runder-sun/Astra/issues">反馈问题或参与改进 ↗</a></div></section>
+  </main>
+  <footer class="wrap"><a class="brand" href="#">astra.</a><span>让证据留下，让研究继续。</span><a href="https://github.com/Runder-sun/Astra/blob/main/LICENSE">MIT License</a></footer>
+  <script src="homepage.js" defer></script>
+</body>
+</html>

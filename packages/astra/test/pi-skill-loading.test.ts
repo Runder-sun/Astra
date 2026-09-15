@@ -48,12 +48,13 @@ describe("Pi-native Astra skills", () => {
 		expect(skill).toContain("Do not embed the manuscript text");
 	});
 
-	it("keeps final research-review submissions compact", async () => {
+	it("requires complete research-review coverage without arbitrary item limits", async () => {
 		const skill = await readFile(join(skillsRoot, "research-review.md"), "utf8");
 
-		expect(skill).toContain("under 3,500 characters");
-		expect(skill).toContain("at most 3 strengths");
-		expect(skill).toContain("at most 5 claim-audit entries");
+		expect(skill).toContain("every claim");
+		expect(skill).toContain("unverified");
+		expect(skill).not.toContain("under 3,500 characters");
+		expect(skill).not.toContain("at most 5 claim-audit entries");
 	});
 
 	it("treats installable system runtime prerequisites as implementation work", async () => {
@@ -100,14 +101,14 @@ describe("Pi-native Astra skills", () => {
 		{
 			name: "stage planning",
 			env: { ASTRA_STAGE_ID: "refine", ASTRA_STAGE_PLAN_ID: "plan-refine" },
-			expectedTools: "astra_submit_stage_plan",
+			expectedTools: "astra_read_research_object,astra_submit_stage_plan",
 		},
 		{
 			name: "main decision",
 			env: { ASTRA_STAGE_ID: "refine", ASTRA_DECISION_TYPE: "adoption" },
-			expectedTools: "astra_submit_main_decision",
+			expectedTools: "astra_read_research_object,astra_submit_main_decision",
 		},
-	])("gives a $name child only its terminal tool", async ({ env, expectedTools }) => {
+	])("gives a $name child controlled object reading and its terminal tool", async ({ env, expectedTools }) => {
 		const root = await mkdtemp(join(tmpdir(), "astra-pi-main-tools-"));
 		try {
 			const launcherPath = join(root, "capture-args.mjs");
@@ -317,6 +318,7 @@ describe("Pi-native Astra skills", () => {
 			await new PiMainAgentAdapter(runner, root).decideRoute(job);
 
 			expect(routePrompt.length).toBeLessThan(64 * 1024);
+			expect(routePrompt).toContain("astra_read_research_object");
 			expect(routePrompt).toContain(artifact.id);
 			expect(routePrompt).toContain(artifact.checksum);
 			expect(routePrompt).toContain("Is the route projection bounded?");

@@ -23,7 +23,13 @@ import {
 import { reviewFixture } from "./review-fixture.ts";
 
 async function workerTask(job: ResearchJob, objective: string, id = `task-${objective}`) {
+	const repairChecks = Object.values(job.state.obligations)
+		.filter((issue) => issue.status === "open")
+		.flatMap((issue) =>
+			(issue.items ?? []).map((item) => ({ issueId: item.id, criterion: `[${item.id}] ${item.criterion}` })),
+		);
 	const task = await job.dispatchTask({
+		repairChecks,
 		id,
 		stageId: job.state.frame.activeStageId,
 		stageExecutionId: "stage_exec_fixture",
@@ -31,7 +37,7 @@ async function workerTask(job: ResearchJob, objective: string, id = `task-${obje
 		objective,
 		inputArtifactRefs: [],
 		requiredOutputType: "validation",
-		acceptanceChecks: ["structured"],
+		acceptanceChecks: ["structured", ...repairChecks.map((check) => check.criterion)],
 		dependencies: [],
 		allowedTools: ["read"],
 		writeAuthority: "workspace-write",
@@ -245,10 +251,10 @@ describe("Pi-native Astra research state", () => {
 					createdAt: new Date().toISOString(),
 				};
 			},
-			async decideRoute(job) {
+			async decideRoute(job, obligation) {
 				const stageIds = Object.keys(job.definitions);
 				const stageIndex = stageIds.indexOf(job.state.frame.activeStageId);
-				const targetStageId = stageIds[stageIndex + 1];
+				const targetStageId = obligation ? undefined : stageIds[stageIndex + 1];
 				return {
 					schemaVersion: "astra.main_agent_decision_manifest.v1",
 					manifestId: `decision-route-${job.state.eventSeq}`,
@@ -256,7 +262,7 @@ describe("Pi-native Astra research state", () => {
 					decisionType: "route",
 					decisionRef: `route-${job.state.eventSeq}`,
 					stageId: job.state.frame.activeStageId,
-					routeAction: targetStageId ? "advance" : "complete",
+					routeAction: obligation ? "continue" : targetStageId ? "advance" : "complete",
 					targetStageId,
 					evidenceRefs: Object.values(job.state.canonicalRoute.stageArtifactIds),
 					rationale: targetStageId ? `advance to ${targetStageId}` : "all quality gates passed",
@@ -285,6 +291,8 @@ describe("Pi-native Astra research state", () => {
 			},
 			reviewer: {
 				async review(evidence, currentJob) {
+					if (evidence.type === "stage-plan")
+						return reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] });
 					reviewCount += 1;
 					return reviewCount === 1
 						? reviewFixture(currentJob, {
@@ -330,6 +338,8 @@ describe("Pi-native Astra research state", () => {
 			},
 			reviewer: {
 				async review(evidence, currentJob) {
+					if (evidence.type === "stage-plan")
+						return reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] });
 					reviewCount += 1;
 					return reviewCount === 1
 						? reviewFixture(currentJob, {
@@ -551,7 +561,9 @@ describe("Pi-native Astra research state", () => {
 				},
 			},
 			reviewer: {
-				async review() {
+				async review(evidence, currentJob) {
+					if (evidence.type === "stage-plan")
+						return reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] });
 					throw new Error("failed candidates must not reach review");
 				},
 			},
@@ -567,7 +579,7 @@ describe("Pi-native Astra research state", () => {
 		const batch = Object.values(job.state.searchBatches)[0];
 		expect(batch?.status).toBe("exhausted");
 		expect(Object.values(batch?.candidates ?? {}).every((candidate) => candidate.status === "failed")).toBe(true);
-		expect(Object.values(job.state.tasks)).toHaveLength(6);
+		expect(Object.values(job.state.tasks).filter((task) => task.role === "worker")).toHaveLength(6);
 		expect(Math.max(...Object.values(job.state.tasks).map((task) => task.attempt))).toBe(3);
 		for (const task of Object.values(job.state.tasks).filter((candidate) => candidate.attempt > 1)) {
 			const prior = Object.values(job.state.tasks).find(

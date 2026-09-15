@@ -16,7 +16,9 @@ import {
 import { recordCodexWebSources } from "./codex-web-sources.ts";
 import {
 	atomicWriteJson,
+	TASK_DELIVERY_INSTRUCTIONS,
 	taskDir,
+	taskStageContract,
 	writeMainDecisionManifest,
 	writeReviewerOutputManifest,
 	writeReviewPacket,
@@ -200,7 +202,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 				]
 			: [];
 		const skills = await loadStageSkills(task.scope.workspaceRoot, task.stageId, "worker");
-		const minSourceRefs = job.definitions[task.stageId].minSourceRefs ?? 0;
+		const minSourceRefs = taskStageContract(job.definitions[task.stageId], task).minSourceRefs ?? 0;
 		const validateSubmission = async (output: Static<ReturnType<typeof codexWorkerSchema>>, sessionRef: string) => {
 			for (const ref of output.refs) {
 				if (
@@ -248,7 +250,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 					for (const record of records) sources.add(record.sourceRef);
 					await atomicWriteJson(sourceLedger, [...sources]);
 				},
-				instructions: `${skills.join("\n\n")}\n\n${submissionInstructions} Before returning final JSON, call astra_validate_submission with the exact draft. Correct any reported errors within the existing task budget, then return the validated draft. Validation is not scientific acceptance.`,
+				instructions: `${skills.join("\n\n")}\n\n${TASK_DELIVERY_INSTRUCTIONS}\n\n${submissionInstructions} Before returning final JSON, call astra_validate_submission with the exact draft. Correct any reported errors within the existing task budget, then return the validated draft. Validation is not scientific acceptance.`,
 				prompt: `Execute this task: ${JSON.stringify(task)}. Read ASTRA_TASK_CONTEXT.json and the referenced inputs. Preserve source directories in produced files. Use ASTRA_RESOURCE_ROOT for environments, models, datasets and caches. Return artifactType, contentJson (a JSON-encoded object with every required output field), and refs for actual files. This stage requires at least ${minSourceRefs} distinct receipted source entries with kind=source in refs, including repair submissions; citing sources only in contentJson does not satisfy this requirement. Reuse declared input source receipts. For new papers use astra_search_literature; if unavailable or insufficient, use native web search targeting original paper pages, then astra_list_sources for host-observed sourceRefs. Do not cite an attempted URL absent from returned results. Distinguish metadata and search snippets from verified full text; restrict claims to available evidence. A negative scientific review is valid evidence; never manufacture positive findings.`,
 				readRoots: [
 					...resources.map((resource) => resource.root),
@@ -314,7 +316,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	async review(evidence: Evidence, job: ResearchJob): Promise<ReviewerRunResult> {
 		const sourceTask = job.state.tasks[evidence.taskId];
 		const required = [...new Set([...sourceTask.acceptanceChecks, ...sourceTask.successCriteria])];
-		const definition = job.definitions[evidence.stageId];
+		const definition = taskStageContract(job.definitions[evidence.stageId], sourceTask);
 		const reviewTasks = Object.values(job.state.tasks).filter(
 			(task) => task.role === "reviewer" && task.inputArtifactRefs.includes(evidence.id),
 		);
@@ -372,12 +374,14 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 					jobId: task.jobId,
 					taskId: task.id,
 					evidenceId: evidence.id,
-					targetSnapshotHash: checksum({
-						evidenceId: evidence.id,
-						content: evidence.content,
-						refs: evidence.refs,
-						checksum: evidence.checksum,
-					}),
+					targetSnapshotHash:
+						evidence.versionHash ??
+						checksum({
+							evidenceId: evidence.id,
+							content: evidence.content,
+							refs: evidence.refs,
+							checksum: evidence.checksum,
+						}),
 					targetSnapshotRef,
 					inputRefs: [evidence.id],
 					resolvedEvidenceRefs,
@@ -451,7 +455,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 							},
 						},
 					],
-					instructions: `${skills.join("\n\n")}\n\n${submissionInstructions} Before final submission, call astra_validate_review and correct inconsistent verdicts or omitted criteria. Review validity is separate from the research outcome: identify a failed frozen criterion when rejecting a report, and preserve negative scientific findings.`,
+					instructions: `${skills.join("\n\n")}\n\n${TASK_DELIVERY_INSTRUCTIONS}\n\n${submissionInstructions} Before final submission, call astra_validate_review and correct inconsistent verdicts or omitted criteria. Review validity is separate from the research outcome: identify a failed frozen criterion when rejecting a report, and preserve negative scientific findings.`,
 					prompt: `You are an independent reviewer with no worker or prior reviewer conversation. Your review directory is ${cwd}; use absolute paths or an explicit working directory when switching between this packet and resource directories. You have at most ${task.budget.maxToolCalls} tool calls: batch related file reads and numerical checks into a few commands. Read review-packet.json, review-target-snapshot.json, and all relevant evidence files. The snapshot's resources list gives read-only access to the original runtime results of this task and its declared inputs. Inspect actual result files and logs there, not just manifest claims; cite the containing resource's exact artifactId and describe the inspected filenames in your rationale. Judge the current artifact against the frozen worker contract; do not demand future-stage results. Include each workerContract.acceptanceChecks and workerContract.successCriteria string from review-packet.json exactly once in criteria; do not add the reviewer task's own checks. Passing requires every criterion to pass with actual evidenceRefs. Cite the exact evidence ID, refs listed in the packet, resource artifactIds, or the two review JSON files you read. Copy reference strings exactly. Submit the structured review only after verification; avoid preliminary review JSON while still inspecting files. A complete negative research assessment can be a valid artifact.`,
 					readRoots: resources.map((resource) => resource.root),
 					maxToolCalls: task.budget.maxToolCalls,
@@ -488,7 +492,10 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 						},
 						task.scope.workspaceRoot,
 					);
-					return { manifestRef, value: { ...review, reviewerTaskId: task.id } };
+					return {
+						manifestRef,
+						value: { ...review, reviewerTaskId: task.id, targetVersionHash: evidence.versionHash },
+					};
 				},
 			);
 		} catch (error) {
@@ -580,7 +587,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 			{
 				cwd,
 				schema,
-				instructions: `${skills.join("\n\n")}\n\n${submissionInstructions}`,
+				instructions: `${skills.join("\n\n")}\n\n${TASK_DELIVERY_INSTRUCTIONS}\n\n${submissionInstructions}`,
 				prompt: `You are the persistent research main agent. Read research-summary.json first for the fresh capability contract, evidence index, open issues and completion blockers; prior conversation may be stale. Full original state and graph remain in research-context.json. Inspect the specific evidence content, review findings or historical nodes needed for this decision using targeted queries (for example jq by evidence ID), and the original files in the read-only job directory. The summary is an index, not proof of evidence quality. Avoid repeatedly dumping the entire state file. ${prompt}`,
 				readRoots: [join(root, ".astra", "jobs", state.frame.jobId)],
 				maxToolCalls: 32,
@@ -601,7 +608,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 			job,
 			id,
 			codexPlanSchema,
-			`Design actionable worker assignments for the active capability ${stageId} in mode ${requestedMode}. ${obligation ? `Resolve obligation ${JSON.stringify(obligation)} with one complete repair task.` : requestedMode === "search" ? "Create diverse independent candidates within searchPolicy bounds. Inspect previous batches and evaluations before continuing a search." : "Create one focused task, or two independently useful tasks."} Every task must include every requiredOutputFields field from the capability contract. Use exact existing artifact/evidence IDs as inputs. Concurrent tasks cannot depend on one another. Each task.objective must instruct its worker to perform this capability and deliver its outputs, not to plan dispatch, enter a stage or declare pipeline completion. Success criteria must assess delivered results, not readiness to start. Only you are planning: do not execute these assignments yourself, and do not copy that restriction into worker objectives. Workers must perform the work and verification permitted by their capability contract.`,
+			`Design actionable worker assignments for the active capability ${stageId} in mode ${requestedMode}. ${obligation ? `Resolve obligation ${JSON.stringify(obligation)} with one complete repair task.` : requestedMode === "search" ? "Create diverse independent candidates within searchPolicy bounds. Inspect previous batches and evaluations before continuing a search." : "Create one focused task, or two independently useful tasks."} Stage and synthesis tasks must include every requiredOutputFields field from the capability contract. Accepted local inputs awaiting synthesis: ${JSON.stringify(job.unsynthesizedLocalEvidence(stageId))}. Previous plan reviews to address: ${JSON.stringify(Object.values(job.state.reviews).filter((review) => job.state.evidence[review.evidenceId]?.type === "stage-plan" && job.state.evidence[review.evidenceId]?.stageId === stageId))}. Use exact existing artifact/evidence IDs as inputs. Concurrent tasks cannot depend on one another. Each task.objective must instruct its worker to perform this capability and deliver its outputs, not to plan dispatch, enter a stage or declare pipeline completion. Success criteria must assess delivered results, not readiness to start. Only you are planning: do not execute these assignments yourself, and do not copy that restriction into worker objectives. Workers must perform the work and verification permitted by their capability contract.`,
 			async (result) => {
 				const value: StagePlanManifest = {
 					...result.output,
@@ -690,12 +697,12 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 		);
 	}
 
-	decideRoute(job: ResearchJob): Promise<MainAgentDecisionManifest> {
+	decideRoute(job: ResearchJob, obligation?: Obligation): Promise<MainAgentDecisionManifest> {
 		return this.decision(
 			job,
 			"route",
 			codexRouteSchema,
-			"Choose continue, search, advance, backtrack, ask-user, or complete. Capabilities are not a fixed pipeline. Completion requires zero completionBlockers and a valid whole-research review. Preserve scientificOutcome and missionCoverage; never force a positive scientific result. Ask the user only for a material scientific decision. Cite exact canonical artifact IDs as evidenceRefs. Set targetStageId and question to null when inapplicable.",
+			`Choose continue, search, advance, backtrack, ask-user, or complete. Capabilities are not a fixed pipeline. ${obligation ? `For this open obligation ${JSON.stringify(obligation)}, choose ONLY continue to repair the current evidence, backtrack to repair an upstream cause, or ask-user for a material blocking decision. Advancing and completing are forbidden. Backtracking preserves the original issue for downstream re-verification.` : ""} Completion requires zero completionBlockers and a valid whole-research review. Preserve scientificOutcome and missionCoverage; never force a positive scientific result. Ask the user only for a material scientific decision. Cite exact artifact or evidence IDs as evidenceRefs. Set targetStageId and question to null when inapplicable.`,
 			(output) => ({
 				...output,
 				targetStageId: output.targetStageId ?? undefined,

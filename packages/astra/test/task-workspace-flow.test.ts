@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { writeWorkerOutputManifest } from "../src/contracts.ts";
 import { writeSourceReceipt } from "../src/literature.ts";
 import { ResearchJob } from "../src/research.ts";
 import { MemoryAstraStore } from "../src/store.ts";
@@ -68,6 +69,70 @@ async function scenario() {
 }
 
 describe("research files across stages and repairs", () => {
+	it("rejects file changes between validated submission and evidence registration", async () => {
+		const { root, job, task, evidence, sourceRoot } = await scenario();
+		const file = evidence.files![0];
+		await writeWorkerOutputManifest(
+			{
+				schemaVersion: "astra.worker_output_manifest.v1",
+				manifestId: "manifest_version",
+				jobId: task.jobId,
+				taskId: task.id,
+				agentId: task.agentId,
+				status: "completed",
+				artifactType: "validation",
+				content: evidence.content,
+				outputRefs: [{ kind: "artifact", ref: file.sourceRef, sha256: file.sha256, summary: "validated file" }],
+				validationStatus: "passed",
+				validationErrors: [],
+				sessionRef: "fixture:version",
+				createdAt: new Date().toISOString(),
+			},
+			root,
+		);
+		await writeFile(join(sourceRoot, "src/main.mjs"), "console.log(999);");
+		await expect(
+			job.recordEvidence({
+				taskId: task.id,
+				stageId: task.stageId,
+				type: evidence.type,
+				content: evidence.content,
+				refs: [file.sourceRef],
+			}),
+		).rejects.toThrow(/changed after validation/);
+	});
+	it("rejects a corrupted frozen evidence file", async () => {
+		const { root, job, task, evidence } = await scenario();
+		const file = evidence.files![0];
+		const path = join(root, ".astra", "jobs", task.jobId, "versions", "files", file.sha256);
+		await rm(path);
+		await writeFile(path, "corrupted bytes");
+		await expect(prepareReviewEvidenceBundle({ ...task, id: "review_corrupt" }, evidence, job)).rejects.toThrow(
+			/integrity/,
+		);
+	});
+	it("keeps submitted bytes when the worker later changes or deletes its files", async () => {
+		const { root, job, task, evidence, sourceRoot } = await scenario();
+		await writeFile(join(sourceRoot, "src/lib/value.mjs"), "export const value = 999;");
+		await rm(join(sourceRoot, "src/main.mjs"));
+		const bundle = await prepareReviewEvidenceBundle({ ...task, id: "review_frozen" }, evidence, job);
+		expect(bundle).toHaveLength(2);
+		const reviewRoot = join(root, ".astra", "jobs", task.jobId, "tasks", "review_frozen");
+		const main = bundle.find((file) => file.path.endsWith("src/main.mjs"))!;
+		expect((await promisify(execFile)(process.execPath, [join(reviewRoot, main.path)])).stdout.trim()).toBe("42");
+		const consumer = await job.dispatchTask({
+			...task,
+			id: "consume_frozen",
+			replayKey: "consume_frozen",
+			inputArtifactRefs: [evidence.id],
+		});
+		const cwd = await prepareTaskWorkspace(consumer, job);
+		expect(
+			(
+				await promisify(execFile)(process.execPath, [join(cwd, "inputs", evidence.id, "src/main.mjs")])
+			).stdout.trim(),
+		).toBe("42");
+	});
 	it("carries non-OpenAlex receipts through downstream workers and independent review", async () => {
 		const { root, job, task, evidence } = await scenario();
 		const ref = "doi:10.1000/test";

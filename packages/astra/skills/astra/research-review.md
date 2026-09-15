@@ -13,7 +13,7 @@ You are producing the whole-research assessment now. Its own canonical adoption 
 
 Each summary entry lists its directly readable `files` separately from optional runtime `resourceRoots`. Manuscripts, PDFs and build logs may be in `files` even when a resource directory is empty. Inspect these listed paths before declaring evidence inaccessible; do not infer absence from the resource directory alone.
 
-Keep submitted `content` under 3,500 characters: at most 3 strengths, at most 5 weaknesses, at most 5 claim-audit entries, and at most 5 required repairs. Submit those four fields as string arrays; each item must be one concise, evidence-linked statement.
+Cover every claim and blocking finding without truncating the audit to a fixed item count. Submit `strengths`, `weaknesses`, `claimAudit`, and `requiredRepairs` as string arrays; each item must be one concise, evidence-linked statement. If the task budget prevents complete verification, identify the unverified checks explicitly and require further review.
 
 Independently report `scientificOutcome` and `missionCoverage` for the primary objective. A workflow can pass with an inconclusive or refuted outcome, but it cannot label insufficient evidence as sufficient coverage. If an in-scope experiment needed for the claimed outcome remains feasible, put it in `requiredRepairs` instead of passing it as a nonblocking caveat.
 

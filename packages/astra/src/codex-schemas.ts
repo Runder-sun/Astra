@@ -60,6 +60,7 @@ export const codexPlanSchema = Type.Object(
 				{
 					key: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" }),
 					objective: text,
+					deliveryKind: Type.Union([Type.Literal("stage"), Type.Literal("local"), Type.Literal("synthesis")]),
 					inputArtifactRefs: texts,
 					requiredOutputFields: Type.Array(text, { minItems: 1 }),
 					acceptanceChecks: Type.Array(text, { minItems: 1 }),

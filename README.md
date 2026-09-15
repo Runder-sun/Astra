@@ -1,5 +1,7 @@
 # Astra
 
+[项目主页](https://runder-sun.github.io/Astra/) · [当前修复状态与剩余差距](docs/superpowers/reviews/2026-09-15-joint-review-fix-status.md)
+
 **实验版 `v0.1.0-alpha.1`。** 面向个人本机使用，真实研究尚未通过最终全流程验收。
 推荐先下载安装包，从[工作台快速开始](packages/astra/README.md#实验版-010-alpha1)进行小预算测试。
 使用限制、验证范围与依赖审计见 [发布说明](RELEASE_NOTES.md)。

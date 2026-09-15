@@ -4,9 +4,10 @@ import { CodexResearchAdapters } from "./codex-adapters.ts";
 import { CodexAppServerRunner } from "./codex-app-server.ts";
 import { assertAstraId, atomicWriteJson } from "./contracts.ts";
 import { migratePmcli } from "./migration.ts";
+import { applyPendingPauses, requestResearchPause } from "./pause-control.ts";
 import { PiChildSessionRunner, PiMainAgentAdapter, PiReviewerAdapter, PiWorkerAdapter } from "./pi-child-session.ts";
 import { ResearchJob } from "./research.ts";
-import { JsonlAstraStore } from "./store.ts";
+import { JsonlAstraStore, ResearchJobLockedError } from "./store.ts";
 import { ResearchSupervisor } from "./supervisor.ts";
 import type { AutomationLevel, MissionFrame } from "./types.ts";
 
@@ -37,6 +38,7 @@ export interface ResearchControlRequest {
 
 export interface ResearchControlResult {
 	action: ResearchControlAction;
+	pauseRequested?: boolean;
 	backend?: "pi" | "codex";
 	costAccounting?: "provider-estimate" | "subscription-unavailable";
 	jobId?: string;
@@ -252,11 +254,15 @@ async function driveToCompletion(
 	const maxTicks = Number(process.env.ASTRA_MAX_TICKS ?? "64");
 	let ticks = 0;
 	while (job.state.frame.status !== "completed") {
+		await store.withJobLock(job.state.frame.jobId, `control_${process.pid}`, async () => {
+			await job.reload();
+			await applyPendingPauses(job);
+		});
 		if (job.state.paused) return;
 		const retryAt = job.state.providerBackoff?.retryAt;
 		const waitMs = retryAt ? Date.parse(retryAt) - Date.now() : 0;
 		if (waitMs > 0) {
-			await new Promise((resolvePromise) => setTimeout(resolvePromise, waitMs));
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(waitMs, 250)));
 			continue;
 		}
 		if (ticks >= maxTicks) throw new Error(`research run exceeded ${maxTicks} ticks`);
@@ -320,13 +326,18 @@ export async function runResearchControl(request: ResearchControlRequest, cwd: s
 	if (!job) throw new Error(`active Astra research job not found: ${jobId}`);
 	if (request.action === "status") return { action: request.action, ...accounting, jobId, status: job.status() };
 	if (request.action === "pause") {
-		job = await mutateLatestJob(store, jobId, async (latest) => {
-			await latest.pause(request.reason?.trim() || "paused by operator");
-		});
+		await requestResearchPause(cwd, jobId, request.reason?.trim() || "paused by operator");
+		try {
+			job = await mutateLatestJob(store, jobId, applyPendingPauses);
+		} catch (error) {
+			if (!(error instanceof ResearchJobLockedError)) throw error;
+			return { action: request.action, ...accounting, jobId, status: job.status(), pauseRequested: true };
+		}
 		return { action: request.action, ...accounting, jobId, status: job.status() };
 	}
 	if (request.action === "resume") {
 		job = await mutateLatestJob(store, jobId, async (latest) => {
+			await applyPendingPauses(latest);
 			if (request.automation !== undefined && request.automation !== latest.state.frame.automation) {
 				await latest.setAutomation(request.automation);
 			}

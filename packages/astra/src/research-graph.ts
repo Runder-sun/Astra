@@ -87,11 +87,16 @@ export function addEdgeToGraph(graph: ResearchGraph, edge: ResearchEdge): void {
 	graph.revision += 1;
 }
 
-export function updateNodeStatus(graph: ResearchGraph, nodeId: string, status: ResearchNode["status"]): void {
+export function updateNodeStatus(
+	graph: ResearchGraph,
+	nodeId: string,
+	status: ResearchNode["status"],
+	timestamp = new Date().toISOString(),
+): void {
 	const node = graph.nodes[nodeId];
 	if (!node) throw new Error(`unknown research node ${nodeId}`);
 	node.status = status;
-	node.updatedAt = new Date().toISOString();
+	node.updatedAt = timestamp;
 	graph.openQuestionIds = graph.openQuestionIds.filter((id) => id !== nodeId || status === "open");
 	graph.activeHypothesisIds = graph.activeHypothesisIds.filter((id) => id !== nodeId || status === "active");
 	graph.acceptedClaimIds = graph.acceptedClaimIds.filter((id) => id !== nodeId || status === "accepted");

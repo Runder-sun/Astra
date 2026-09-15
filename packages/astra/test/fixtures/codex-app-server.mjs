@@ -91,7 +91,7 @@ createInterface({ input: process.stdin }).on("line", line => {
 			if (fields.tasks) {
 				const context = JSON.parse(readFileSync("research-context.json", "utf8"));
 				const stage = context.capabilities[context.state.frame.activeStageId];
-				output = { tasks: [{ key: "candidate", objective: "Bound the research question", inputArtifactRefs: [], requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, hypothesis: "A bounded test is possible" }], rationale: "Evaluate a bounded question first" };
+				output = { tasks: [{ key: "candidate", deliveryKind: "stage", objective: "Bound the research question", inputArtifactRefs: [], requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, hypothesis: "A bounded test is possible" }], rationale: "Evaluate a bounded question first" };
 			} else if (fields.contentJson) {
 				const context = JSON.parse(readFileSync("ASTRA_TASK_CONTEXT.json", "utf8"));
 				output = { artifactType: context.task.requiredOutputType, contentJson: JSON.stringify(Object.fromEntries(context.task.requiredOutputFields.map(field => [field, `fixture ${field}`]))), refs: [] };

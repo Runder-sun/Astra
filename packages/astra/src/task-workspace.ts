@@ -1,10 +1,19 @@
 import { createHash } from "node:crypto";
 import { access, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { assertAstraId, atomicWriteJson, canonicalArtifactPath, taskDir } from "./contracts.ts";
+import {
+	assertAstraId,
+	atomicWriteJson,
+	canonicalArtifactPath,
+	readJson,
+	taskDir,
+	taskStageContract,
+	workerManifestPath,
+	writeTaskPacket,
+} from "./contracts.ts";
 import { sourceReceiptFilename } from "./literature.ts";
 import type { ResearchJob } from "./research.ts";
-import type { Evidence, TaskPacket } from "./types.ts";
+import type { Evidence, EvidenceFileVersion, TaskPacket, WorkerOutputManifest } from "./types.ts";
 
 const RESEARCH_REVIEW_FIELDS: Record<string, string[]> = {
 	validation: ["researchQuestion", "scope", "nonGoals", "acceptanceCriteria", "falsifiableNextStep"],
@@ -127,6 +136,58 @@ function evidenceFileSource(projectRoot: string, workspace: string, ref: string)
 	return resolve(ref.startsWith(".astra/") ? projectRoot : workspace, ref);
 }
 
+export async function freezeEvidenceFiles(task: TaskPacket, refs: string[]): Promise<EvidenceFileVersion[]> {
+	const projectRoot = resolve(task.scope.workspaceRoot);
+	let manifest: WorkerOutputManifest | undefined;
+	if (task.version) {
+		try {
+			manifest = await readJson<WorkerOutputManifest>(workerManifestPath(projectRoot, task.jobId, task.id));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+	const files: EvidenceFileVersion[] = [];
+	for (const sourceRef of new Set(refs)) {
+		const receipt = sourceReceiptFilename(sourceRef);
+		if (!receipt && (isAbsolute(sourceRef) || /^[a-z][a-z0-9+.-]*:/i.test(sourceRef))) continue;
+		const workspace = taskWorkspacePath(projectRoot, task.jobId, task.id);
+		const allowedRoot = receipt ? join(projectRoot, ".astra", "jobs", task.jobId, "sources") : workspace;
+		const source = receipt ? join(allowedRoot, receipt) : evidenceFileSource(projectRoot, workspace, sourceRef);
+		if (!source) continue;
+		const content = await readEvidenceFile(source, allowedRoot);
+		if (!content) {
+			if (task.version && !receipt) throw new Error(`submitted evidence file is missing: ${sourceRef}`);
+			continue;
+		}
+		const sha256 = createHash("sha256").update(content).digest("hex");
+		const declared = manifest?.outputRefs.find(
+			(ref) => ref.ref === sourceRef || ref.ref === relative(workspace, source).split("\\").join("/"),
+		);
+		if (declared?.sha256 && declared.sha256 !== sha256)
+			throw new Error(`submitted evidence changed after validation: ${sourceRef}`);
+		await writeEvidenceFile(join(projectRoot, ".astra", "jobs", task.jobId, "versions", "files"), sha256, content);
+		files.push({ sourceRef, sha256 });
+	}
+	return files;
+}
+
+export async function readVersionedFile(
+	task: TaskPacket,
+	evidence: Evidence,
+	sourceRef: string,
+	source: string,
+	allowedRoot: string,
+): Promise<Buffer | undefined> {
+	const file = evidence.files?.find((entry) => entry.sourceRef === sourceRef);
+	if (!file) return readEvidenceFile(source, allowedRoot);
+	if (!/^[a-f0-9]{64}$/.test(file.sha256)) throw new Error(`invalid evidence file hash: ${sourceRef}`);
+	const root = join(resolve(task.scope.workspaceRoot), ".astra", "jobs", task.jobId, "versions", "files");
+	const content = await readEvidenceFile(join(root, file.sha256), root);
+	if (!content || createHash("sha256").update(content).digest("hex") !== file.sha256)
+		throw new Error(`evidence version integrity failure: ${sourceRef}`);
+	return content;
+}
+
 async function writeEvidenceFile(root: string, path: string, content: Buffer): Promise<void> {
 	const destination = resolve(root, path);
 	if (!isInside(root, destination)) throw new Error(`evidence destination is outside its bundle: ${path}`);
@@ -164,7 +225,7 @@ async function materializeInputFiles(
 			const allowedRoot = receipt ? join(projectRoot, ".astra", "jobs", task.jobId, "sources") : sourceRoot;
 			const source = receipt ? join(allowedRoot, receipt) : evidenceFileSource(projectRoot, sourceRoot, sourceRef);
 			if (!source) continue;
-			const content = await readEvidenceFile(source, allowedRoot);
+			const content = await readVersionedFile(task, evidence, sourceRef, source, allowedRoot);
 			if (!content) continue;
 			const path = join("inputs", artifactRef, receipt ? join("sources", receipt) : relative(sourceRoot, source))
 				.split("\\")
@@ -182,6 +243,8 @@ async function materializeInputFiles(
 }
 
 export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): Promise<string> {
+	const version = await job.captureTaskVersion(task.id);
+	await writeTaskPacket({ ...task, version });
 	const workspace = taskWorkspacePath(task.scope.workspaceRoot, task.jobId, task.id);
 	await mkdir(workspace, { recursive: true });
 	const writableResourceRoot =
@@ -281,11 +344,12 @@ export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): 
 	});
 	await atomicWriteJson(join(workspace, "ASTRA_TASK_CONTEXT.json"), {
 		schemaVersion: "astra.task_context.v1",
+		version,
 		mission: {
 			...snapshot.frame,
 			permissions: { ...snapshot.frame.permissions, workspaceRoot: "." },
 		},
-		stage: job.definitions[task.stageId],
+		stage: taskStageContract(job.definitions[task.stageId], task),
 		task: {
 			...task,
 			inputArtifactRefs: relevantInputRefs,
@@ -323,10 +387,14 @@ export async function prepareReviewEvidenceBundle(
 		allowedRoot: string,
 		sourceRef: string,
 		path: string,
+		versionedEvidence?: Evidence,
+		originalRef = sourceRef,
 	): Promise<void> => {
 		const copyKey = `${source}\0${sourceRef}`;
 		if (copiedSources.has(copyKey)) return;
-		const content = await readEvidenceFile(source, allowedRoot);
+		const content = versionedEvidence
+			? await readVersionedFile(task, versionedEvidence, originalRef, source, allowedRoot)
+			: await readEvidenceFile(source, allowedRoot);
 		if (!content) return;
 		await writeEvidenceFile(reviewRoot, path, content);
 		copiedSources.add(copyKey);
@@ -339,7 +407,7 @@ export async function prepareReviewEvidenceBundle(
 	for (const sourceRef of evidence.refs) {
 		const filename = sourceReceiptFilename(sourceRef);
 		if (filename) {
-			await copyIntoBundle(join(sourcesRoot, filename), sourcesRoot, sourceRef, join("sources", filename));
+			await copyIntoBundle(join(sourcesRoot, filename), sourcesRoot, sourceRef, join("sources", filename), evidence);
 			continue;
 		}
 		const source = evidenceFileSource(projectRoot, sourceWorkspace, sourceRef);
@@ -349,6 +417,7 @@ export async function prepareReviewEvidenceBundle(
 				sourceWorkspace,
 				sourceRef,
 				join("evidence", evidence.id, relative(sourceWorkspace, source)),
+				evidence,
 			);
 	}
 
@@ -366,17 +435,29 @@ export async function prepareReviewEvidenceBundle(
 			);
 		const upstreamEvidence = job.state.evidence[artifact?.evidenceId ?? inputRef];
 		if (!upstreamEvidence) continue;
+		if (!artifact) {
+			const path = join("input-evidence", `${inputRef}.json`).split("\\").join("/");
+			const content = Buffer.from(JSON.stringify(upstreamEvidence, null, 2));
+			await writeEvidenceFile(reviewRoot, path, content);
+			bundle.push({ sourceRef: path, path, sha256: createHash("sha256").update(content).digest("hex") });
+		}
 		const upstreamWorkspace = taskWorkspacePath(projectRoot, task.jobId, upstreamEvidence.taskId);
 		for (const sourceRef of upstreamEvidence.refs) {
 			const filename = sourceReceiptFilename(sourceRef);
 			if (filename) {
-				await copyIntoBundle(join(sourcesRoot, filename), sourcesRoot, sourceRef, join("sources", filename));
+				await copyIntoBundle(
+					join(sourcesRoot, filename),
+					sourcesRoot,
+					sourceRef,
+					join("sources", filename),
+					upstreamEvidence,
+				);
 				continue;
 			}
 			const source = evidenceFileSource(projectRoot, upstreamWorkspace, sourceRef);
 			if (!source) continue;
 			const materializedRef = join("inputs", inputRef, relative(upstreamWorkspace, source)).split("\\").join("/");
-			await copyIntoBundle(source, upstreamWorkspace, materializedRef, materializedRef);
+			await copyIntoBundle(source, upstreamWorkspace, materializedRef, materializedRef, upstreamEvidence, sourceRef);
 		}
 	}
 	return bundle;

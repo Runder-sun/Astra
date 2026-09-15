@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
-import { scientificAssessment } from "./research.ts";
+import { readSourceRecord } from "./literature.ts";
+import { validatePaperDelivery } from "./paper-delivery.ts";
+import { scientificAssessment, validateClaimAssessments } from "./research.ts";
 import type { OutputRef, TaskPacket } from "./types.ts";
 
 const MAX_REFERENCED_FILE_BYTES = 32 * 1024 * 1024;
@@ -55,6 +57,7 @@ export async function validateWorkerSubmission(
 	}
 
 	const executionRoot = resolve(options.executionRoot);
+	if (packet.requiredOutputType === "result-to-claim") validateClaimAssessments(content);
 	const outputRefs: OutputRef[] = [];
 	for (const ref of submission.refs) {
 		if (!ref.ref.trim() || !ref.summary.trim()) throw new Error("worker output refs require a ref and summary");
@@ -112,9 +115,14 @@ export async function validateWorkerSubmission(
 		}
 	}
 
+	if (packet.requiredOutputType === "paper-compile") await validatePaperDelivery(content, outputRefs, executionRoot);
 	const sourceCount = new Set(outputRefs.filter((ref) => ref.kind === "source").map((ref) => ref.ref)).size;
 	if (sourceCount < (options.minSourceRefs ?? 0)) {
 		throw new Error(`worker output requires at least ${options.minSourceRefs} source refs; received ${sourceCount}`);
+	}
+	for (const ref of outputRefs.filter((ref) => ref.kind === "source")) {
+		if (!(await readSourceRecord(packet.scope.workspaceRoot, packet.jobId, ref.ref)))
+			throw new Error(`source requires an intact retrieval receipt: ${ref.ref}`);
 	}
 	if (!outputRefs.some((ref) => ref.kind === "session")) {
 		outputRefs.push({ kind: "session", ref: options.sessionRef, summary: "Pi worker session" });

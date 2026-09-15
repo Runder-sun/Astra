@@ -510,13 +510,13 @@ describe("main-agent authored stage planning", () => {
 		const firstResourceRoot = taskResourcePath(root, job.state.frame.jobId, first.id);
 		await mkdir(firstResourceRoot, { recursive: true });
 		await writeFile(join(firstResourceRoot, "partial-environment.txt"), "installed\n", "utf8");
-		const retry = {
+		await job.setTaskStatus(first.id, "failed");
+		const retry = await job.dispatchTask({
 			...first,
 			id: "task_resource_attempt_2",
 			attempt: 2,
-			status: "ready" as const,
 			supersedesTaskId: first.id,
-		};
+		});
 
 		await prepareTaskWorkspace(retry, job);
 

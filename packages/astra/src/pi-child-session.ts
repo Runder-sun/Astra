@@ -10,7 +10,9 @@ import {
 	readStagePlanManifest,
 	readWorkerOutputManifest,
 	stagePlanManifestPath,
+	TASK_DELIVERY_INSTRUCTIONS,
 	taskDir,
+	taskStageContract,
 	writeReviewPacket,
 	writeReviewSnapshot,
 	writeReviewTrace,
@@ -312,9 +314,9 @@ export class PiChildSessionRunner {
 				: role === "reviewer"
 					? ["read", "grep", "find", "ls", "astra_submit_review"]
 					: env.ASTRA_STAGE_PLAN_ID
-						? ["astra_submit_stage_plan"]
+						? ["astra_read_research_object", "astra_submit_stage_plan"]
 						: env.ASTRA_DECISION_TYPE
-							? ["astra_submit_main_decision"]
+							? ["astra_read_research_object", "astra_submit_main_decision"]
 							: [
 									"read",
 									"grep",
@@ -323,6 +325,7 @@ export class PiChildSessionRunner {
 									"astra_submit_stage_plan",
 									"astra_submit_main_decision",
 									"research_status",
+									"astra_read_research_object",
 								];
 		const args = [
 			"--mode",
@@ -471,7 +474,7 @@ export class PiChildSessionRunner {
 			task.id,
 			task.attempt,
 			role,
-			prompt,
+			`${prompt}\n\n${TASK_DELIVERY_INSTRUCTIONS}`,
 			{
 				ASTRA_PROJECT_ROOT: task.scope.workspaceRoot,
 				ASTRA_STAGE_ID: task.stageId,
@@ -534,9 +537,9 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 				? taskResourcePath(task.scope.workspaceRoot, task.jobId, task.id)
 				: undefined;
 		const result = await this.runner.runTask(
-			task,
+			job.state.tasks[task.id],
 			"worker",
-			`You are the Astra worker for TaskPacket ${task.id}. Read ASTRA_TASK_CONTEXT.json in the current isolated task workspace before acting. Execute only the authored objective. Upstream structured content is inline under inputs.canonicalArtifacts unless an entry provides contentPath; read that relative JSON file when present.${task.stageId === "research-review" ? " For research-review, read inputs.reviewSummaryPath first and then drill into at most three contentPath files needed to verify the highest-risk claims; do not read every canonical digest. Keep the submitted content under 3,500 characters with at most 3 strengths, at most 5 weaknesses, at most 5 claim-audit entries, and at most 5 required repairs. Independently report scientificOutcome and missionCoverage for the primary objective, then submit strengths, weaknesses, claimAudit, and requiredRepairs as concise string arrays matching the tool schema." : ""} Upstream files are available only at the exact relative paths in inputs.files[].path. Never assume an upstream basename exists in the workspace root. Do not load raw datasets or long logs into model context; use bounded commands or small summaries. Treat the current directory as the workspace root and never access a parent .astra directory or construct host absolute paths.${resourceRoot ? ' The only writable path outside the task workspace is the predeclared "$ASTRA_RESOURCE_ROOT". For resource-producing work, create environments, datasets, checkpoints, caches, and other reusable runtime assets under "$ASTRA_RESOURCE_ROOT" by referencing that environment variable literally in commands. Do not create a resources/ directory in the task workspace or derive a resource path from the task id. Keep source code, compact resource manifests, exact command records, and reviewable logs in the task workspace.' : ""} Produce every required output field and call astra_submit_worker_output exactly once. Only cite artifact/log refs for files you actually created and source refs returned by a retrieval tool; otherwise pass refs: [] and Astra will add the session ref. Never invent a ref. Do not decide adoption, route, or stage closure.`,
+			`You are the Astra worker for TaskPacket ${task.id}. Read ASTRA_TASK_CONTEXT.json in the current isolated task workspace before acting. Execute only the authored objective. Upstream structured content is inline under inputs.canonicalArtifacts unless an entry provides contentPath; read that relative JSON file when present.${task.stageId === "research-review" ? " For research-review, read inputs.reviewSummaryPath first as an index, then inspect contentPath files and direct evidence needed for every acceptance criterion and every claim. Do not truncate findings or repairs to a fixed item count. Batch targeted reads within the task budget; report any unchecked criterion or claim as unverified and require further review. Independently report scientificOutcome and missionCoverage for the primary objective, then submit strengths, weaknesses, claimAudit, and requiredRepairs as concise string arrays matching the tool schema." : ""} Upstream files are available only at the exact relative paths in inputs.files[].path. Never assume an upstream basename exists in the workspace root. Do not load raw datasets or long logs into model context; use bounded commands or small summaries. Treat the current directory as the workspace root and never access a parent .astra directory or construct host absolute paths.${resourceRoot ? ' The only writable path outside the task workspace is the predeclared "$ASTRA_RESOURCE_ROOT". For resource-producing work, create environments, datasets, checkpoints, caches, and other reusable runtime assets under "$ASTRA_RESOURCE_ROOT" by referencing that environment variable literally in commands. Do not create a resources/ directory in the task workspace or derive a resource path from the task id. Keep source code, compact resource manifests, exact command records, and reviewable logs in the task workspace.' : ""} Produce every required output field and call astra_submit_worker_output exactly once. Only cite artifact/log refs for files you actually created and source refs returned by a retrieval tool; otherwise pass refs: [] and Astra will add the session ref. Never invent a ref. Do not decide adoption, route, or stage closure.`,
 			{
 				ASTRA_EXECUTION_ROOT: executionRoot,
 				ASTRA_RESOURCE_ROOT: resourceRoot,
@@ -638,10 +641,11 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 	}
 
 	async review(evidence: Evidence, job: ResearchJob): Promise<ReviewerRunResult> {
-		const definition = job.definitions[evidence.stageId];
+		const baseDefinition = job.definitions[evidence.stageId];
 		const workerTask = job.state.tasks[evidence.taskId];
-		if (!definition) throw new Error(`stage definition not found for review: ${evidence.stageId}`);
+		if (!baseDefinition) throw new Error(`stage definition not found for review: ${evidence.stageId}`);
 		if (!workerTask) throw new Error(`source worker task not found for evidence: ${evidence.id}`);
+		const definition = taskStageContract(baseDefinition, workerTask);
 		const reviewOrdinal =
 			Object.values(job.state.reviews).filter((review) => review.evidenceId === evidence.id).length + 1;
 		const priorReviewer = Object.values(job.state.tasks).find(
@@ -703,12 +707,14 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 				jobId: task.jobId,
 				taskId: task.id,
 				evidenceId: evidence.id,
-				targetSnapshotHash: checksum({
-					evidenceId: evidence.id,
-					content: evidence.content,
-					refs: evidence.refs,
-					checksum: evidence.checksum,
-				}),
+				targetSnapshotHash:
+					evidence.versionHash ??
+					checksum({
+						evidenceId: evidence.id,
+						content: evidence.content,
+						refs: evidence.refs,
+						checksum: evidence.checksum,
+					}),
 				targetSnapshotRef: snapshotRef,
 				inputRefs: task.inputArtifactRefs,
 				resolvedEvidenceRefs,
@@ -846,6 +852,7 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 		);
 		return {
 			verdict: manifest.verdict,
+			targetVersionHash: evidence.versionHash,
 			findings: manifest.findings,
 			reviewerTaskId: task.id,
 			score: manifest.score,
@@ -880,7 +887,12 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		const repairEvidence = obligation
 			? Object.values(job.state.evidence)
 					.filter((evidence) => evidence.stageId === stageId)
-					.map((evidence) => ({ id: evidence.id, type: evidence.type, status: evidence.status }))
+					.map((evidence) => ({
+						id: evidence.id,
+						type: evidence.type,
+						status: evidence.status,
+						task: job.state.tasks[evidence.taskId],
+					}))
 			: [];
 		const latestSearchBatch = Object.values(job.state.searchBatches)
 			.filter((batch) => batch.stageId === stageId && batch.status !== "superseded")
@@ -899,7 +911,9 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 					),
 				}
 			: undefined;
+		const localEvidence = job.unsynthesizedLocalEvidence(stageId);
 		const availableInputRefs = [
+			...localEvidence.map((evidence) => evidence.id),
 			...activeCanonical.map((artifact) => artifact.id),
 			...repairEvidence.map((evidence) => evidence.id),
 		];
@@ -917,7 +931,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			decisionRef,
 			1,
 			"main-agent",
-			`You are Astra's persistent main research agent and the only authority that may define subagent work. The active capability is ${stageId}; capabilities are not a fixed pipeline. The frozen capability contract is ${JSON.stringify(definition)}. The canonical research graph projection is ${JSON.stringify(projectResearchGraph(job.state))}. Available canonical and repair inputs are ${JSON.stringify({ activeCanonical, repairEvidence })}. The requested plan mode is ${requestedMode}. ${obligation ? `This repair plan must resolve obligation ${obligation.id}: ${obligation.description}. Submit exactly one complete repair task.` : requestedMode === "search" ? `Author ${definition.searchPolicy?.minCandidates ?? 2} to ${definition.searchPolicy?.maxCandidates ?? 4} genuinely diverse candidate tasks. Give each a distinct hypothesis and use mode search; candidates run independently and will be compared by frozen criteria ${JSON.stringify(definition.searchPolicy?.criteria ?? definition.acceptanceChecks)}.${continuationContext ? ` This is bounded search round ${continuationBatch?.round ? continuationBatch.round + 1 : 1}/${continuationBatch?.maxRounds ?? definition.searchPolicy?.maxRounds ?? 2}. The previous round and independent evaluations are ${JSON.stringify(continuationContext)}. Its tie rationale was ${JSON.stringify(continuationBatch?.continuationRationale)}. Create orthogonal discriminators that can break that exact tie; do not repeat any previous hypothesis.` : " This is the first bounded search round."}` : "Author one focused execution task, or two non-overlapping tasks only when their outputs are independently useful."} Call astra_submit_stage_plan exactly once. Tasks in the same plan run concurrently in isolated workspaces: a task cannot consume another task's output from the same plan. If work has an ordering dependency, plan only the prerequisite task and let a later main-agent round plan its consumer. Every task must include every authored canonical ref it needs; full immutable contents will be materialized in its workspace. Do not perform worker work or choose the route yourself.`,
+			`You are Astra's persistent main research agent and the only authority that may define subagent work. The active capability is ${stageId}; capabilities are not a fixed pipeline. The frozen capability contract is ${JSON.stringify(definition)}. The canonical research graph projection is ${JSON.stringify(projectResearchGraph(job.state))}. Use astra_read_research_object with exact IDs to expand structured evidence, reviews and obligations before planning; follow nextOffset for complete content. To read a declared frozen UTF-8 evidence file, pass its exact files[].sourceRef as fileRef alongside the evidence or canonical ID. Binary files require a text extraction or page preview. Previous plan reviews to address: ${JSON.stringify(Object.values(job.state.reviews).filter((review) => job.state.evidence[review.evidenceId]?.type === "stage-plan" && job.state.evidence[review.evidenceId]?.stageId === stageId))}. Available canonical and repair inputs are ${JSON.stringify({ activeCanonical, repairEvidence, localEvidence })}. The requested plan mode is ${requestedMode}. ${obligation ? `This repair plan must resolve obligation ${obligation.id}: ${obligation.description}. Submit exactly one complete repair task.` : requestedMode === "search" ? `Author ${definition.searchPolicy?.minCandidates ?? 2} to ${definition.searchPolicy?.maxCandidates ?? 4} genuinely diverse candidate tasks. Give each a distinct hypothesis and use mode search; candidates run independently and will be compared by frozen criteria ${JSON.stringify(definition.searchPolicy?.criteria ?? definition.acceptanceChecks)}.${continuationContext ? ` This is bounded search round ${continuationBatch?.round ? continuationBatch.round + 1 : 1}/${continuationBatch?.maxRounds ?? definition.searchPolicy?.maxRounds ?? 2}. The previous round and independent evaluations are ${JSON.stringify(continuationContext)}. Its tie rationale was ${JSON.stringify(continuationBatch?.continuationRationale)}. Create orthogonal discriminators that can break that exact tie; do not repeat any previous hypothesis.` : " This is the first bounded search round."}` : "Author one focused execution task, or two non-overlapping tasks only when their outputs are independently useful."} ${TASK_DELIVERY_INSTRUCTIONS} Call astra_submit_stage_plan exactly once. Tasks in the same plan run concurrently in isolated workspaces: a task cannot consume another task's output from the same plan. If work has an ordering dependency, plan only the prerequisite task and let a later main-agent round plan its consumer. Every task must include every authored canonical ref it needs; full immutable contents will be materialized in its workspace. Do not perform worker work or choose the route yourself.`,
 			{
 				ASTRA_SESSION_ID: sessionId,
 				ASTRA_PROJECT_ROOT: this.cwd,
@@ -1021,7 +1035,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			decisionRef,
 			1,
 			"main-agent",
-			`${prompt} Use decisionRef ${decisionRef}.`,
+			`${prompt} Use astra_read_research_object with exact research object IDs to expand summaries and inspect complete structured evidence, reviews, obligations or prior decisions. Follow nextOffset until the relevant content is verified; report any unverified basis. To read a declared frozen UTF-8 evidence file, pass its exact files[].sourceRef as fileRef alongside the evidence or canonical ID. Binary files require a text extraction or page preview. Use decisionRef ${decisionRef}.`,
 			{
 				ASTRA_SESSION_ID: sessionId,
 				ASTRA_DECISION_TYPE: type,
@@ -1114,7 +1128,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		return this.decide(
 			job,
 			"adoption",
-			`You are Astra's main research agent. This complete evidence snapshot has passed independent review: ${JSON.stringify(evidence)}. Decide whether to adopt it as canonical without inspecting the filesystem. Valid active canonical artifact ids for replacementOf are ${JSON.stringify(replaceableArtifactIds)}. Use replacementOf only when replacing one of those exact ids; omit it when the list is empty. Call astra_submit_main_decision with decisionType adoption, evidenceId ${evidence.id}, adopt true or false, and rationale.`,
+			`You are Astra's main research agent. This complete evidence snapshot has passed independent review: ${JSON.stringify(evidence)}. Inspect the structured evidence and reviews using the controlled research reader as needed, then decide whether to adopt it as canonical. Valid active canonical artifact ids for replacementOf are ${JSON.stringify(replaceableArtifactIds)}. Use replacementOf only when replacing one of those exact ids; omit it when the list is empty. Call astra_submit_main_decision with decisionType adoption, evidenceId ${evidence.id}, adopt true or false, and rationale.`,
 			{ ASTRA_EVIDENCE_ID: evidence.id },
 		);
 	}
@@ -1137,7 +1151,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		);
 	}
 
-	decideRoute(job: ResearchJob): Promise<MainAgentDecisionManifest> {
+	decideRoute(job: ResearchJob, obligation?: Obligation): Promise<MainAgentDecisionManifest> {
 		const snapshot = job.state;
 		const currentArtifactId = snapshot.canonicalRoute.stageArtifactIds[snapshot.frame.activeStageId];
 		const currentArtifact = currentArtifactId ? snapshot.canonical[currentArtifactId] : undefined;
@@ -1151,6 +1165,14 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			.sort((left, right) => left.createdAt.localeCompare(right.createdAt))
 			.slice(-6);
 		const routeContext = {
+			repairStrategy: obligation
+				? {
+						obligation,
+						allowedActions: ["continue", "backtrack", "ask-user"],
+						instruction:
+							"Choose only these actions. Continue repairs current evidence; backtrack repairs an upstream cause. Original issues require subsequent re-verification.",
+					}
+				: undefined,
 			projection: {
 				kind: "astra.route_decision_context.v1",
 				sourceRef: `job:${snapshot.frame.jobId}:event:${snapshot.eventSeq}`,
@@ -1197,6 +1219,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			`You are Astra's persistent main research agent and control the canonical route. Inspect this bounded, lossless-by-reference route context ${JSON.stringify(routeContext)}. Choose exactly one action: continue the current evidence loop, search alternatives, advance to the highest-value capability, backtrack to invalidate a flawed upstream conclusion, ask the user one concrete blocking question, or complete. Completion is forbidden while completionBlockers is non-empty. Process completion does not mean the hypothesis was supported: preserve the recorded scientificOutcome and missionCoverage, and continue gathering evidence only when an in-scope action can materially improve coverage. A negative whole-research review requires backtrack or continue, never complete. In collaborative mode, use ask-user only for a decision where the user's scientific preference, boundary, risk tolerance, or external knowledge can materially change the route; do not ask for routine task approval. Call astra_submit_main_decision with decisionType route, stageId ${snapshot.frame.activeStageId}, routeAction, targetStageId when advancing/backtracking, evidenceRefs, any newQuestions, and rationale.`,
 			{
 				ASTRA_COMPLETION_BLOCKERS: JSON.stringify(routeContext.completionBlockers),
+				ASTRA_REPAIR_OBLIGATION_ID: obligation?.id ?? "",
 				ASTRA_ROUTE_EVIDENCE_REFS: JSON.stringify(routeContext.canonicalArtifacts.map((artifact) => artifact.id)),
 			},
 		);

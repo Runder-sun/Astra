@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { checksum, MAX_TASK_ATTEMPTS, type ResearchJob } from "./research.ts";
+import { applyPendingPauses } from "./pause-control.ts";
+import { planEvidence, planReviewStatus, preparePlanEvidence } from "./plan-review.ts";
+import { checksum, MAX_TASK_ATTEMPTS, type ResearchJob, ResearchTaskBudgetError } from "./research.ts";
 import type { AstraStore } from "./store.ts";
 import type {
 	CandidateEvaluation,
@@ -20,6 +22,7 @@ export interface WorkerRunResult {
 }
 
 export interface ReviewerRunResult {
+	targetVersionHash?: string;
 	verdict: ReviewVerdict;
 	findings: string[];
 	reviewerTaskId?: string;
@@ -45,6 +48,8 @@ export class ProviderCapacityError extends Error {
 const PROVIDER_BACKOFF_BASE_MS = 15_000;
 const PROVIDER_BACKOFF_MAX_MS = 5 * 60_000;
 
+class ResearchPausedError extends Error {}
+
 export interface ResearchWorkerAdapter {
 	run(task: TaskPacket, job: ResearchJob): Promise<WorkerRunResult>;
 }
@@ -66,7 +71,7 @@ export interface ResearchMainAgentAdapter {
 		evaluations: CandidateEvaluation[],
 		job: ResearchJob,
 	): Promise<MainAgentDecisionManifest>;
-	decideRoute(job: ResearchJob): Promise<MainAgentDecisionManifest>;
+	decideRoute(job: ResearchJob, obligation?: Obligation): Promise<MainAgentDecisionManifest>;
 }
 
 export interface SupervisorOptions {
@@ -96,6 +101,7 @@ export class ResearchSupervisor {
 	private readonly reviewer: ResearchReviewerAdapter;
 	private readonly mainAgent: ResearchMainAgentAdapter;
 	private recovered = false;
+	private pauseCheck: Promise<void> = Promise.resolve();
 
 	constructor(job: ResearchJob, store: AstraStore, options: SupervisorOptions) {
 		this.job = job;
@@ -120,6 +126,7 @@ export class ResearchSupervisor {
 	}
 
 	private async tickLeased(): Promise<TickResult> {
+		await this.checkPauseRequests();
 		const initialStageId = this.job.state.frame.activeStageId;
 		if (this.job.state.frame.status === "completed") return this.result(initialStageId, [], false);
 		const stage = this.job.state.stages[initialStageId];
@@ -129,6 +136,16 @@ export class ResearchSupervisor {
 		if (await this.gateOnBudget(initialStageId)) return this.result(initialStageId, dispatchedTaskIds, false);
 
 		for (const task of Object.values(this.job.state.tasks)) {
+			if (
+				task.stageId === initialStageId &&
+				task.role === "worker" &&
+				task.planId &&
+				["ready", "running"].includes(task.status) &&
+				planReviewStatus(this.job, task.planId) !== "passed"
+			) {
+				await this.job.setTaskStatus(task.id, "blocked");
+				continue;
+			}
 			if (task.stageId === initialStageId && task.role === "worker" && task.status === "running") {
 				await this.job.setTaskStatus(task.id, "failed");
 				this.recovered = true;
@@ -156,10 +173,46 @@ export class ResearchSupervisor {
 			const obligation = this.openStageObligation(initialStageId);
 			const requestedMode = obligation
 				? "repair"
-				: stage.lastRouteAction === "search" || this.shouldStartConfiguredSearch(initialStageId)
+				: this.job.unsynthesizedLocalEvidence(initialStageId).length === 0 &&
+						(stage.lastRouteAction === "search" || this.shouldStartConfiguredSearch(initialStageId))
 					? "search"
 					: "decompose";
 			let plan = this.reusablePlan(initialStageId, obligation?.id);
+			if (!plan && obligation) {
+				if (
+					this.job.state.frame.automation !== "full" &&
+					this.job.definitions[initialStageId].gate === "user" &&
+					!this.job.isRouteGateApproved(initialStageId)
+				) {
+					await this.job.requireUserGate({
+						kind: "stage",
+						stageId: initialStageId,
+						phase: "route",
+						reason: "Approve the repair strategy decision",
+					});
+					return this.result(initialStageId, dispatchedTaskIds, false);
+				}
+				if (await this.gateOnBudget(initialStageId, { turns: 1 }))
+					return this.result(initialStageId, dispatchedTaskIds, false);
+				await this.job.consumeTurns(1);
+				try {
+					const route = await this.callAdapter(() => this.mainAgent.decideRoute(this.job, obligation));
+					if (!["continue", "backtrack", "ask-user"].includes(route.routeAction ?? ""))
+						throw new NonRetryableResearchError(
+							"Open repair obligations require continue, backtrack, or ask-user",
+						);
+					await this.job.applyRouteDecision(route);
+					if (route.routeAction !== "continue" || this.shouldYield())
+						return this.result(
+							initialStageId,
+							dispatchedTaskIds,
+							this.job.state.frame.activeStageId !== initialStageId,
+						);
+				} catch (error) {
+					await this.handleAdapterError(error);
+					return this.result(initialStageId, dispatchedTaskIds, false);
+				}
+			}
 			if (!plan) {
 				if (await this.gateOnBudget(initialStageId, { turns: 1 })) {
 					return this.result(initialStageId, dispatchedTaskIds, false);
@@ -219,6 +272,12 @@ export class ResearchSupervisor {
 		return this.job.state.paused || Boolean(backoff && Date.parse(backoff.retryAt) > Date.now());
 	}
 
+	private checkPauseRequests(): Promise<void> {
+		const check = this.pauseCheck.then(() => applyPendingPauses(this.job));
+		this.pauseCheck = check.catch(() => undefined);
+		return check;
+	}
+
 	private shouldPlan(stageId: string): boolean {
 		if (this.activeSearch(stageId)) return false;
 		if (
@@ -230,6 +289,7 @@ export class ResearchSupervisor {
 		}
 		if (this.pendingEvidence(stageId).length > 0) return false;
 		if (this.openStageObligation(stageId)) return true;
+		if (this.job.unsynthesizedLocalEvidence(stageId).length > 0) return true;
 		const stage = this.job.state.stages[stageId];
 		const routeArtifactId = this.job.state.canonicalRoute.stageArtifactIds[stageId];
 		if (!routeArtifactId) return !this.terminalSearchFailure(stageId);
@@ -241,14 +301,20 @@ export class ResearchSupervisor {
 	private shouldStartConfiguredSearch(stageId: string): boolean {
 		if (!this.job.definitions[stageId].searchPolicy) return false;
 		const latest = Object.values(this.job.state.searchBatches)
-			.filter((batch) => batch.stageId === stageId && batch.status !== "superseded")
+			.filter(
+				(batch) =>
+					batch.stageId === stageId &&
+					batch.status !== "superseded" &&
+					planReviewStatus(this.job, batch.planId) !== "stale",
+			)
 			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
 		return !latest || (latest.status === "exhausted" && latest.round < latest.maxRounds);
 	}
 
 	private pendingEvidence(stageId: string): Evidence[] {
 		return Object.values(this.job.state.evidence).filter((evidence) => {
-			if (evidence.stageId !== stageId || evidence.status === "rejected") return false;
+			if (evidence.type === "stage-plan" || evidence.stageId !== stageId || evidence.status === "rejected")
+				return false;
 			const task = this.job.state.tasks[evidence.taskId];
 			const reviews = Object.values(this.job.state.reviews).filter((review) => review.evidenceId === evidence.id);
 			if (reviews.length === 0) return true;
@@ -265,6 +331,7 @@ export class ResearchSupervisor {
 				if (reviews.some((review) => review.verdict !== "pass")) return false;
 				return true;
 			}
+			if (task?.deliveryKind === "local") return false;
 			return (
 				evidence.status === "accepted" &&
 				!Object.values(this.job.state.canonical).some((artifact) => artifact.evidenceId === evidence.id)
@@ -284,7 +351,12 @@ export class ResearchSupervisor {
 
 	private activeSearch(stageId: string): SearchBatch | undefined {
 		return Object.values(this.job.state.searchBatches)
-			.filter((batch) => batch.stageId === stageId && ["planning", "running", "evaluating"].includes(batch.status))
+			.filter(
+				(batch) =>
+					batch.stageId === stageId &&
+					["planning", "running", "evaluating"].includes(batch.status) &&
+					planReviewStatus(this.job, batch.planId) !== "stale",
+			)
 			.sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
 	}
 
@@ -302,6 +374,29 @@ export class ResearchSupervisor {
 	}
 
 	private async dispatchAndRun(plan: StagePlanManifest, dispatchedTaskIds: string[]): Promise<void> {
+		if (this.shouldYield()) return;
+		if (planReviewStatus(this.job, plan.id) !== "passed") {
+			if (["failed", "stale"].includes(planReviewStatus(this.job, plan.id))) return;
+			if (await this.gateOnBudget(plan.stageId, { tasks: planEvidence(this.job, plan.id) ? 0 : 2, turns: 1 }))
+				return;
+			let reviewerTaskId: string | undefined;
+			let reviewCommitted = false;
+			try {
+				const evidence = await preparePlanEvidence(this.job, plan);
+				await this.job.consumeTurns(1);
+				const result = await this.callAdapter(() => this.reviewer.review(evidence, this.job));
+				reviewerTaskId = result.reviewerTaskId;
+				await this.job.recordReview({ ...result, evidenceId: evidence.id, blocking: false });
+				reviewCommitted = true;
+				if (result.reviewerTaskId) await this.job.setTaskStatus(result.reviewerTaskId, "succeeded");
+			} catch (error) {
+				if (reviewerTaskId && !reviewCommitted) await this.job.failUncommittedReviewerTask(reviewerTaskId);
+				await this.handleAdapterError(error);
+				return;
+			}
+			if (planReviewStatus(this.job, plan.id) !== "passed") return;
+		}
+		if (this.shouldYield()) return;
 		const plannedTasks = await this.dispatchPlan(plan);
 		for (const task of plannedTasks) {
 			if (["ready", "running"].includes(task.status)) dispatchedTaskIds.push(task.id);
@@ -318,7 +413,7 @@ export class ResearchSupervisor {
 
 	private async reviewPendingEvidence(stageId: string): Promise<void> {
 		for (const evidence of Object.values(this.job.state.evidence)) {
-			if (evidence.stageId !== stageId || evidence.status === "rejected") continue;
+			if (evidence.type === "stage-plan" || evidence.stageId !== stageId || evidence.status === "rejected") continue;
 			const reviews = Object.values(this.job.state.reviews).filter((review) => review.evidenceId === evidence.id);
 			if (reviews.some((review) => review.verdict !== "pass")) continue;
 			const qualityPolicy = this.job.definitions[stageId]?.qualityPolicy;
@@ -330,7 +425,7 @@ export class ResearchSupervisor {
 			) {
 				continue;
 			}
-			if (await this.gateOnBudget(stageId, { tasks: 1, turns: 1 })) return;
+			if (await this.gateOnBudget(stageId, { turns: 1 })) return;
 			await this.job.consumeTurns(1);
 			let reviewerTaskId: string | undefined;
 			let reviewCommitted = false;
@@ -340,6 +435,7 @@ export class ResearchSupervisor {
 				const sourceTask = this.job.state.tasks[evidence.taskId];
 				const review = await this.job.recordReview({
 					evidenceId: evidence.id,
+					targetVersionHash: verdict.targetVersionHash,
 					reviewerTaskId: verdict.reviewerTaskId,
 					verdict: verdict.verdict,
 					findings: verdict.findings,
@@ -404,7 +500,7 @@ export class ResearchSupervisor {
 
 	private async promoteReviewedEvidence(stageId: string): Promise<void> {
 		for (const evidence of Object.values(this.job.state.evidence)) {
-			if (evidence.stageId !== stageId || evidence.status === "rejected") continue;
+			if (evidence.type === "stage-plan" || evidence.stageId !== stageId || evidence.status === "rejected") continue;
 			const sourceTask = this.job.state.tasks[evidence.taskId];
 			if (sourceTask?.searchBatchId) {
 				const batch = this.job.state.searchBatches[sourceTask.searchBatchId];
@@ -433,6 +529,7 @@ export class ResearchSupervisor {
 				}
 			}
 			if (this.job.state.evidence[evidence.id]?.status !== "accepted") continue;
+			if (sourceTask?.deliveryKind === "local") continue;
 			if (Object.values(this.job.state.canonical).some((artifact) => artifact.evidenceId === evidence.id)) continue;
 			if (await this.gateOnBudget(stageId, { turns: 1 })) return;
 			await this.job.consumeTurns(1);
@@ -447,6 +544,7 @@ export class ResearchSupervisor {
 	}
 
 	private canRoute(stageId: string): boolean {
+		if (this.job.unsynthesizedLocalEvidence(stageId).length > 0) return false;
 		if (this.openStageObligation(stageId) || this.activeSearch(stageId) || this.pendingEvidence(stageId).length > 0) {
 			return false;
 		}
@@ -462,7 +560,12 @@ export class ResearchSupervisor {
 	}
 
 	private async handleAdapterError(error: unknown): Promise<void> {
+		if (error instanceof ResearchPausedError) return;
 		this.recovered = true;
+		if (error instanceof ResearchTaskBudgetError) {
+			await this.gateOnBudget(this.job.state.frame.activeStageId, { tasks: 1 });
+			return;
+		}
 		if (error instanceof ProviderCapacityError) {
 			const current = this.job.state.providerBackoff;
 			if (current && Date.parse(current.retryAt) > Date.now()) return;
@@ -484,11 +587,19 @@ export class ResearchSupervisor {
 
 	private async callAdapter<T>(run: () => Promise<T>): Promise<T> {
 		try {
+			await this.checkPauseRequests();
+			if (this.job.state.paused) throw new ResearchPausedError("research paused before model call");
 			const result = await run();
 			await this.job.clearProviderBackoff();
+			await this.checkPauseRequests();
 			return result;
 		} catch (error) {
-			if (error instanceof ProviderCapacityError) await this.job.refundTurns(1);
+			if (
+				error instanceof ProviderCapacityError ||
+				error instanceof ResearchTaskBudgetError ||
+				error instanceof ResearchPausedError
+			)
+				await this.job.refundTurns(1);
 			throw error;
 		}
 	}
@@ -518,7 +629,12 @@ export class ResearchSupervisor {
 
 	private reusablePlan(stageId: string, obligationId?: string): StagePlanManifest | undefined {
 		return Object.values(this.job.state.stagePlans)
-			.filter((plan) => plan.stageId === stageId && plan.obligationId === obligationId)
+			.filter(
+				(plan) =>
+					plan.stageId === stageId &&
+					plan.obligationId === obligationId &&
+					!["failed", "stale"].includes(planReviewStatus(this.job, plan.id)),
+			)
 			.sort((left, right) => right.createdAt.localeCompare(left.createdAt))
 			.find((plan) =>
 				plan.tasks.some((planned) => {
@@ -534,6 +650,22 @@ export class ResearchSupervisor {
 
 	private async dispatchPlan(plan: StagePlanManifest): Promise<TaskPacket[]> {
 		const definition = this.job.definitions[plan.stageId];
+		const obligation = plan.obligationId ? this.job.state.obligations[plan.obligationId] : undefined;
+		const failedReview = obligation ? this.job.state.reviews[obligation.sourceReviewId] : undefined;
+		const failedEvidence = failedReview ? this.job.state.evidence[failedReview.evidenceId] : undefined;
+		const repairChecks = Object.values(this.job.state.obligations)
+			.filter(
+				(issue) =>
+					issue.status === "open" &&
+					failedEvidence &&
+					this.job.state.evidence[this.job.state.reviews[issue.sourceReviewId]?.evidenceId]
+						?.currentEvidenceSetId === failedEvidence.currentEvidenceSetId,
+			)
+			.flatMap((issue) =>
+				(issue.items ?? [])
+					.filter((item) => item.status === "open")
+					.map((item) => ({ issueId: item.id, criterion: `[${item.id}] ${item.criterion}` })),
+			);
 		const backtrackChecks = this.job.state.graph.unresolvedObjectionIds.flatMap((id) => {
 			const objection = this.job.state.graph.nodes[id];
 			return objection.stageId === plan.stageId &&
@@ -568,34 +700,61 @@ export class ResearchSupervisor {
 				const inputArtifactRefs = [
 					...new Set([
 						...planned.inputArtifactRefs,
+						...(failedEvidence ? [failedEvidence.id] : []),
+						...(failedEvidence
+							? this.job.state.tasks[failedEvidence.taskId].inputArtifactRefs.map((ref) =>
+									this.job.resolveRepairInput(ref),
+								)
+							: []),
 						...(plan.stageId === "research-review"
 							? Object.values(this.job.state.canonicalRoute.stageArtifactIds)
 							: []),
 					]),
 				];
 				return this.job.dispatchTask({
+					planId: plan.id,
+					repairChecks,
 					id: taskId,
 					attempt,
 					replayKey,
 					stageId: plan.stageId,
 					stageExecutionId: this.job.state.stages[plan.stageId].executionId ?? `stage_exec_${plan.stageId}`,
 					role: "worker",
+					deliveryKind: planned.deliveryKind ?? "stage",
+					repairOfEvidenceId: failedEvidence?.id,
 					objective: planned.objective,
 					inputArtifactRefs,
 					requiredCanonicalArtifacts: inputArtifactRefs.filter(
 						(ref) => this.job.state.canonical[ref]?.status === "active",
 					),
-					requiredOutputType: definition.outputArtifactType,
-					requiredOutputFields: planned.requiredOutputFields,
+					requiredOutputType:
+						planned.deliveryKind === "local"
+							? `${definition.outputArtifactType}:local`
+							: definition.outputArtifactType,
+					requiredOutputFields: [
+						...new Set([
+							...planned.requiredOutputFields,
+							...(failedEvidence ? this.job.state.tasks[failedEvidence.taskId].requiredOutputFields : []),
+						]),
+					],
 					acceptanceChecks: [
 						...new Set([
-							...definition.acceptanceChecks,
+							...(planned.deliveryKind === "local" ? [] : definition.acceptanceChecks),
 							...planned.acceptanceChecks,
+							...(failedEvidence ? this.job.state.tasks[failedEvidence.taskId].acceptanceChecks : []),
+							...(failedReview?.findings ?? []),
+							...repairChecks.map((check) => check.criterion),
 							...backtrackChecks,
 							...(batch?.criteria ?? []),
 						]),
 					],
-					failureSignals: [...new Set([...definition.failureSignals, ...planned.failureSignals])],
+					failureSignals: [
+						...new Set([
+							...(planned.deliveryKind === "local" ? [] : definition.failureSignals),
+							...planned.failureSignals,
+							...(failedEvidence ? this.job.state.tasks[failedEvidence.taskId].failureSignals : []),
+						]),
+					],
 					dependencies: [],
 					scope: { workspaceRoot: this.job.state.frame.permissions.workspaceRoot, allowedPaths: ["."] },
 					allowedTools: definition.workerTools,
@@ -609,7 +768,12 @@ export class ResearchSupervisor {
 								: { maxTurns: 8, maxToolCalls: 16, maxRuntimeMs: 300_000 },
 					reviewGateRequired: true,
 					resumePolicy: "resume-session",
-					successCriteria: planned.successCriteria,
+					successCriteria: [
+						...new Set([
+							...planned.successCriteria,
+							...(failedEvidence ? this.job.state.tasks[failedEvidence.taskId].successCriteria : []),
+						]),
+					],
 					...(batch && searchCandidate ? { searchBatchId: batch.id, searchCandidateId: searchCandidate.id } : {}),
 					...(prior?.status === "failed" ? { supersedesTaskId: prior.id } : {}),
 				});
@@ -629,19 +793,23 @@ export class ResearchSupervisor {
 			const obligation = stagePlan?.obligationId ? this.job.state.obligations[stagePlan.obligationId] : undefined;
 			const failedReview = obligation ? this.job.state.reviews[obligation.sourceReviewId] : undefined;
 			const failedEvidence = failedReview ? this.job.state.evidence[failedReview.evidenceId] : undefined;
-			const priorEvidence = task.inputArtifactRefs
-				.map((ref) => this.job.state.evidence[ref])
-				.find((evidence) => evidence !== undefined);
 			await this.job.recordEvidence({
 				taskId: task.id,
 				stageId: task.stageId,
 				type: output.artifactType,
 				content: output.content,
 				refs: output.refs,
-				currentEvidenceSetId: failedEvidence?.currentEvidenceSetId ?? priorEvidence?.currentEvidenceSetId,
+				currentEvidenceSetId: failedEvidence?.currentEvidenceSetId,
 			});
 		} catch (error) {
-			await this.job.setTaskStatus(task.id, error instanceof ProviderCapacityError ? "ready" : "failed");
+			if (this.job.state.tasks[task.id].status === "succeeded")
+				throw new NonRetryableResearchError(
+					`evidence registration failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			await this.job.setTaskStatus(
+				task.id,
+				error instanceof ProviderCapacityError || error instanceof ResearchPausedError ? "ready" : "failed",
+			);
 			throw error;
 		}
 	}
