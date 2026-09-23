@@ -1,121 +1,59 @@
 # Astra
 
-[项目主页](https://runder-sun.github.io/Astra/) · [当前修复状态与剩余差距](docs/superpowers/reviews/2026-09-15-joint-review-fix-status.md)
+面向个人研究者的开源自动研究框架，提供本机工作台。从一个有明确边界的问题开始，组织文献、实验和独立审阅，保留代码、数据、审阅意见与结论依据。
 
-**实验版 `v0.1.0-alpha.1`。** 面向个人本机使用，真实研究尚未通过最终全流程验收。
-推荐先下载安装包，从[工作台快速开始](packages/astra/README.md#实验版-010-alpha1)进行小预算测试。
-使用限制、验证范围与依赖审计见 [发布说明](RELEASE_NOTES.md)。
+[项目主页](https://runder-sun.github.io/Astra/) · [快速开始](docs/getting-started.md) · [研究示例](docs/examples/README.md) · [下载实验版](https://github.com/Runder-sun/Astra/releases/tag/v0.1.0-alpha.1) · [English](README.en.md)
 
-Astra 是生长在 Pi `0.84.1` 完整 monorepo 上的自动/半自动研究 agent。Pi 统一
-负责 provider、agent loop、session、CLI、TUI、print、JSON、RPC、skills 和
-extensions；Astra 只负责研究领域 contract、durable state 和 outer supervisor。
+**当前下载版：`v0.1.0-alpha.1`（实验版）。** 适合愿意检查原始证据的个人用户。真实研究尚未通过最终全流程验收；不保证任务收敛或论文达到发表要求。`main` 是开发源码，能力和验证范围见[版本与支持](docs/support.md)。
 
-## 产品入口
+![Astra 发布版工作台的新建研究页面](docs/assets/workbench-alpha1.png)
 
-```bash
-npm install --ignore-scripts
-npm run build:offline
+*截图来自实际 alpha.1 安装包，仅展示填写研究目标，不代表已完成研究。*
 
-npm run astra --
-npm run astra -- research run --automation autonomous "研究目标"
-npm run astra -- research run --automation full --require-paper "研究目标并产出论文"
-npm run astra -- research status
-npm run astra -- research tick
-npm run astra -- research pause "等待人工决策"
-npm run astra -- research resume
-```
+## 可以怎样使用
 
-`packages/astra/src/launcher.ts` 是产品入口。默认 Pi 后端通过 Pi `main()` 和扩展调用研究控制服务。
-`--backend codex` 直接调用同一研究控制服务，通过官方 Codex App Server 管理登录、模型和工具；
-无需额外模型 API 密钥。主控保留会话，工作任务隔离，每次独立审阅新建会话。
-Astra 管理研究状态与验收，不复制后端的模型执行循环。
+- **限定研究问题**：说明目标、已有条件、预算和期望交付，先尝试小规模复现或比较实验。
+- **观察执行与审阅**：查看任务、阶段验收项、审阅意见和未关闭问题；需要时暂停并补充说明。
+- **检查成果依据**：下载已采纳材料，核验源码、原始数据与结论。流程完成和假设成立分别记录，负面结果同样保留。
+
+## 安装并启动
+
+先准备 Linux、Node.js 22.19 或更高版本、npm，以及已登录的官方 Codex CLI。其他系统尚未验证；模型账号和兼容版本说明见[环境要求](docs/getting-started.md#环境要求)。
+
+在新的目录运行以下命令，安装固定版本的公开附件：
 
 ```bash
-export ASTRA_CODEX_MODEL=gpt-5.6-luna
-node packages/astra/src/workbench.ts --root ./research --port 4319
+mkdir astra-test
+cd astra-test
+npm init -y
+npm install --ignore-scripts https://github.com/Runder-sun/Astra/releases/download/v0.1.0-alpha.1/earendil-works-pi-astra-0.1.0-alpha.1.tgz
+npx --no-install astra-workbench --root ./research --port 4319
 ```
 
-普通浏览器打开 `http://127.0.0.1:4319`。使用前安装并登录官方 Codex CLI。
+在本机浏览器打开 `http://127.0.0.1:4319`，点击“新建研究”。首次选择 **24 个任务**，先不勾选论文交付。任务预算不是实际费用或订阅额度上限。
 
-子会话通过 Pi 原生 `--skill` loader 加载 Astra 指令：关闭环境中的默认 skill
-发现，只显式绑定当前 stage 和 worker/reviewer/main-agent role 对应的 package
-skill，避免无关项目 skill 污染自动研究任务。
+建议输入：“固定随机种子，比较均值和中位数在小型污染正态样本上的误差。仅用 Python 标准库，保留源码、原始结果和失败记录，不声称方法创新。”
 
-`research run` 和 `research resume` 都会在 tick budget 内持续驱动 outer loop，直到
-完成或进入持久 user/budget gate；`research tick` 只执行一个 durable supervisor
-transaction，适合人工或调度器单步控制。三种模式的实际语义是：
+完整步骤、暂停与恢复、备份及常见问题见[使用指南](docs/getting-started.md)。下载包沿用内部 Pi 包名，通过本仓库附件分发，不是上游 Pi 官方产品。
 
-- `collaborative`：普通研究循环自动执行，只在科研偏好、边界、风险或外部事实会改变路线时主动询问用户，并在 `gate: user` 的能力关闭前等待确认；
-- `autonomous`（默认）：普通 stage 自动推进，`gate: user` 的 stage 关闭前等待确认；
-- `full`：软 gate 内全自动，任务、turn、cost、权限和破坏性操作等硬边界仍会暂停。
+## 使用边界
 
-研究过程状态和科学结论是两个不同维度。`completed` 只表示证据、审查和路线闭环已经
-完成；`scientificOutcome` 单独记录 `supported`、`partially-supported`、`refuted`、
-`inconclusive` 或 `insufficient-evidence`，`missionCoverage` 记录主问题证据是否充分。
-`result-to-claim` 和最终 `research-review` 必须各有两次独立通过，且二者对这两个字段一致。
+- 工作台仅供个人本机访问，不提供公网多人服务。
+- 研究可能执行模型生成的代码；请使用独立工作目录或隔离环境，按需授予权限。
+- 关闭浏览器不会停止研究；服务重启后不会自动接管运行任务。
+- 文献检索记录可能只有摘要或搜索片段，不能据此声称核验过全文。
+- 论文需要额外编译工具，且必须人工检查可编辑源码、复现材料和 PDF 页面。
 
-`--require-paper` 把 `paper-write` 和 `paper-compile` 加入显式交付物。缺少其中任一 canonical
-artifact 时，main agent 不能提交完成决策。
+## 文档与参与
 
-Pi 交互模式提供 `/research-board` 查看问题、假设、claim、异议、候选评分、预算和下一决策；
-`/research-guide <text>` 将用户意见写入同一研究图，`/research-route` 查看当前唯一 canonical route
-及 search 比较结果。
+| 你想做什么 | 入口 |
+| --- | --- |
+| 安装、第一次运行、暂停和继续 | [快速开始](docs/getting-started.md) |
+| 了解支持环境和已知限制 | [版本与支持](docs/support.md) |
+| 查看示例与已有案例的证据边界 | [研究示例](docs/examples/README.md) |
+| 修改源码或了解架构 | [开发指南](docs/development/README.md) |
+| 构建和验证下一次发布 | [发布流程](docs/development/releases.md) |
+| 报告问题或贡献修改 | [贡献指南](CONTRIBUTING.md) |
+| 报告安全问题 | [安全说明](SECURITY.md) |
 
-全局预算可以在创建时设置，也可以在预算 gate 后提高再恢复：
-
-```bash
-npm run astra -- research run --automation full --max-tasks 80 --max-turns 300 --max-cost-usd 20 "研究目标"
-npm run astra -- research resume --max-turns 400
-```
-
-不可恢复的 provider 认证、授权、凭据或模型配置错误会在第一次失败后持久暂停，不会继续消耗
-research turns；修复 provider 配置后再显式 `research resume`。
-
-研究事实存放在项目 `.astra/`：
-
-- `job.json`：原子快照；
-- `events.jsonl`：append-only 研究事件；
-- `tasks/`：TaskPacket、worker/reviewer manifest 和 trace；
-- `canonical/`：adoption/retirement artifact 与 checksum receipt；
-- `sessions/`：Pi child session JSONL。
-
-Pi transcript 是对话事实，`.astra` ledger 是研究事实；两者通过 session ref、
-task id、evidence id 和 job id 连接。
-
-## 验证
-
-源码仓库保留上游 Pi 构建结构及 MIT 声明；Astra 发布使用独立实验版附件。
-根目录的上游 `release:*`、`publish*` 脚本用于 Pi 全套包，不是 Astra 发布入口，请勿用于本实验版发布。
-
-```bash
-npm run check
-npm run build:offline
-
-ASTRA_FIXTURE_PROVIDER=1 ASTRA_MAX_TICKS=64 \
-  npm run astra -- research run --automation full "Pi-native auto research audit"
-
-node scripts/audit-astra-run.mjs \
-  /path/to/workspace \
-  job_id \
-  /path/to/pi-parent-sessions
-```
-
-fixture provider 仍经过真实 Pi `Agent`、tool loop、JSON child process 和 session
-持久化，但它只证明 runtime contract，不证明联网文献、实验或论文质量。
-
-## Legacy Rust 边界
-
-迁移前的完整 Cargo crate 已归档到 `legacy/rust/`。仓库根目录不再保留 Cargo
-manifest、Rust CLI/TUI 或旧研究 runtime 入口；默认 npm build、test、package 和
-release 都不会编译或分发该归档。
-
-归档只用于 `.pmcli` 迁移取证、旧行为 baseline 和 parity 检查，不能继续增加产品
-能力。需要手工验证旧实现时，必须显式指定
-`--manifest-path legacy/rust/Cargo.toml`；新研究状态始终由 `.astra` 持有。
-
-## 设计文档
-
-- `docs/superpowers/specs/2026-08-12-pi-native-astra-architecture.md`
-- `docs/superpowers/specs/2026-08-14-pi-rust-parity-boundary.md`
-- `docs/superpowers/specs/2026-08-19-scientific-outcome-contract.md`
-- `packages/astra/README.md`
+Astra 基于 Pi；当前运行所需的上游组件保留在仓库中。[来源与历史](docs/history/README.md)记录上游关系及旧 Rust 归档入口。遵循 [MIT 许可证](LICENSE)，保留上游版权声明。

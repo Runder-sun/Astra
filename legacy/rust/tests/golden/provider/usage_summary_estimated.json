@@ -1,8 +1,0 @@
-{
-  "scope": "project",
-  "input_tokens": 0,
-  "output_tokens": 0,
-  "tool_calls": 0,
-  "estimated_cost": "0.000000",
-  "accounting_quality": "estimated"
-}
