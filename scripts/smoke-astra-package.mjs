@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { cp, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,7 +11,13 @@ let child;
 try {
 	await cp(join(source, "dist"), join(root, "dist"), { recursive: true });
 	await cp(join(source, "web"), join(root, "web"), { recursive: true });
-	await writeFile(join(root, "package.json"), '{"type":"module"}\n');
+	const { dependencies } = JSON.parse(await readFile(join(source, "package.json"), "utf8"));
+	await writeFile(join(root, "package.json"), JSON.stringify({ type: "module", dependencies }));
+	// A real installation includes runtime dependencies; never resolve this checkout's workspaces.
+	execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund"], {
+		cwd: root,
+		stdio: "inherit",
+	});
 	// Replace only the model-facing runner; the compiled server must resolve it itself.
 	await writeFile(
 		join(root, "dist/workbench-runner.js"),

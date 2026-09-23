@@ -1,0 +1,26 @@
+name: 问题报告
+description: 报告安装、运行或研究流程中的可复现问题
+body:
+  - type: markdown
+    attributes:
+      value: 请勿上传凭证、私人研究数据或完整会话。敏感漏洞使用安全说明中的私密渠道。
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: Astra 版本或提交号、操作系统、Node.js、npm、后端 CLI 与模型。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 最短复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期与实际结果
+      description: 附上相关的脱敏错误；涉及研究结论时列出直接证据与未核验项。
+    validations:
+      required: true

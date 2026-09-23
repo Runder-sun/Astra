@@ -9,7 +9,7 @@
  * Steps:
  * 1. Check for uncommitted changes
  * 2. Verify every public workspace package is registered on npm
- * 3. Bump version via npm run version:xxx or set an explicit version
+ * 3. Bump version via npm run upstream:version:xxx or set an explicit version
  * 4. Update CHANGELOG.md files: [Unreleased] -> [version] - date
  * 5. Regenerate release artifacts
  * 6. Run checks and tests
@@ -144,7 +144,7 @@ function bumpOrSetVersion(target) {
 
 	if (BUMP_TYPES.has(target)) {
 		console.log(`Bumping version (${target})...`);
-		run(`npm run version:${target}`);
+		run(`npm run upstream:version:${target}`);
 	} else {
 		if (compareVersions(target, currentVersion) <= 0) {
 			console.error(`Error: explicit version ${target} must be greater than current version ${currentVersion}.`);
