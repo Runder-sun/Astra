@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, runAgentLoop, runAgentLoopContinue } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
@@ -80,6 +80,254 @@ function createUserMessage(text: string): UserMessage {
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
+
+describe("F04 public stream failure settlement", () => {
+	for (const continuing of [false, true]) {
+		it.each(
+			[
+				"transformContext",
+				"convertToLlm",
+				"getApiKey",
+				"getSteeringMessages",
+				"getFollowUpMessages",
+				"prepareNextTurn",
+				"shouldStopAfterTurn",
+				"streamFn",
+			].flatMap((hook) => [false, true].map((asynchronous) => [hook, asynchronous] as const)),
+		)(
+			`F04-01/02 ends iteration and result on %s failure (async=%s, continue=${continuing})`,
+			async (hook, asynchronous) => {
+				const original = new Error(`fixture ${hook} failure`);
+				const failSync = () => {
+					throw original;
+				};
+				const fail = asynchronous ? async () => failSync() : failSync;
+				const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+				if (hook !== "streamFn") Object.assign(config, { [hook]: fail });
+				let providerCalls = 0;
+				const provider = () => {
+					providerCalls++;
+					if (hook === "streamFn") {
+						if (asynchronous) return Promise.reject(original);
+						throw original;
+					}
+					const stream = new MockAssistantStream();
+					queueMicrotask(() =>
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessage([{ type: "text", text: "completed" }]),
+						}),
+					);
+					return stream;
+				};
+				const prompt = createUserMessage("offline");
+				const context: AgentContext = { systemPrompt: "", messages: continuing ? [prompt] : [], tools: [] };
+				const stream = continuing
+					? agentLoopContinue(context, config, undefined, provider)
+					: agentLoop([prompt], context, config, undefined, provider);
+				const events: AgentEvent[] = [];
+				const iteration = (async () => {
+					for await (const event of stream) events.push(event);
+					return true;
+				})();
+				let watchdog: ReturnType<typeof setTimeout> | undefined;
+				try {
+					const result = await Promise.race([
+						Promise.all([stream.result(), iteration]),
+						new Promise<undefined>((resolve) => {
+							watchdog = setTimeout(() => resolve(undefined), 250);
+						}),
+					]);
+					expect(result, "stream result and iterator must settle").toBeDefined();
+					const failure = result![0].at(-1);
+					expect(failure).toMatchObject({
+						role: "assistant",
+						errorMessage: original.message,
+						stopReason: "error",
+						usage: createUsage(),
+					});
+					expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+					if (hook === "transformContext") expect(providerCalls).toBe(0);
+				} finally {
+					clearTimeout(watchdog);
+				}
+			},
+		);
+	}
+
+	it.each([false, true])(
+		"F04-04 wakes all pending iterators when an aborted callback fails (continue=%s)",
+		async (continuing) => {
+			const controller = new AbortController();
+			let entered = () => {};
+			let release = () => {};
+			const started = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				transformContext: async () => {
+					entered();
+					await held;
+					throw new Error("aborted callback");
+				},
+			};
+			const prompt = createUserMessage("offline");
+			const context: AgentContext = { systemPrompt: "", messages: continuing ? [prompt] : [], tools: [] };
+			const provider = () => {
+				throw new Error("unexpected provider call");
+			};
+			const stream = continuing
+				? agentLoopContinue(context, config, controller.signal, provider)
+				: agentLoop([prompt], context, config, controller.signal, provider);
+			await started;
+			const consume = async () => {
+				const events: AgentEvent[] = [];
+				for await (const event of stream) events.push(event);
+				return events;
+			};
+			const first = consume();
+			const second = consume();
+			controller.abort();
+			release();
+			const [messages, eventsA, eventsB] = await Promise.all([stream.result(), first, second]);
+			expect(messages.at(-1)).toMatchObject({ stopReason: "aborted", errorMessage: "aborted callback" });
+			expect([...eventsA, ...eventsB].filter((event) => event.type === "agent_end")).toHaveLength(1);
+		},
+	);
+
+	it.each([false, true])(
+		"F04-05 direct Promise entrypoints still reject the same error (continue=%s)",
+		async (continuing) => {
+			const error = new Error("direct failure");
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				transformContext: async () => {
+					throw error;
+				},
+			};
+			const prompt = createUserMessage("offline");
+			const context: AgentContext = { systemPrompt: "", messages: continuing ? [prompt] : [], tools: [] };
+			const provider = () => {
+				throw new Error("unexpected provider call");
+			};
+			await expect(
+				continuing
+					? runAgentLoopContinue(context, config, () => {}, undefined, provider)
+					: runAgentLoop([prompt], context, config, () => {}, undefined, provider),
+			).rejects.toBe(error);
+		},
+	);
+
+	it.each([false, true])(
+		"F04-03 retains completed prompt, injected message and tool result before failure (continue=%s)",
+		async (continuing) => {
+			const prompt = createUserMessage("existing prompt");
+			const injected = createUserMessage("injected prompt");
+			const parameters = Type.Object({});
+			const tool: AgentTool<typeof parameters, object> = {
+				name: "offline",
+				label: "offline",
+				description: "offline",
+				parameters,
+				execute: async () => ({ content: [{ type: "text", text: "tool receipt" }], details: {} }),
+			};
+			const context: AgentContext = { systemPrompt: "", messages: continuing ? [prompt] : [], tools: [tool] };
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				getSteeringMessages: async () => [injected],
+				prepareNextTurn: async () => {
+					throw new Error("after tool turn");
+				},
+			};
+			const provider = () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() =>
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[{ type: "toolCall", id: "offline-1", name: "offline", arguments: {} }],
+							"toolUse",
+						),
+					}),
+				);
+				return stream;
+			};
+			const stream = continuing
+				? agentLoopContinue(context, config, undefined, provider)
+				: agentLoop([prompt], context, config, undefined, provider);
+			const events: AgentEvent[] = [];
+			for await (const event of stream) events.push(event);
+			const messages = await stream.result();
+			expect(messages.map((message) => message.role)).toEqual(
+				continuing
+					? ["user", "assistant", "toolResult", "assistant"]
+					: ["user", "user", "assistant", "toolResult", "assistant"],
+			);
+			expect(messages[continuing ? 0 : 1]).toBe(injected);
+			expect(messages.at(-1)).toMatchObject({ errorMessage: "after tool turn", stopReason: "error" });
+			expect(events.filter((event) => event.type === "message_end").map((event) => event.message)).toEqual(messages);
+			expect(events.at(-1)).toEqual({ type: "agent_end", messages });
+		},
+	);
+
+	it("F04-04 wakes both pending iterators on normal success", async () => {
+		let entered = () => {};
+		let release = () => {};
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			transformContext: async (messages) => {
+				entered();
+				await held;
+				return messages;
+			},
+		};
+		const stream = agentLoop(
+			[createUserMessage("offline")],
+			{ systemPrompt: "", messages: [], tools: [] },
+			config,
+			undefined,
+			() => {
+				const response = new MockAssistantStream();
+				queueMicrotask(() =>
+					response.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "normal" }]),
+					}),
+				);
+				return response;
+			},
+		);
+		await started;
+		const consume = async () => {
+			for await (const _event of stream) {
+			}
+			return true;
+		};
+		const first = consume();
+		const second = consume();
+		release();
+		const [messages, firstDone, secondDone] = await Promise.all([stream.result(), first, second]);
+		expect([firstDone, secondDone]).toEqual([true, true]);
+		expect(messages.at(-1)).toMatchObject({ stopReason: "stop", content: [{ type: "text", text: "normal" }] });
+	});
+});
 
 describe("default stream function compatibility", () => {
 	it("uses the configured default when a legacy caller omits streamFn", async () => {

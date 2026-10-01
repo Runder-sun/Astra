@@ -48,6 +48,7 @@ export interface CodexRunOptions<S extends TSchema> {
 	env?: Record<string, string>;
 	tools?: CodexTool[];
 	maxToolCalls: number;
+	/** Interrupts admission at the deadline; awaited host tools must settle before run returns. */
 	timeoutMs: number;
 	logPath: string;
 	onThread(threadId: string): Promise<void>;
@@ -92,6 +93,7 @@ class AppServerConnection {
 	private stderr = "";
 	private readonly exited: Promise<void>;
 	private failure?: Error;
+	private closing?: Promise<void>;
 	onMessage: (message: Record<string, unknown>) => void = () => {};
 	onFailure: (error: Error) => void = () => {};
 
@@ -150,7 +152,7 @@ class AppServerConnection {
 		this.failure ??= error;
 		for (const request of this.pending.values()) request.reject(error);
 		this.pending.clear();
-		this.onFailure(error);
+		if (!this.closed) this.onFailure(error);
 	}
 
 	send(message: unknown): void {
@@ -158,7 +160,7 @@ class AppServerConnection {
 	}
 
 	request(method: string, params: unknown): Promise<unknown> {
-		if (this.failure) return Promise.reject(this.failure);
+		if (this.failure || this.closed) return Promise.reject(this.failure ?? codexError("Codex connection closed"));
 		const id = ++this.sequence;
 		return new Promise((resolveRequest, reject) => {
 			const timer = setTimeout(() => {
@@ -207,17 +209,21 @@ class AppServerConnection {
 		return paths;
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (this.closing) return this.closing;
 		this.closed = true;
 		this.fail(codexError("Codex connection closed"));
-		this.child.stdin.end();
-		this.child.kill("SIGTERM");
-		const timer = setTimeout(() => this.child.kill("SIGKILL"), 2000);
-		try {
-			await this.exited;
-		} finally {
-			clearTimeout(timer);
-		}
+		this.closing = (async () => {
+			this.child.stdin.end();
+			this.child.kill("SIGTERM");
+			const timer = setTimeout(() => this.child.kill("SIGKILL"), 2000);
+			try {
+				await this.exited;
+			} finally {
+				clearTimeout(timer);
+			}
+		})();
+		return this.closing;
 	}
 }
 
@@ -265,6 +271,10 @@ export class CodexAppServerRunner {
 		let finalText = "";
 		let toolCalls = 0;
 		let failure: Error | undefined;
+		let result: CodexRunResult<Static<S>> | undefined;
+		let accepting = true;
+		let terminating = false;
+		const hostRequests = new Set<Promise<void>>();
 		let log = Promise.resolve();
 		let rejectTurn: (error: Error) => void = () => {};
 		let resolveTurn: () => void = () => {};
@@ -279,20 +289,33 @@ export class CodexAppServerRunner {
 		let completed = waitForCompletion();
 		// Attach immediately: protocol failure may arrive while thread/start is still awaited.
 		void completed.catch(() => {});
-		connection.onFailure = (error) => rejectTurn(error);
 		const interrupt = () => {
 			if (threadId && turnId) connection.send({ id: -1, method: "turn/interrupt", params: { threadId, turnId } });
 		};
-		const abort = () => {
-			interrupt();
-			rejectTurn(codexError("Codex research execution interrupted by operator"));
+		const terminate = (error: unknown) => {
+			failure ??= error instanceof Error ? error : new Error(String(error));
+			accepting = false;
+			if (!terminating) {
+				terminating = true;
+				interrupt();
+				void connection.close().catch((closeError: unknown) => {
+					failure ??= closeError instanceof Error ? closeError : new Error(String(closeError));
+				});
+			}
+			rejectTurn(failure);
 		};
+		connection.onFailure = terminate;
+		const abort = () => terminate(codexError("Codex research execution interrupted by operator"));
 		process.once("SIGINT", abort);
 		process.once("SIGTERM", abort);
-		const timer = setTimeout(() => {
-			interrupt();
-			rejectTurn(new CodexRuntimeBudgetError(options.timeoutMs));
-		}, options.timeoutMs);
+		const timer = setTimeout(() => terminate(new CodexRuntimeBudgetError(options.timeoutMs)), options.timeoutMs);
+		const checkFailure = () => {
+			if (failure) throw failure;
+		};
+		const drainHostWork = async () => {
+			while (hostRequests.size > 0) await Promise.allSettled([...hostRequests]);
+			await log;
+		};
 		try {
 			await mkdir(dirname(options.logPath), { recursive: true });
 			connection.onMessage = (message) => {
@@ -306,7 +329,7 @@ export class CodexAppServerRunner {
 					method === "error"
 				) {
 					log = log.then(() => appendFile(options.logPath, `${JSON.stringify(message)}\n`, { mode: 0o600 }));
-					void log.catch(rejectTurn);
+					void log.catch(terminate);
 				}
 				if (method === "turn/started") turnId = String(record(params.turn).id ?? "");
 				if (method === "item/started") {
@@ -322,49 +345,60 @@ export class CodexAppServerRunner {
 						].includes(String(kind)) &&
 						++toolCalls > options.maxToolCalls
 					) {
-						interrupt();
-						rejectTurn(new CodexToolBudgetError(options.maxToolCalls));
+						terminate(new CodexToolBudgetError(options.maxToolCalls));
 					}
 				}
 				if (method === "item/completed") {
 					const item = record(params.item);
-					if (item.type === "webSearch" && options.webSearch && options.onWebSearch) {
+					if (accepting && item.type === "webSearch" && options.webSearch && options.onWebSearch) {
 						const observe = options.onWebSearch;
-						log = log.then(() => observe(item));
-						void log.catch(rejectTurn);
+						log = log.then(async () => {
+							if (terminating) throw failure;
+							await observe(item);
+						});
+						void log.catch(terminate);
 					}
 					if (item.type === "agentMessage" && (item.phase === "final_answer" || item.phase == null))
 						finalText = String(item.text ?? "");
 				}
 				if (method === "turn/completed") {
 					const turn = record(params.turn);
-					if (turn.status === "completed") resolveTurn();
-					else {
+					if (turn.status === "completed") {
+						accepting = false;
+						resolveTurn();
+					} else {
 						const error = record(turn.error);
-						rejectTurn(
+						terminate(
 							codexError(String(error.message ?? `Codex turn ${String(turn.status)}`), error.codexErrorInfo),
 						);
 					}
 				}
 				if (method === "error" && params.willRetry === false) {
 					const error = record(params.error);
-					rejectTurn(codexError(String(error.message ?? "Codex turn failed"), error.codexErrorInfo));
+					terminate(codexError(String(error.message ?? "Codex turn failed"), error.codexErrorInfo));
 				}
 				if (message.id !== undefined) {
+					if (!accepting) {
+						connection.send({
+							id: message.id,
+							error: { code: -32600, message: "Astra turn is no longer accepting host requests" },
+						});
+						return;
+					}
 					if (method !== "item/tool/call") {
 						connection.send({
 							id: message.id,
 							error: { code: -32601, message: "Astra requires operator intervention for this request" },
 						});
-						interrupt();
-						rejectTurn(codexError(`Codex requires operator intervention: ${method}`));
+						terminate(codexError(`Codex requires operator intervention: ${method}`));
 						return;
 					}
 					const tool = options.tools?.find((candidate) => candidate.name === params.tool);
-					void (async () => {
+					const request = (async () => {
 						try {
 							// A native search completion must be receipted before a subsequent host tool lists sources.
 							await log;
+							checkFailure();
 							if (!tool) throw new Error("Unknown Astra tool");
 							if (!Value.Check(tool.inputSchema, params.arguments))
 								throw new Error(
@@ -393,22 +427,34 @@ export class CodexAppServerRunner {
 							});
 						}
 					})();
+					hostRequests.add(request);
+					void request.then(
+						() => hostRequests.delete(request),
+						(error: unknown) => {
+							hostRequests.delete(request);
+							terminate(error);
+						},
+					);
 				}
 			};
+			checkFailure();
 			await connection.initialize();
-			if (failure) throw failure;
+			checkFailure();
 			const effective = record(
 				record(await connection.request("config/read", { cwd: options.cwd, includeLayers: false })).config,
 			);
+			checkFailure();
 			if (effective.openai_base_url)
 				throw codexError("Remove the Codex openai_base_url override to use subscription routing");
 			const skillList = record(await connection.request("skills/list", { cwds: [options.cwd] }));
+			checkFailure();
 			const skillEntries = Array.isArray(skillList.data) ? skillList.data : [];
 			const skills = skillEntries.flatMap((entry) => {
 				const found = record(entry).skills;
 				return Array.isArray(found) ? found : [];
 			});
 			for (const path of await connection.runtimeExecutables()) filesystem[path] = "read";
+			checkFailure();
 			const config = {
 				"permissions.astra.filesystem": filesystem,
 				mcp_servers: Object.fromEntries(
@@ -442,6 +488,7 @@ export class CodexAppServerRunner {
 							}),
 				}),
 			);
+			checkFailure();
 			threadId = String(record(started.thread).id ?? "");
 			if (
 				!threadId ||
@@ -459,11 +506,13 @@ export class CodexAppServerRunner {
 					{ mode: 0o600 },
 				),
 			);
+			void log.catch(terminate);
+			checkFailure();
 			await options.onThread(threadId);
-			if (failure) throw failure;
+			checkFailure();
 			let prompt = options.prompt;
 			for (let attempt = 0; ; attempt++) {
-				if (failure) throw failure;
+				checkFailure();
 				const turn = record(
 					await connection.request("turn/start", {
 						threadId,
@@ -473,7 +522,9 @@ export class CodexAppServerRunner {
 				);
 				turnId = String(record(turn.turn).id ?? turnId);
 				await completed;
-				await log;
+				accepting = false;
+				await drainHostWork();
+				checkFailure();
 				try {
 					let output: unknown;
 					try {
@@ -484,12 +535,13 @@ export class CodexAppServerRunner {
 					if (!Value.Check(options.schema, output))
 						throw codexError("Codex final output does not match the requested research schema");
 					options.validateOutput?.(output as Static<S>);
-					return {
+					result = {
 						output: output as Static<S>,
 						model: String(started.model),
 						threadId,
 						sessionFile: options.logPath,
 					};
+					break;
 				} catch (error) {
 					const reason = error instanceof Error ? error.message : String(error);
 					const retry = Boolean(options.validateOutput) && attempt === 0;
@@ -498,19 +550,36 @@ export class CodexAppServerRunner {
 						`${JSON.stringify({ method: "astra/output_rejected", params: { threadId, turnId, attempt: attempt + 1, retry, reason } })}\n`,
 						{ mode: 0o600 },
 					);
+					checkFailure();
 					if (!retry) throw error;
+					accepting = true;
 					prompt = `Astra final submission rejected: ${reason}. Correct only the final submission in this same session. Keep the scientific judgment and all original requirements; do not repeat research. If using a validated receipt, copy the tool's finalOutput exactly. The original tool and runtime budgets still apply. This is the only automatic correction attempt.`;
 					finalText = "";
 					completed = waitForCompletion();
 					void completed.catch(() => {});
 				}
 			}
+		} catch (error) {
+			terminate(error);
 		} finally {
-			clearTimeout(timer);
-			process.off("SIGINT", abort);
-			process.off("SIGTERM", abort);
-			await connection.close();
-			await log;
+			accepting = false;
+			terminating = true;
+			try {
+				// Closing ends protocol admission before taking the final log-queue snapshot.
+				for (const operation of [() => connection.close(), drainHostWork]) {
+					try {
+						await operation();
+					} catch (error) {
+						failure ??= error instanceof Error ? error : new Error(String(error));
+					}
+				}
+			} finally {
+				clearTimeout(timer);
+				process.off("SIGINT", abort);
+				process.off("SIGTERM", abort);
+			}
 		}
+		if (failure) throw failure;
+		return result!;
 	}
 }

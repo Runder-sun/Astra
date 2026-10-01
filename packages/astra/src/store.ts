@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
 	appendFile,
+	type FileHandle,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -10,7 +11,6 @@ import {
 	rename,
 	rm,
 	rmdir,
-	stat,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
@@ -21,6 +21,7 @@ export class ResearchJobLockedError extends Error {}
 
 export interface AstraStore {
 	loadSnapshot(jobId: string): Promise<JobSnapshot | undefined>;
+	/** Cross-process writers must hold withWriteLock; append does not acquire it again. */
 	append(jobId: string, event: AstraEvent): Promise<StoredEvent>;
 	writeSnapshot(snapshot: JobSnapshot): Promise<void>;
 	readEvents(jobId: string): Promise<StoredEvent[]>;
@@ -41,9 +42,14 @@ function isJobLockRecord(value: unknown): value is JobLockRecord {
 	const record = value as Record<string, unknown>;
 	return (
 		typeof record.owner === "string" &&
+		record.owner.length > 0 &&
 		typeof record.pid === "number" &&
+		Number.isInteger(record.pid) &&
+		record.pid > 0 &&
 		typeof record.token === "string" &&
-		typeof record.createdAt === "string"
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(record.token) &&
+		typeof record.createdAt === "string" &&
+		Number.isFinite(Date.parse(record.createdAt))
 	);
 }
 
@@ -76,30 +82,50 @@ export class JsonlAstraStore implements AstraStore {
 		return join(this.jobDir(jobId), "events.jsonl");
 	}
 
-	private lockPath(jobId: string): string {
-		return join(this.jobDir(jobId), "supervisor.lock");
-	}
-
-	private async readJobLock(path: string): Promise<JobLockRecord | undefined> {
-		try {
-			const value: unknown = JSON.parse(await readFile(path, "utf8"));
-			return isJobLockRecord(value) ? value : undefined;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
-			throw error;
-		}
-	}
-
 	async withJobLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T> {
-		return this.withFileLock(jobId, this.lockPath(jobId), owner, operation);
+		const legacy = join(this.jobDir(jobId), "supervisor.lock");
+		return this.withDirectoryLock(jobId, `${legacy}.d`, "supervisor", owner, async () => {
+			try {
+				if (!(await lstat(legacy)).isFile())
+					throw new ResearchJobLockedError("research supervisor legacy lock is not a file");
+				const holder: unknown = JSON.parse(await readFile(legacy, "utf8"));
+				if (!isJobLockRecord(holder))
+					throw new ResearchJobLockedError("research supervisor legacy owner is invalid");
+				if (processIsAlive(holder.pid))
+					throw new ResearchJobLockedError(`research supervisor lock held by ${holder.owner} (pid ${holder.pid})`);
+			} catch (error) {
+				if (error instanceof SyntaxError)
+					throw new ResearchJobLockedError("research supervisor legacy owner is invalid");
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			return operation();
+		});
 	}
 
 	async withWriteLock<T>(jobId: string, operation: () => Promise<T>): Promise<T> {
+		return this.withDirectoryLock(
+			jobId,
+			join(this.jobDir(jobId), "journal.lock"),
+			"journal",
+			"journal writer",
+			async () => {
+				await this.repairEventTail(jobId);
+				return operation();
+			},
+		);
+	}
+
+	private async withDirectoryLock<T>(
+		jobId: string,
+		path: string,
+		kind: "journal" | "supervisor",
+		owner: string,
+		operation: () => Promise<T>,
+	): Promise<T> {
 		await mkdir(this.jobDir(jobId), { recursive: true });
-		const path = join(this.jobDir(jobId), "journal.lock");
 		const temp = await mkdtemp(`${path}.tmp-`);
 		const lock: JobLockRecord = {
-			owner: "journal writer",
+			owner,
 			pid: process.pid,
 			token: randomUUID(),
 			createdAt: new Date().toISOString(),
@@ -123,10 +149,10 @@ export class JsonlAstraStore implements AstraStore {
 						if (!target.isDirectory()) throw error;
 					}
 					try {
-						const holder = await this.readJournalLock(path);
+						const holder = await this.readJournalLock(path, kind);
 						if (holder && processIsAlive(holder.pid))
 							throw new ResearchJobLockedError(
-								`research journal lock held by ${holder.owner} (pid ${holder.pid})`,
+								`research ${kind} lock held by ${holder.owner} (pid ${holder.pid})`,
 							);
 						await this.removeJournalOwner(path, holder?.token);
 					} catch (inspectionError) {
@@ -134,7 +160,7 @@ export class JsonlAstraStore implements AstraStore {
 					}
 				}
 			}
-			if (!acquired) throw new ResearchJobLockedError("research journal lock changed during recovery");
+			if (!acquired) throw new ResearchJobLockedError(`research ${kind} lock changed during recovery`);
 			try {
 				return await operation();
 			} finally {
@@ -145,34 +171,30 @@ export class JsonlAstraStore implements AstraStore {
 		}
 	}
 
-	private async readJournalLock(path: string): Promise<JobLockRecord | undefined> {
+	private async readJournalLock(
+		path: string,
+		kind: "journal" | "supervisor" = "journal",
+	): Promise<JobLockRecord | undefined> {
 		if (!(await lstat(path)).isDirectory())
-			throw new ResearchJobLockedError("research journal lock is not a directory");
+			throw new ResearchJobLockedError(`research ${kind} lock is not a directory`);
 		const names = await readdir(path);
 		if (names.length === 0) return undefined;
 		if (
 			names.length !== 1 ||
 			!/^owner-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/.test(names[0])
 		)
-			throw new ResearchJobLockedError("research journal lock has an unknown owner");
+			throw new ResearchJobLockedError(`research ${kind} lock has an unknown owner`);
 		const ownerPath = join(path, names[0]);
-		if (!(await lstat(ownerPath)).isFile()) throw new ResearchJobLockedError("research journal owner is not a file");
+		if (!(await lstat(ownerPath)).isFile()) throw new ResearchJobLockedError(`research ${kind} owner is not a file`);
 		let value: unknown;
 		try {
 			value = JSON.parse(await readFile(ownerPath, "utf8"));
 		} catch (error) {
-			if (error instanceof SyntaxError) throw new ResearchJobLockedError("research journal owner is invalid");
+			if (error instanceof SyntaxError) throw new ResearchJobLockedError(`research ${kind} owner is invalid`);
 			throw error;
 		}
-		if (
-			!isJobLockRecord(value) ||
-			names[0] !== `owner-${value.token}.json` ||
-			!value.owner ||
-			!Number.isInteger(value.pid) ||
-			value.pid <= 0 ||
-			!Number.isFinite(Date.parse(value.createdAt))
-		)
-			throw new ResearchJobLockedError("research journal owner is invalid");
+		if (!isJobLockRecord(value) || names[0] !== `owner-${value.token}.json`)
+			throw new ResearchJobLockedError(`research ${kind} owner is invalid`);
 		return value;
 	}
 
@@ -188,46 +210,6 @@ export class JsonlAstraStore implements AstraStore {
 			await rmdir(path);
 		} catch (error) {
 			if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
-		}
-	}
-
-	private async withFileLock<T>(jobId: string, path: string, owner: string, operation: () => Promise<T>): Promise<T> {
-		await mkdir(this.jobDir(jobId), { recursive: true });
-		const lock: JobLockRecord = {
-			owner,
-			pid: process.pid,
-			token: randomUUID(),
-			createdAt: new Date().toISOString(),
-		};
-		for (;;) {
-			try {
-				const handle = await open(path, "wx", 0o600);
-				try {
-					await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
-				} finally {
-					await handle.close();
-				}
-				break;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				const holder = await this.readJobLock(path);
-				if (holder && processIsAlive(holder.pid)) {
-					throw new ResearchJobLockedError(`research supervisor lock held by ${holder.owner} (pid ${holder.pid})`);
-				}
-				if (!holder) {
-					const lockStat = await stat(path).catch(() => undefined);
-					if (lockStat && Date.now() - lockStat.mtimeMs < 30_000) {
-						throw new ResearchJobLockedError("research supervisor lock held by an initializing process");
-					}
-				}
-				await rm(path, { force: true });
-			}
-		}
-		try {
-			return await operation();
-		} finally {
-			const holder = await this.readJobLock(path);
-			if (holder?.token === lock.token) await rm(path, { force: true });
 		}
 	}
 
@@ -251,7 +233,10 @@ export class JsonlAstraStore implements AstraStore {
 		await previous;
 		try {
 			await mkdir(this.jobDir(jobId), { recursive: true });
-			const current = await this.readEvents(jobId);
+			const content = await this.readEventContent(jobId);
+			const { events: current } = this.parseEvents(jobId, content);
+			if (content && !content.endsWith("\n"))
+				throw new Error("research journal tail requires withWriteLock before append");
 			const stored: StoredEvent = { seq: current.length + 1, timestamp: new Date().toISOString(), jobId, event };
 			await appendFile(this.eventsPath(jobId), `${JSON.stringify(stored)}\n`, "utf8");
 			return stored;
@@ -269,17 +254,157 @@ export class JsonlAstraStore implements AstraStore {
 		await rename(temp, target);
 	}
 
-	async readEvents(jobId: string): Promise<StoredEvent[]> {
+	private async readEventContent(jobId: string): Promise<string> {
 		try {
-			const content = await readFile(this.eventsPath(jobId), "utf8");
-			return content
-				.split("\n")
-				.filter(Boolean)
-				.map((line) => JSON.parse(line) as StoredEvent);
+			return await readFile(this.eventsPath(jobId), "utf8");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
 			throw error;
 		}
+	}
+
+	// Recognizes only a valid JSON prefix interrupted at EOF. It never repairs or
+	// produces a value; complete records still use JSON.parse on every runtime.
+	private isIncompleteJson(text: string): boolean {
+		let position = 0;
+		const incomplete = Symbol("EOF");
+		const invalid = Symbol("invalid JSON");
+		const whitespace = () => {
+			while (/[ \t\r\n]/.test(text[position] ?? "x")) position++;
+		};
+		const next = () => {
+			if (position === text.length) throw incomplete;
+			return text[position++];
+		};
+		const string = () => {
+			if (next() !== '"') throw invalid;
+			for (;;) {
+				const char = next();
+				if (char === '"') return;
+				if (char.charCodeAt(0) < 0x20) throw invalid;
+				if (char !== "\\") continue;
+				const escaped = next();
+				if ('"\\/bfnrt'.includes(escaped)) continue;
+				if (escaped !== "u") throw invalid;
+				for (let index = 0; index < 4; index++) if (!/[0-9a-fA-F]/.test(next())) throw invalid;
+			}
+		};
+		const digits = () => {
+			if (position === text.length) throw incomplete;
+			if (!/[0-9]/.test(text[position])) throw invalid;
+			while (/[0-9]/.test(text[position] ?? "x")) position++;
+		};
+		const value = (): void => {
+			whitespace();
+			if (position === text.length) throw incomplete;
+			const char = text[position];
+			if (char === '"') {
+				string();
+				return;
+			}
+			if (char === "{" || char === "[") {
+				position++;
+				const end = char === "{" ? "}" : "]";
+				whitespace();
+				if (text[position] === end) {
+					position++;
+					return;
+				}
+				for (;;) {
+					if (char === "{") {
+						whitespace();
+						string();
+						whitespace();
+						if (next() !== ":") throw invalid;
+					}
+					value();
+					whitespace();
+					const separator = next();
+					if (separator === end) return;
+					if (separator !== ",") throw invalid;
+				}
+			}
+			for (const literal of ["true", "false", "null"]) {
+				if (char !== literal[0]) continue;
+				for (const expected of literal) if (next() !== expected) throw invalid;
+				return;
+			}
+			if (char === "-") position++;
+			if (text[position] === "0") position++;
+			else digits();
+			if (text[position] === ".") {
+				position++;
+				digits();
+			}
+			if (text[position] === "e" || text[position] === "E") {
+				position++;
+				if (text[position] === "+" || text[position] === "-") position++;
+				digits();
+			}
+		};
+		try {
+			value();
+			whitespace();
+			return false;
+		} catch (error) {
+			if (error === incomplete) return true;
+			if (error === invalid) return false;
+			throw error;
+		}
+	}
+
+	private parseEvents(
+		jobId: string,
+		content: string,
+	): { events: StoredEvent[]; completeBytes: number; incomplete: boolean } {
+		const events: StoredEvent[] = [];
+		const lines = content.split("\n");
+		for (let index = 0; index < lines.length; index++) {
+			const line = lines[index];
+			if (!line) continue;
+			let stored: StoredEvent;
+			try {
+				stored = JSON.parse(line) as StoredEvent;
+			} catch (error) {
+				if (error instanceof SyntaxError && index === lines.length - 1 && this.isIncompleteJson(line))
+					return {
+						events,
+						completeBytes: Buffer.byteLength(content.slice(0, content.lastIndexOf("\n") + 1)),
+						incomplete: true,
+					};
+				throw error;
+			}
+			if (!stored || stored.seq !== events.length + 1 || stored.jobId !== jobId)
+				throw new Error(`research journal event sequence or job id mismatch for ${jobId}`);
+			events.push(stored);
+		}
+		return { events, completeBytes: Buffer.byteLength(content), incomplete: false };
+	}
+
+	private async repairEventTail(jobId: string): Promise<void> {
+		let handle: FileHandle;
+		try {
+			handle = await open(this.eventsPath(jobId), "r+");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		try {
+			const { size } = await handle.stat();
+			if (size === 0) return;
+			const last = Buffer.alloc(1);
+			await handle.read(last, 0, 1, size - 1);
+			if (last[0] === 10) return;
+			const parsed = this.parseEvents(jobId, await handle.readFile("utf8"));
+			if (parsed.incomplete) await handle.truncate(parsed.completeBytes);
+			else await handle.write("\n", size, "utf8");
+		} finally {
+			await handle.close();
+		}
+	}
+
+	async readEvents(jobId: string): Promise<StoredEvent[]> {
+		return this.parseEvents(jobId, await this.readEventContent(jobId)).events;
 	}
 
 	async readEventSeq(jobId: string): Promise<number> {

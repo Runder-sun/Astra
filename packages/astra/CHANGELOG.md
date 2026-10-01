@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Supervisor ownership now uses `supervisor.lock.d` with the existing journal directory-lock protocol. Stop old versions before upgrading; concurrent old and new versions writing the same job are unsupported. Legacy `supervisor.lock` files are checked without deleting or renaming them; unknown owners fail explicitly.
 - Unified public installation instructions around the fixed alpha.1 download; moved technical reference material into developer documentation.
 - Moved historical Rust sources out of the current tree; the published alpha.1 tag remains the archive reference. Current migration reporting stays available.
 - Pinned direct Pi dependencies to 0.84.1 for future packages.
@@ -11,6 +12,8 @@
 
 ### Fixed
 
+- JSONL journals preserve complete events without a trailing newline and tolerate only a syntactically valid incomplete EOF fragment on reads. The existing journal write lock repairs that tail before committing; direct append refuses a tail requiring repair. Complete corruption and sequence or job-ID mismatches remain errors.
+- Codex app-server runs stop accepting host work on termination and await started tools, source callbacks, session callbacks and logs before returning, including before final-output validation. Runtime budgets trigger interruption but are not hard return deadlines: a custom tool that never settles keeps the run pending. Tools must include their host work in their returned promise; this does not roll back completed effects or cover detached background work.
 - Interrupted review and canonical adoption retain their complete governance consequences and resume deterministically. Retirement and candidate cleanup preserve archives and registered sessions before deleting sources; concurrent budget, lease and task operations validate the current state under the existing journal queue.
 - Codex runtime exhaustion now follows budgeted recovery, including main-agent replanning. Planning and plan reviews expose inherited dispatch requirements before approval, and the main agent starts from a focused current-work index instead of the full historical index.
 - Codex tool-call exhaustion uses bounded task recovery instead of pausing the whole research job as an infrastructure failure. Worker retries retain read-only execution logs and source ledgers; replanning can inspect recorded failures, and global budgets remain enforced.

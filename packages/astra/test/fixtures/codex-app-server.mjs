@@ -8,6 +8,27 @@ let output;
 let turnId;
 let validatedReviewOutput;
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
+const lateCloseKeepAlive = process.env.ASTRA_FAKE_CODEX_LATE_CLOSE ? setInterval(() => {}, 1000) : undefined;
+if (process.env.ASTRA_FAKE_CODEX_PID) writeFileSync(process.env.ASTRA_FAKE_CODEX_PID, String(process.pid));
+process.on("SIGTERM", () => {
+	clearInterval(lateCloseKeepAlive);
+	if (process.env.ASTRA_FAKE_CODEX_LATE_CLOSE) {
+		process.stdout.write(`${JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId, lateClose: true } })}\n`, () => {
+			if (process.env.ASTRA_FAKE_CODEX_CLOSED) writeFileSync(process.env.ASTRA_FAKE_CODEX_CLOSED, "closed");
+			process.exit(0);
+		});
+	} else {
+		if (process.env.ASTRA_FAKE_CODEX_CLOSED) writeFileSync(process.env.ASTRA_FAKE_CODEX_CLOSED, "closed");
+		process.exit(0);
+	}
+});
+process.on("SIGUSR1", () => {
+	if (mode === "parallel-disconnect") {
+		if (process.env.ASTRA_FAKE_CODEX_CLOSED) writeFileSync(process.env.ASTRA_FAKE_CODEX_CLOSED, "closed");
+		process.exit(17);
+	} else if (mode === "parallel-budget") send({ method: "item/started", params: { threadId, item: { id: "over-budget", type: "dynamicToolCall" } } });
+	else send({ method: "error", params: { threadId, willRetry: false, error: { message: "controlled connection failure" } } });
+});
 function complete() {
 	if (output?.criteria && output?.verdict && output.astraValidatedReview === undefined) output.astraValidatedReview = null;
 	const payload = mode === "invalid-output" ? "not JSON" : JSON.stringify(output);
@@ -18,6 +39,7 @@ function complete() {
 createInterface({ input: process.stdin }).on("line", line => {
 	const message = JSON.parse(line);
 	if (process.env.ASTRA_FAKE_CODEX_LOG) appendFileSync(process.env.ASTRA_FAKE_CODEX_LOG, `${line}\n`);
+	if (process.env.ASTRA_FAKE_CODEX_STALL && process.env.ASTRA_FAKE_CODEX_STALL === message.method) return;
 	if (message.id === "validate-review") {
 		if (message.result?.success || !message.result?.contentItems[0].text.includes("failed frozen criterion")) throw new Error("Expected contradictory-verdict feedback");
 		output.verdict = "pass";
@@ -175,6 +197,19 @@ createInterface({ input: process.stdin }).on("line", line => {
 			return;
 		}
 		if (mode === "timeout") return;
+		if (mode?.startsWith("parallel-") || mode === "early-tool-complete" || mode === "web-before-tool") {
+			if (mode === "web-before-tool") {
+				const item = { id: "web-controlled", type: "webSearch", query: "offline" };
+				send({ method: "item/started", params: { threadId, item } });
+				send({ method: "item/completed", params: { threadId, item } });
+			}
+			for (let i = 0; i < (mode?.startsWith("parallel-") ? 2 : 1); i++) {
+				send({ method: "item/started", params: { threadId, item: { id: `held-${i}`, type: "dynamicToolCall" } } });
+				send({ id: `held-${i}`, method: "item/tool/call", params: { threadId, tool: "audit_tool", arguments: { query: String(i) } } });
+			}
+			if (mode === "early-tool-complete" || mode === "web-before-tool") complete();
+			return;
+		}
 		if (["retry-error", "fatal-error"].includes(mode)) {
 			const params = { threadId, turnId, willRetry: mode === "retry-error", error: { message: "fixture stream failure", codexErrorInfo: "streamDisconnected" } };
 			send({ method: "error", params: { ...params, threadId: "other-thread" } });

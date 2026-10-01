@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Command cancellation escalates to SIGKILL after five seconds when the process remains alive, clears termination timers on exit, and preserves output collection from descendants after the parent exits.
 - Fixed print and JSON modes exiting successfully when an extension startup handler reports an error.
 - Fixed inherited GitHub Copilot login triggering API rate limits while enabling model policies by limiting concurrent policy updates ([#6187](https://github.com/earendil-works/pi/issues/6187)).
 - Fixed fullscreen transcript search snapping back to the current match during manual scrolling and fragmented mouse input leaking into the search query.

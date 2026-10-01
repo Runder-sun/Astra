@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Public agent-loop streams end with a visible error assistant on callback failures, retain completed messages from the run, and wake all waiting iterators. Direct Promise entrypoints still reject the original error.
 - Fixed `streamProxy()` dropping finalized tool-call metadata such as OpenAI Responses namespaces ([#7709](https://github.com/earendil-works/pi/issues/7709)).
 
 ## [0.84.1] - 2026-08-07

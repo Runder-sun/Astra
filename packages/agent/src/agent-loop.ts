@@ -35,22 +35,7 @@ export function agentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	const stream = createAgentStream();
-
-	void runAgentLoop(
-		prompts,
-		context,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
-
-	return stream;
+	return streamAgentRun((emit) => runAgentLoop(prompts, context, config, emit, signal, streamFn), config, signal);
 }
 
 /**
@@ -75,20 +60,51 @@ export function agentLoopContinue(
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
+	return streamAgentRun((emit) => runAgentLoopContinue(context, config, emit, signal, streamFn), config, signal);
+}
+
+function streamAgentRun(
+	run: (emit: AgentEventSink) => Promise<AgentMessage[]>,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
-
-	void runAgentLoopContinue(
-		context,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
-
+	const completedMessages: AgentMessage[] = [];
+	const emit: AgentEventSink = (event) => {
+		if (event.type === "message_end") completedMessages.push(event.message);
+		stream.push(event);
+	};
+	void (async () => {
+		let messages = completedMessages;
+		try {
+			messages = await run(emit);
+		} catch (error) {
+			const failure: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "" }],
+				api: config.model.api,
+				provider: config.model.provider,
+				model: config.model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: signal?.aborted ? "aborted" : "error",
+				errorMessage: error instanceof Error ? error.message : String(error),
+				timestamp: Date.now(),
+			};
+			emit({ type: "message_start", message: failure });
+			emit({ type: "message_end", message: failure });
+			emit({ type: "turn_end", message: failure, toolResults: [] });
+			emit({ type: "agent_end", messages });
+		} finally {
+			stream.end(messages);
+		}
+	})();
 	return stream;
 }
 
