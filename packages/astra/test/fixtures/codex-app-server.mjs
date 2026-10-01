@@ -6,8 +6,10 @@ const mode = process.env.ASTRA_FAKE_CODEX_MODE;
 let threadId;
 let output;
 let turnId;
+let validatedReviewOutput;
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
 function complete() {
+	if (output?.criteria && output?.verdict && output.astraValidatedReview === undefined) output.astraValidatedReview = null;
 	const payload = mode === "invalid-output" ? "not JSON" : JSON.stringify(output);
 	send({ method: "item/completed", params: { threadId: "other-thread", item: { type: "agentMessage", phase: "final_answer", text: "wrong output" } } });
 	send({ method: "item/completed", params: { threadId, item: { type: "agentMessage", phase: "final_answer", text: payload } } });
@@ -20,12 +22,32 @@ createInterface({ input: process.stdin }).on("line", line => {
 		if (message.result?.success || !message.result?.contentItems[0].text.includes("failed frozen criterion")) throw new Error("Expected contradictory-verdict feedback");
 		output.verdict = "pass";
 		output.score = 1;
+		if (process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT === "paraphrased-review-receipt") {
+			output.verdict = "partial";
+			output.score = 0.5;
+			output.criteria[0].passed = false;
+			output.criteria[0].score = 0.5;
+			output.findings = ["Original verified missing evidence finding"];
+		}
 		send({ method: "item/started", params: { threadId, item: { id: "validate-review-corrected", type: "dynamicToolCall" } } });
 		send({ id: "validate-review-corrected", method: "item/tool/call", params: { threadId, tool: "astra_validate_review", arguments: output } });
 		return;
 	}
 	if (message.id === "validate-review-corrected") {
 		if (!message.result?.success) throw new Error("Expected valid negative-assessment review");
+		if (process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT) {
+			const draft = structuredClone(output);
+			output = JSON.parse(message.result.contentItems[0].text).finalOutput;
+			validatedReviewOutput = structuredClone(output);
+			if (!output) throw new Error("Expected a validated review receipt");
+			if (["repeated-review-receipt", "changed-review-receipt"].includes(process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT)) {
+				output.criteria = draft.criteria;
+				output.verifiedRefs = [...draft.verifiedRefs, ...output.verifiedRefs];
+				if (process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT === "changed-review-receipt") output.criteria[0].rationale = "Altered after validation";
+			}
+			if (process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT === "unknown-review-receipt") output.astraValidatedReview = "unknown";
+			if (process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT === "paraphrased-review-receipt") output.findings = ["Reworded summary of the finding"];
+		}
 		complete();
 		return;
 	}
@@ -37,6 +59,13 @@ createInterface({ input: process.stdin }).on("line", line => {
 		} else {
 			if (!message.result?.success || !JSON.parse(message.result.contentItems[0].text).valid) throw new Error("Expected corrected submission to validate");
 			if (process.env.ASTRA_FAKE_CODEX_INVALID_FINAL === "1") output.contentJson = "{}";
+			if (process.env.ASTRA_FAKE_CODEX_RECEIPT) {
+				output = JSON.parse(message.result.contentItems[0].text).finalOutput;
+				if (!output) throw new Error("Expected a validated submission receipt");
+				if (process.env.ASTRA_FAKE_CODEX_RECEIPT === "unknown-receipt") output.contentJson = JSON.stringify({ astraValidatedSubmission: "unknown" });
+				if (process.env.ASTRA_FAKE_CODEX_RECEIPT === "translated-receipt") output.refs = output.refs.map(ref => ({ ...ref, summary: "沿用声明输入中已有的来源收据。" }));
+				if (process.env.ASTRA_FAKE_CODEX_RECEIPT === "changed-source-receipt") output.refs[0].ref = "openalex:W999";
+			}
 			complete();
 		}
 		return;
@@ -84,6 +113,13 @@ createInterface({ input: process.stdin }).on("line", line => {
 	}
 	if (message.method === "turn/start") {
 		turnId = `turn-${Date.now()}`;
+		if (validatedReviewOutput && message.params.input[0].text.startsWith("Astra final submission rejected:")) {
+			send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
+			send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+			if (process.env.ASTRA_FAKE_CODEX_REVIEW_RECEIPT === "paraphrased-review-receipt") output = structuredClone(validatedReviewOutput);
+			complete();
+			return;
+		}
 		output = JSON.parse(process.env.ASTRA_FAKE_CODEX_OUTPUT ?? '{"answer":"ok"}');
 		if (mode === "environment") output = { answer: ["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"].some(key => process.env[key]) ? "leaked" : "ok" };
 		if (["research", "literature-interrupt", "literature-resume", "submission-preflight", "review-preflight", "review-contradiction"].includes(mode)) {
@@ -91,7 +127,7 @@ createInterface({ input: process.stdin }).on("line", line => {
 			if (fields.tasks) {
 				const context = JSON.parse(readFileSync("research-context.json", "utf8"));
 				const stage = context.capabilities[context.state.frame.activeStageId];
-				output = { tasks: [{ key: "candidate", deliveryKind: "stage", objective: "Bound the research question", inputArtifactRefs: [], requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, hypothesis: "A bounded test is possible" }], rationale: "Evaluate a bounded question first" };
+				output = { tasks: [{ key: "candidate", deliveryKind: "stage", objective: "Bound the research question", inputArtifactRefs: [], requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, responsibilityBindings: [], responsibilityTransfers: [], hypothesis: "A bounded test is possible" }], rationale: "Evaluate a bounded question first" };
 			} else if (fields.contentJson) {
 				const context = JSON.parse(readFileSync("ASTRA_TASK_CONTEXT.json", "utf8"));
 				output = { artifactType: context.task.requiredOutputType, contentJson: JSON.stringify(Object.fromEntries(context.task.requiredOutputFields.map(field => [field, `fixture ${field}`]))), refs: [] };
@@ -100,7 +136,8 @@ createInterface({ input: process.stdin }).on("line", line => {
 				const packet = JSON.parse(readFileSync("review-packet.json", "utf8"));
 				const refs = [`evidence:${packet.evidenceId}`, "review-packet.json", "review-target-snapshot.json"];
 				if (process.env.ASTRA_FAKE_CODEX_FOREIGN_REVIEW_REF === "1") refs.push("../other-review/private.json");
-				output = { verdict: "pass", score: 1, findings: ["Fixture contract is complete"], verifiedRefs: refs, criteria: [...new Set([...packet.workerContract.acceptanceChecks, ...packet.workerContract.successCriteria])].map(criterion => ({ criterion, passed: true, score: 1, evidenceRefs: refs, rationale: "Verified fixture" })) };
+				const reviewCriteria = JSON.parse(readFileSync("review-target-snapshot.json", "utf8")).reviewCriteria?.map(group => group.criterion) ?? [...new Set([...packet.workerContract.acceptanceChecks, ...packet.workerContract.successCriteria])];
+				output = { verdict: "pass", score: 1, findings: ["Fixture contract is complete"], verifiedRefs: refs, criteria: reviewCriteria.map(criterion => ({ criterion, passed: true, score: 1, evidenceRefs: refs, rationale: "Verified fixture" })) };
 				if (process.env.ASTRA_FAKE_CODEX_PARAPHRASE === "1") output.criteria[0].criterion = "paraphrased criterion";
 				if (mode === "review-preflight" || mode === "review-contradiction") {
 					output.verdict = "fail";
@@ -125,6 +162,11 @@ createInterface({ input: process.stdin }).on("line", line => {
 		if (mode === "review-preflight") {
 			send({ method: "item/started", params: { threadId, item: { id: "validate-review", type: "dynamicToolCall" } } });
 			send({ id: "validate-review", method: "item/tool/call", params: { threadId, tool: "astra_validate_review", arguments: output } });
+			return;
+		}
+		if (mode === "incremental-submission") {
+			send({ method: "item/started", params: { threadId, item: { id: "validate-corrected", type: "dynamicToolCall" } } });
+			send({ id: "validate-corrected", method: "item/tool/call", params: { threadId, tool: "astra_validate_submission", arguments: output } });
 			return;
 		}
 		if (mode === "submission-preflight" || mode === "literature-interrupt" || (mode === "full-research" && message.params.outputSchema.properties.contentJson && ["literature", "novelty", "paper-write", "research-review"].includes(output.artifactType))) {

@@ -36,14 +36,14 @@ export interface LiteratureRecord {
 	landingPageUrl?: string;
 	pdfUrl?: string;
 	citedByCount?: number;
-	retrievalLevel?: "web-search-result";
+	retrievalLevel?: "web-search-result" | "source-page";
 	snippet?: string;
 }
 
 export type LiteratureResponse = Pick<Response, "ok" | "status" | "headers" | "body" | "text">;
 export type Fetcher = (
 	input: string | URL,
-	init?: Pick<RequestInit, "signal" | "headers">,
+	init?: Pick<RequestInit, "signal" | "headers" | "redirect">,
 ) => Promise<LiteratureResponse>;
 
 const originalFetch = globalThis.fetch;
@@ -56,6 +56,7 @@ export const literatureFetch: Fetcher = (input, init) => {
 	// Keep fetch and its dispatcher on the same undici version; do not change global fetch.
 	return proxyFetch(input, {
 		signal: init?.signal,
+		redirect: init?.redirect,
 		headers: Object.fromEntries(new Headers(init?.headers).entries()),
 		dispatcher: proxyAgent,
 	});
@@ -212,6 +213,13 @@ async function responseJson(response: LiteratureResponse): Promise<OpenAlexRespo
 }
 
 export async function readLiteratureResponse(response: LiteratureResponse): Promise<string> {
+	return (await readLiteratureBytes(response)).toString("utf8");
+}
+
+export async function readLiteratureBytes(
+	response: LiteratureResponse,
+	maxBytes = MAX_RESPONSE_BYTES,
+): Promise<Buffer> {
 	if (!response.ok) {
 		await response.body?.cancel();
 		throw new Error(`HTTP ${response.status}`);
@@ -225,13 +233,13 @@ export async function readLiteratureResponse(response: LiteratureResponse): Prom
 			const { done, value } = await reader.read();
 			if (done) break;
 			size += value.byteLength;
-			if (size > MAX_RESPONSE_BYTES) throw new Error("Literature response exceeded 4 MiB");
+			if (size > maxBytes) throw new Error(`Literature response exceeded ${maxBytes / (1024 * 1024)} MiB`);
 			chunks.push(value);
 		}
 	} finally {
 		await reader.cancel();
 	}
-	return Buffer.concat(chunks).toString("utf8");
+	return Buffer.concat(chunks);
 }
 
 export async function searchOpenAlex(options: SearchOpenAlexOptions): Promise<LiteratureSearchResult> {

@@ -1,19 +1,23 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	ExtensionEvent,
-	ExtensionFactory,
-	ToolDefinition,
+import {
+	createGrepTool,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ExtensionEvent,
+	type ExtensionFactory,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { taskPacketPath, writeTaskPacket } from "../src/contracts.ts";
 import { createAstraExtension } from "../src/extension.ts";
+import { writeSourceReceipt } from "../src/literature.ts";
 import { ResearchJob } from "../src/research.ts";
 import { JsonlAstraStore } from "../src/store.ts";
+import { prepareTaskWorkspace, taskWorkspacePath } from "../src/task-workspace.ts";
 import type { TaskPacket } from "../src/types.ts";
+import { incrementalContentHash } from "../src/worker-submission.ts";
 
 const tempRoots: string[] = [];
 
@@ -106,6 +110,127 @@ async function setup(role: "worker" | "reviewer" = "worker"): Promise<{ fixture:
 }
 
 describe("Astra TaskPacket inner-loop controls", () => {
+	it("submits a literature increment through the extension and records the merged evidence", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-extension-incremental-"));
+		tempRoots.push(root);
+		const job = await ResearchJob.create(new JsonlAstraStore(root), {
+			objective: "Incremental literature",
+			workspaceRoot: root,
+			automation: "full",
+		});
+		const refs = ["https://example.org/a", "https://example.org/b", "https://example.org/c"];
+		for (const sourceRef of refs)
+			await writeSourceReceipt(
+				{ workspaceRoot: root, jobId: job.state.frame.jobId, query: "fixture", limit: 3 },
+				{ sourceRef, title: sourceRef, authors: [] },
+				"fixture",
+				new Date().toISOString(),
+			);
+		const sourceTask = await job.dispatchTask({
+			stageId: "literature",
+			stageExecutionId: "literature",
+			role: "worker",
+			objective: "create base",
+			inputArtifactRefs: [],
+			requiredCanonicalArtifacts: [],
+			requiredOutputType: "literature:local",
+			requiredOutputFields: ["queryStrategy", "sources"],
+			acceptanceChecks: ["record limitations"],
+			failureSignals: ["limitations remain undocumented"],
+			dependencies: [],
+			scope: { workspaceRoot: root, allowedPaths: ["."] },
+			allowedTools: ["read"],
+			writeAuthority: "none",
+			budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 10000 },
+			reviewGateRequired: true,
+			resumePolicy: "resume-session",
+			successCriteria: [],
+		});
+		await job.setTaskStatus(sourceTask.id, "succeeded");
+		const base = await job.recordEvidence({
+			taskId: sourceTask.id,
+			stageId: "literature",
+			type: "literature:local",
+			content: { queryStrategy: { limitations: "search-only" }, sources: refs.map((sourceRef) => ({ sourceRef })) },
+			refs,
+		});
+		const task = await job.dispatchTask({
+			stageId: "literature",
+			stageExecutionId: "literature",
+			role: "worker",
+			deliveryKind: "local",
+			objective: "repair limitation",
+			repairOfEvidenceId: base.id,
+			inputArtifactRefs: [base.id],
+			requiredOutputType: "literature:local",
+			requiredOutputFields: ["queryStrategy", "sources"],
+			acceptanceChecks: ["record limitations"],
+			repairChecks: [{ issueId: "issue_lit", criterion: "record limitations" }],
+			requiredCanonicalArtifacts: [],
+			failureSignals: ["limitations remain undocumented"],
+			dependencies: [],
+			scope: { workspaceRoot: root, allowedPaths: ["."] },
+			allowedTools: ["read"],
+			writeAuthority: "none",
+			budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 10000 },
+			reviewGateRequired: true,
+			resumePolicy: "resume-session",
+			successCriteria: [],
+		});
+		await writeTaskPacket(task);
+		vi.stubEnv("ASTRA_PROJECT_ROOT", root);
+		vi.stubEnv("ASTRA_JOB_ID", task.jobId);
+		vi.stubEnv("ASTRA_ROLE", "worker");
+		vi.stubEnv("ASTRA_TASK_PACKET", taskPacketPath(root, task.jobId, task.id));
+		vi.stubEnv("ASTRA_SESSION_ID", "incremental-session");
+		const fixture = createFixture(createAstraExtension({ jobId: task.jobId, role: "worker" }), root);
+		const submit = fixture.tools.get("astra_submit_worker_output");
+		if (!submit) throw new Error("worker submission tool was not registered");
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: [
+				{
+					op: "set" as const,
+					path: ["queryStrategy", "limitations"],
+					value: "capture unavailable",
+					issueId: "issue_lit",
+					sourceRefs: [],
+					reason: "Clarify the recorded limitation.",
+				},
+			],
+			affectedCriteria: task.acceptanceChecks,
+			rationale: "Retain the full base while correcting the limitation.",
+		};
+		const response = await submit.execute(
+			"incremental-output",
+			{ artifactType: task.requiredOutputType, content: {}, incrementalRevision: revision, refs: [] },
+			undefined,
+			undefined,
+			fixture.context,
+		);
+		expect(response.terminate).toBe(true);
+		const manifest = response.details as {
+			content: unknown;
+			incrementalRevision: { resultHash: string };
+			outputRefs: Array<{ ref: string }>;
+		};
+		expect(manifest.content).toMatchObject({
+			queryStrategy: { limitations: "capture unavailable" },
+			sources: refs.map((sourceRef) => ({ sourceRef })),
+		});
+		await job.setTaskStatus(task.id, "succeeded");
+		const evidence = await job.recordEvidence({
+			taskId: task.id,
+			stageId: task.stageId,
+			type: task.requiredOutputType,
+			content: manifest.content,
+			refs: manifest.outputRefs.map((ref) => ref.ref),
+			currentEvidenceSetId: base.currentEvidenceSetId,
+			incrementalRevision: { ...revision, resultHash: manifest.incrementalRevision.resultHash },
+		});
+		expect(evidence.incrementalRevision?.resultHash).toBe(manifest.incrementalRevision.resultHash);
+	});
 	it("lets the main agent page through full evidence by owned ID without accepting file paths", async () => {
 		const { task, fixture: workerFixture } = await setup();
 		const root = workerFixture.context.cwd;
@@ -398,6 +523,7 @@ describe("Astra TaskPacket inner-loop controls", () => {
 			acceptanceChecks: ["all obligation findings are resolved"],
 			failureSignals: ["a finding remains unresolved"],
 			successCriteria: ["the complete artifact passes review"],
+			responsibilityBindings: [],
 		};
 
 		const rejected = await submit.execute(
@@ -549,6 +675,99 @@ describe("Astra TaskPacket inner-loop controls", () => {
 		await expect(call("outside", "touch /tmp/astra-outside")).resolves.toMatchObject({
 			block: true,
 			reason: expect.stringContaining("outside declared resource roots"),
+		});
+	});
+
+	it("permits validated retry roots only for read, ls, find and grep", async () => {
+		const { task: seed, fixture: firstFixture } = await setup();
+		const root = firstFixture.context.cwd;
+		const store = new JsonlAstraStore(root);
+		const job = (await ResearchJob.open(store, seed.jobId))!;
+		const first = await job.dispatchTask({
+			...seed,
+			id: "source_read_permissions",
+			replayKey: "retry-permissions",
+			allowedTools: ["read", "ls", "find", "grep", "write", "edit", "bash"],
+			writeAuthority: "workspace-write",
+			budget: { ...seed.budget, maxToolCalls: 20 },
+		});
+		await prepareTaskWorkspace(first, job);
+		const previous = taskWorkspacePath(root, first.jobId, first.id);
+		await writeFile(join(previous, "partial.json"), '{"result":42}');
+		await symlink(root, join(previous, "escape"));
+		await job.setTaskStatus(first.id, "failed");
+		const retry = await job.dispatchTask({
+			...first,
+			id: "retry_read_permissions",
+			attempt: 2,
+			supersedesTaskId: first.id,
+			allowedTools: ["read", "ls", "find", "grep", "write", "edit", "bash"],
+			writeAuthority: "workspace-write",
+			budget: { ...first.budget, maxToolCalls: 20 },
+		});
+		const cwd = await prepareTaskWorkspace(retry, job);
+		vi.stubEnv("ASTRA_TASK_PACKET", taskPacketPath(root, retry.jobId, retry.id));
+		vi.stubEnv("ASTRA_RECOVERY_READ_ROOTS", JSON.stringify([previous]));
+		const fixture = createFixture(createAstraExtension({ jobId: retry.jobId, role: "worker" }), cwd);
+		const handler = fixture.handlers.get("tool_call")!;
+		const call = (toolName: string, path: string) =>
+			handler(
+				{ type: "tool_call", toolCallId: toolName, toolName, input: { path } } as ExtensionEvent,
+				fixture.context,
+			);
+		for (const name of ["read", "ls", "find", "grep"]) {
+			await expect(call(name, name === "read" ? join(previous, "partial.json") : previous)).resolves.toBeUndefined();
+		}
+		for (const name of ["write", "edit"])
+			await expect(call(name, join(previous, "partial.json"))).resolves.toMatchObject({ block: true });
+		await expect(call("read", join(previous, "escape", "AGENTS.md"))).resolves.toMatchObject({ block: true });
+		await expect(
+			handler(
+				{
+					type: "tool_call",
+					toolCallId: "old-bash",
+					toolName: "bash",
+					input: { command: `touch "${previous}/marker"` },
+				} as ExtensionEvent,
+				fixture.context,
+			),
+		).resolves.toMatchObject({ block: true });
+		const largeLog = join(previous, "large-log.jsonl");
+		const logPrefix = `${JSON.stringify({ detail: "x".repeat(90) })}\n`.repeat(200);
+		await writeFile(largeLog, `${logPrefix}{"failure":"RECOVERY_MARKER"}\n`);
+		await expect(call("read", largeLog)).resolves.toMatchObject({
+			block: true,
+			reason: expect.stringContaining("grep"),
+		});
+		await expect(call("read", largeLog)).resolves.toMatchObject({ reason: expect.not.stringContaining("bash") });
+		await expect(
+			handler(
+				{
+					type: "tool_call",
+					toolCallId: "old-log-bash",
+					toolName: "bash",
+					input: { command: `tail -n 1 "${largeLog}"` },
+				} as ExtensionEvent,
+				fixture.context,
+			),
+		).resolves.toMatchObject({ block: true });
+		await expect(call("grep", largeLog)).resolves.toBeUndefined();
+		const result = await createGrepTool(cwd).execute("recovery-log-grep", {
+			path: largeLog,
+			pattern: "RECOVERY_MARKER",
+			limit: 1,
+		});
+		expect(JSON.stringify(result)).toContain("RECOVERY_MARKER");
+		await expect(call("grep", join(previous, "escape", "AGENTS.md"))).resolves.toMatchObject({ block: true });
+		const largeCurrent = join(cwd, "large-current.log");
+		await writeFile(largeCurrent, "x".repeat(16 * 1024 + 1));
+		await expect(call("read", largeCurrent)).resolves.toMatchObject({
+			block: true,
+			reason: expect.stringContaining("bash"),
+		});
+		vi.stubEnv("ASTRA_RECOVERY_READ_ROOTS", JSON.stringify([root]));
+		await expect(call("read", join(root, ".astra", "jobs", retry.jobId, "job.json"))).resolves.toMatchObject({
+			block: true,
 		});
 	});
 

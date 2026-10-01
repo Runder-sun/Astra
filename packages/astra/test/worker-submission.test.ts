@@ -6,8 +6,14 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FIXTURE_PDF_SOURCE } from "../src/fixture-pdf.ts";
 import { sourceReceiptFilename, writeSourceReceipt } from "../src/literature.ts";
-import type { TaskPacket } from "../src/types.ts";
-import { validateWorkerSubmission } from "../src/worker-submission.ts";
+import { ResearchJob } from "../src/research.ts";
+import { MemoryAstraStore } from "../src/store.ts";
+import type { IncrementalRevision, TaskPacket } from "../src/types.ts";
+import {
+	applyIncrementalRevision,
+	incrementalContentHash,
+	validateWorkerSubmission,
+} from "../src/worker-submission.ts";
 
 const tempRoots: string[] = [];
 
@@ -50,6 +56,476 @@ function packet(root: string): TaskPacket {
 }
 
 describe("worker submission validation", () => {
+	it("merges a declared literature increment onto its exact same-stage repair base", () => {
+		const task = {
+			...packet("/workspace"),
+			stageId: "literature",
+			requiredOutputType: "literature:local",
+			repairOfEvidenceId: "evidence_base",
+			inputArtifactRefs: ["evidence_base"],
+			repairChecks: [{ issueId: "issue_base", criterion: "implementation is runnable" }],
+		};
+		const base = {
+			id: "evidence_base",
+			stageId: "literature",
+			currentEvidenceSetId: "series_1",
+			content: { queryStrategy: { limitations: "search only" }, sources: [] },
+		};
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: [
+				{
+					op: "set" as const,
+					path: ["queryStrategy", "limitations"],
+					value: "search only; page capture unavailable",
+					issueId: "issue_base",
+					sourceRefs: [],
+					reason: "Clarify the retrieval limitation.",
+				},
+			],
+			affectedCriteria: [task.acceptanceChecks[0]!],
+			rationale: "Record why the source page could not be captured.",
+		};
+		expect(applyIncrementalRevision(task, base, {}, revision)).toMatchObject({
+			content: { queryStrategy: { limitations: "search only; page capture unavailable" }, sources: [] },
+			metadata: { baseEvidenceId: base.id, affectedCriteria: revision.affectedCriteria },
+		});
+	});
+
+	it.each(["wrong base hash", "undeclared base", "prototype path", "overlapping operations"])(
+		"rejects an incremental revision with %s",
+		(name) => {
+			const task = {
+				...packet("/workspace"),
+				stageId: "literature",
+				requiredOutputType: "literature:local",
+				repairOfEvidenceId: "evidence_base",
+				inputArtifactRefs: ["evidence_base"],
+				repairChecks: [{ issueId: "issue_base", criterion: "implementation is runnable" }],
+			};
+			const base = {
+				id: "evidence_base",
+				stageId: "literature",
+				currentEvidenceSetId: "series_1",
+				content: { queryStrategy: { limitations: "search only" }, sources: [] },
+			};
+			const revision: Omit<IncrementalRevision, "resultHash"> = {
+				baseEvidenceId: base.id,
+				baseHash: incrementalContentHash(base.content),
+				operations: [
+					{
+						op: "set",
+						path: ["queryStrategy", "limitations"],
+						value: "changed",
+						issueId: "issue_base",
+						sourceRefs: [],
+						reason: "Clarify the retrieval limitation.",
+					},
+				],
+				affectedCriteria: [task.acceptanceChecks[0]!],
+				rationale: "Correct the limitation.",
+			};
+			if (name === "wrong base hash") revision.baseHash = "0".repeat(64);
+			if (name === "undeclared base") revision.baseEvidenceId = "evidence_other";
+			if (name === "prototype path") revision.operations[0]!.path = ["__proto__", "polluted"];
+			if (name === "overlapping operations")
+				revision.operations.push(
+					{
+						op: "set",
+						path: ["queryStrategy"],
+						value: {},
+						issueId: "issue_base",
+						sourceRefs: [],
+						reason: "preserve fields",
+					},
+					{
+						op: "set",
+						path: ["queryStrategy", "limitations"],
+						value: "changed",
+						issueId: "issue_base",
+						sourceRefs: [],
+						reason: "preserve fields",
+					},
+				);
+			expect(() => applyIncrementalRevision(task, base, {}, revision)).toThrow();
+		},
+	);
+
+	it("rejects implicit deletions from object or array replacement", () => {
+		const task = {
+			...packet("/workspace"),
+			stageId: "literature",
+			requiredOutputType: "literature:local",
+			repairOfEvidenceId: "evidence_base",
+			inputArtifactRefs: ["evidence_base"],
+			repairChecks: [{ issueId: "issue_base", criterion: "implementation is runnable" }],
+		};
+		const base = {
+			id: "evidence_base",
+			stageId: "literature",
+			currentEvidenceSetId: "series_1",
+			content: { queryStrategy: { limitations: "search only", queries: ["q1", "q2"] } },
+		};
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: [
+				{
+					op: "set" as const,
+					path: ["queryStrategy"],
+					value: { limitations: "changed", queries: ["q1"] },
+					issueId: "issue_base",
+					sourceRefs: [],
+					reason: "Do not drop either query.",
+				},
+			],
+			affectedCriteria: [task.acceptanceChecks[0]!],
+			rationale: "Do not drop the previous query.",
+		};
+		expect(() => applyIncrementalRevision(task, base, {}, revision)).toThrow(/delete|remove|preserve/i);
+	});
+
+	it("updates array entries only through an exact unique sourceRef selector", () => {
+		const task = {
+			...packet("/workspace"),
+			stageId: "literature",
+			requiredOutputType: "literature:local",
+			repairOfEvidenceId: "evidence_base",
+			inputArtifactRefs: ["evidence_base"],
+			repairChecks: [{ issueId: "issue_base", criterion: "implementation is runnable" }],
+		};
+		const sourceRef = "doi:10.1234/source";
+		const base = {
+			id: "evidence_base",
+			stageId: "literature",
+			refs: [sourceRef],
+			content: { sources: [{ sourceRef, limitations: "snippet only" }] },
+		};
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: [
+				{
+					op: "set" as const,
+					path: ["sources", `@sourceRef:${sourceRef}`, "limitations"],
+					value: "snippet only; full text unavailable",
+					issueId: "issue_base",
+					sourceRefs: [sourceRef],
+					reason: "Clarify evidence limits.",
+				},
+			],
+			affectedCriteria: [task.acceptanceChecks[0]!],
+			rationale: "Retain the existing source row while clarifying its evidence limit.",
+		};
+		expect(applyIncrementalRevision(task, base, {}, revision).content.sources).toEqual([
+			{ sourceRef, limitations: "snippet only; full text unavailable" },
+		]);
+		const duplicateBase = { ...base, content: { sources: [{ sourceRef }, { sourceRef }] } };
+		expect(() =>
+			applyIncrementalRevision(
+				task,
+				duplicateBase,
+				{},
+				{ ...revision, baseHash: incrementalContentHash(duplicateBase.content) },
+			),
+		).toThrow(/exactly one/);
+		const renamedRevision = {
+			...revision,
+			operations: [
+				{
+					...revision.operations[0]!,
+					path: ["sources", `@sourceRef:${sourceRef}`],
+					value: { sourceRef: "doi:10.1234/renamed", limitations: "changed" },
+				},
+			],
+		};
+		expect(() => applyIncrementalRevision(task, base, {}, renamedRevision)).toThrow(/delete or replace/);
+	});
+
+	it("appends multiple unique literature rows by explicit stable ID", () => {
+		const task = {
+			...packet("/workspace"),
+			stageId: "literature",
+			requiredOutputType: "literature:local",
+			repairOfEvidenceId: "evidence_base",
+			inputArtifactRefs: ["evidence_base"],
+			repairChecks: [{ issueId: "issue_base", criterion: "implementation is runnable" }],
+		};
+		const base = { id: "evidence_base", stageId: "literature", content: { sources: [] } };
+		const sourceRefs = ["doi:10.1234/a", "doi:10.1234/b"];
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: sourceRefs.map((sourceRef) => ({
+				op: "set" as const,
+				path: ["sources", `@append:${sourceRef}`],
+				value: { sourceRef, note: "verified source" },
+				issueId: "issue_base",
+				sourceRefs: [sourceRef],
+				reason: "Add the newly verified source row.",
+			})),
+			affectedCriteria: [task.acceptanceChecks[0]!],
+			rationale: "Append new literature rows while preserving the prior inventory.",
+		};
+		const refs = sourceRefs.map((ref) => ({ kind: "source", ref }));
+		expect(applyIncrementalRevision(task, base, {}, revision, refs).content.sources).toEqual(
+			sourceRefs.map((sourceRef) => ({ sourceRef, note: "verified source" })),
+		);
+		const duplicate = {
+			...revision,
+			operations: [
+				{
+					op: "set" as const,
+					path: ["sources"],
+					value: [{ sourceRef: sourceRefs[0] }, { sourceRef: sourceRefs[0] }],
+					issueId: "issue_base",
+					sourceRefs,
+					reason: "This malformed duplicate must be rejected.",
+				},
+			],
+		};
+		expect(() => applyIncrementalRevision(task, base, {}, duplicate, refs)).toThrow(/unique/);
+	});
+
+	it("validates an increment against the host base and retains receipted base sources", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-incremental-submission-"));
+		tempRoots.push(root);
+		const store = new MemoryAstraStore();
+		const job = await ResearchJob.create(store, {
+			workspaceRoot: root,
+			objective: "repair literature evidence",
+		});
+		const sourceRef = "https://example.org/source";
+		await writeSourceReceipt(
+			{ workspaceRoot: root, jobId: job.state.frame.jobId, query: "source", limit: 1 },
+			{ sourceRef, title: "Source", authors: [] },
+			"fixture",
+			new Date().toISOString(),
+		);
+		const sourceTask = await job.dispatchTask({
+			stageId: "literature",
+			stageExecutionId: "literature",
+			role: "worker",
+			objective: "create a repair base",
+			inputArtifactRefs: [],
+			requiredCanonicalArtifacts: [],
+			requiredOutputType: "literature:local",
+			requiredOutputFields: ["queryStrategy", "sources"],
+			acceptanceChecks: ["record limitations"],
+			failureSignals: [],
+			dependencies: [],
+			scope: { workspaceRoot: root, allowedPaths: ["."] },
+			allowedTools: ["read"],
+			writeAuthority: "none",
+			budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 10_000 },
+			reviewGateRequired: true,
+			resumePolicy: "resume-session",
+			successCriteria: [],
+		});
+		await job.setTaskStatus(sourceTask.id, "succeeded");
+		const base = await job.recordEvidence({
+			id: "evidence_base",
+			taskId: sourceTask.id,
+			stageId: "literature",
+			type: "literature:local",
+			content: {
+				queryStrategy: { limitations: "search-only", repairAppendix: { ledgerRows: [{ sourceRef }] } },
+				sources: [{ sourceRef }],
+			},
+			refs: [sourceRef],
+		});
+		const task = await job.dispatchTask({
+			stageId: "literature",
+			stageExecutionId: "literature",
+			role: "worker",
+			deliveryKind: "local",
+			objective: "repair literature limitations",
+			repairOfEvidenceId: base.id,
+			inputArtifactRefs: [base.id],
+			requiredOutputType: "literature:local",
+			requiredOutputFields: ["queryStrategy", "sources"],
+			acceptanceChecks: ["record limitations"],
+			repairChecks: [{ issueId: "issue_base", criterion: "record limitations" }],
+			requiredCanonicalArtifacts: [],
+			failureSignals: [],
+			dependencies: [],
+			scope: { workspaceRoot: root, allowedPaths: ["."] },
+			allowedTools: ["read"],
+			writeAuthority: "none",
+			budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 10_000 },
+			reviewGateRequired: true,
+			resumePolicy: "resume-session",
+			successCriteria: [],
+		});
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: [
+				{
+					op: "set" as const,
+					path: ["queryStrategy", "limitations"],
+					value: "search-only; capture unavailable",
+					issueId: "issue_base",
+					sourceRefs: [sourceRef],
+					reason: "Clarify the retrieval limitation.",
+				},
+			],
+			affectedCriteria: task.acceptanceChecks,
+			rationale: "The repair clarifies the capture limitation without rewriting the literature inventory.",
+		};
+		const addedSourceRef = "https://example.org/new-source";
+		const undeclaredSourceRevision = {
+			...revision,
+			operations: [
+				{
+					op: "set" as const,
+					path: ["sources", `@append:${addedSourceRef}`],
+					value: { sourceRef: addedSourceRef },
+					issueId: "issue_base",
+					sourceRefs: [],
+					reason: "Try to add an unreferenced source.",
+				},
+			],
+		};
+		await expect(
+			validateWorkerSubmission(
+				task,
+				{
+					artifactType: task.requiredOutputType,
+					content: {},
+					refs: [],
+					incrementalRevision: undeclaredSourceRevision,
+				},
+				{ executionRoot: root, sessionRef: "test:incremental", job },
+			),
+		).rejects.toThrow(/declared in operation sourceRefs/);
+		const addedSourceRevision = {
+			...undeclaredSourceRevision,
+			operations: [{ ...undeclaredSourceRevision.operations[0]!, sourceRefs: [addedSourceRef] }],
+		};
+		const addedSourceSubmission = {
+			artifactType: task.requiredOutputType,
+			content: {},
+			refs: [{ kind: "source", ref: addedSourceRef, summary: "new source" }],
+			incrementalRevision: addedSourceRevision,
+		};
+		await expect(
+			validateWorkerSubmission(task, addedSourceSubmission, {
+				executionRoot: root,
+				sessionRef: "test:incremental",
+				job,
+			}),
+		).rejects.toThrow(/receipt/);
+		await writeSourceReceipt(
+			{ workspaceRoot: root, jobId: job.state.frame.jobId, query: "new source", limit: 1 },
+			{ sourceRef: addedSourceRef, title: "New source", authors: [] },
+			"fixture",
+			new Date().toISOString(),
+		);
+		await expect(
+			validateWorkerSubmission(task, addedSourceSubmission, {
+				executionRoot: root,
+				sessionRef: "test:incremental",
+				job,
+			}),
+		).resolves.toMatchObject({ content: { sources: [{ sourceRef }, { sourceRef: addedSourceRef }] } });
+		const nestedSourceRef = "https://example.org/nested-source";
+		const nestedRevision = {
+			...revision,
+			operations: [
+				{
+					op: "set" as const,
+					path: ["queryStrategy", "repairAppendix", "ledgerRows", `@append:${nestedSourceRef}`],
+					value: { sourceRef: nestedSourceRef },
+					issueId: "issue_base",
+					sourceRefs: [nestedSourceRef],
+					reason: "Add the source row supporting this repair.",
+				},
+			],
+		};
+		const nestedSubmission = {
+			artifactType: task.requiredOutputType,
+			content: {},
+			refs: [{ kind: "source", ref: nestedSourceRef, summary: "nested source" }],
+			incrementalRevision: nestedRevision,
+		};
+		await expect(
+			validateWorkerSubmission(task, nestedSubmission, { executionRoot: root, sessionRef: "test:incremental", job }),
+		).rejects.toThrow(/receipt/);
+		await writeSourceReceipt(
+			{ workspaceRoot: root, jobId: job.state.frame.jobId, query: "nested source", limit: 1 },
+			{ sourceRef: nestedSourceRef, title: "Nested source", authors: [] },
+			"fixture",
+			new Date().toISOString(),
+		);
+		await expect(
+			validateWorkerSubmission(task, nestedSubmission, { executionRoot: root, sessionRef: "test:incremental", job }),
+		).resolves.toMatchObject({
+			content: {
+				queryStrategy: { repairAppendix: { ledgerRows: [{ sourceRef }, { sourceRef: nestedSourceRef }] } },
+			},
+		});
+		const validated = await validateWorkerSubmission(
+			task,
+			{ artifactType: task.requiredOutputType, content: {}, refs: [], incrementalRevision: revision },
+			{ executionRoot: root, sessionRef: "test:incremental", minSourceRefs: 1, job },
+		);
+		await job.setTaskStatus(task.id, "succeeded");
+		const repaired = await job.recordEvidence({
+			taskId: task.id,
+			stageId: task.stageId,
+			type: task.requiredOutputType,
+			content: validated.content,
+			refs: [...new Set(validated.outputRefs.map((ref) => ref.ref))],
+			currentEvidenceSetId: base.currentEvidenceSetId,
+			incrementalRevision: validated.incrementalRevision,
+		});
+		expect(validated.content).toMatchObject({
+			queryStrategy: { limitations: "search-only; capture unavailable" },
+			sources: [{ sourceRef }],
+		});
+		expect(validated.outputRefs).toContainEqual(expect.objectContaining({ kind: "source", ref: sourceRef }));
+		expect(validated.incrementalRevision?.baseHash).toBe(revision.baseHash);
+		expect(repaired.refs).toContain(sourceRef);
+		expect(repaired.incrementalRevision?.resultHash).toBe(incrementalContentHash(repaired.content));
+		const reopened = await ResearchJob.open(store, job.state.frame.jobId);
+		expect(reopened?.state.evidence[repaired.id]?.incrementalRevision).toEqual(repaired.incrementalRevision);
+	});
+
+	it("finds undeclared named source arrays nested in array objects", () => {
+		const task = {
+			...packet("/workspace"),
+			stageId: "literature",
+			requiredOutputType: "literature:local",
+			repairOfEvidenceId: "evidence_nested_base",
+			inputArtifactRefs: ["evidence_nested_base"],
+			repairChecks: [{ issueId: "issue_nested", criterion: "record limitations" }],
+		};
+		const base = {
+			id: "evidence_nested_base",
+			stageId: "literature",
+			content: { metadata: { sections: [] } },
+		};
+		const revision = {
+			baseEvidenceId: base.id,
+			baseHash: incrementalContentHash(base.content),
+			operations: [
+				{
+					op: "set" as const,
+					path: ["metadata"],
+					value: { sections: [[{ ledgerRows: [{ sourceRef: "https://example.org/hidden" }] }]] },
+					issueId: "issue_nested",
+					sourceRefs: [],
+					reason: "Attempt to add a nested unreferenced source.",
+				},
+			],
+			affectedCriteria: ["record limitations"],
+			rationale: "Test that nested named source collections remain attributable.",
+		};
+		expect(() => applyIncrementalRevision(task, base, {}, revision)).toThrow(/declared in operation sourceRefs/);
+	});
+
 	it("parses compiled PDFs and requires the log, editable source and complete declared local inputs", async () => {
 		const root = await mkdtemp(join(tmpdir(), "astra-paper-preflight-"));
 		tempRoots.push(root);

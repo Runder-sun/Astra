@@ -1,5 +1,5 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -25,7 +25,7 @@ import {
 	runResearchControl,
 } from "./research-control.ts";
 import { JsonlAstraStore } from "./store.ts";
-import { readVersionedFile } from "./task-workspace.ts";
+import { readVersionedFile, taskRecoveryMaterials } from "./task-workspace.ts";
 import type {
 	AutomationLevel,
 	MainAgentDecisionManifest,
@@ -285,16 +285,54 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			if (packet && ["read", "write", "edit", "grep", "find", "ls"].includes(event.toolName)) {
 				const requestedPath = String(input.path ?? ".").replace(/^@/, "");
 				const target = resolve(ctx.cwd, requestedPath);
-				if (!isInside(resolve(ctx.cwd), target)) {
-					return { block: true, reason: "worker file tools must stay inside the isolated task workspace" };
+				const readOnlyTool = ["read", "grep", "find", "ls"].includes(event.toolName);
+				let allowedRoots = [resolve(ctx.cwd)];
+				if (current.role === "worker" && readOnlyTool && !isInside(resolve(ctx.cwd), target)) {
+					try {
+						const declared: unknown = JSON.parse(process.env.ASTRA_RECOVERY_READ_ROOTS ?? "[]");
+						const recovery = await taskRecoveryMaterials(packet, job);
+						if (
+							!Array.isArray(declared) ||
+							declared.some((root) => typeof root !== "string" || !recovery?.readRoots.includes(root))
+						)
+							return { block: true, reason: "retry recovery roots are not host-validated" };
+						allowedRoots = [...allowedRoots, ...declared];
+					} catch (error) {
+						return { block: true, reason: error instanceof Error ? error.message : String(error) };
+					}
+				}
+				if (!allowedRoots.some((root) => isInside(root, target)))
+					return {
+						block: true,
+						reason:
+							"worker file tools must stay inside the isolated workspace or declared read-only recovery roots",
+					};
+				let ancestor = target;
+				while (true) {
+					try {
+						const resolvedTarget = await realpath(ancestor);
+						if (!allowedRoots.some((root) => isInside(root, resolvedTarget)))
+							return {
+								block: true,
+								reason: "worker file path escapes its allowed root through a symbolic link",
+							};
+						break;
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+						const parent = dirname(ancestor);
+						if (parent === ancestor) throw error;
+						ancestor = parent;
+					}
 				}
 				if (current.role === "worker" && event.toolName === "read" && requestedPath !== "ASTRA_TASK_CONTEXT.json") {
 					try {
 						const metadata = await stat(target);
 						if (metadata.isFile() && metadata.size > MAX_WORKER_DIRECT_READ_BYTES) {
-							const recovery = packet.allowedTools.includes("bash")
-								? "Use a bounded bash command such as jq, sed, head, tail, or wc and keep the output concise."
-								: "Use inputs.canonicalArtifacts and smaller summary files, then submit the required output.";
+							const recovery = !isInside(resolve(ctx.cwd), target)
+								? "Use grep with an exact pattern and a small limit to inspect this read-only recovery file."
+								: packet.allowedTools.includes("bash")
+									? "Use a bounded bash command such as jq, sed, head, tail, or wc and keep the output concise."
+									: "Use inputs.canonicalArtifacts and smaller summary files, then submit the required output.";
 							return {
 								block: true,
 								reason: `Direct read blocked for ${requestedPath} (${metadata.size} bytes). Do not retry this file with a different limit or offset. ${recovery}`,
@@ -412,36 +450,37 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			}
 		});
 
-		const scientificOutcomeParameter = Type.Union([
-			Type.Literal("supported"),
-			Type.Literal("partially-supported"),
-			Type.Literal("refuted"),
-			Type.Literal("inconclusive"),
-			Type.Literal("insufficient-evidence"),
-		]);
-		const missionCoverageParameter = Type.Union([Type.Literal("sufficient"), Type.Literal("insufficient")]);
+		const workerOutputType = process.env.ASTRA_REQUIRED_OUTPUT_TYPE ?? process.env.ASTRA_STAGE_ID;
 		const workerContentParameters =
-			(process.env.ASTRA_REQUIRED_OUTPUT_TYPE ?? process.env.ASTRA_STAGE_ID) === "result-to-claim"
-				? Type.Object({
-						scientificOutcome: scientificOutcomeParameter,
-						missionCoverage: missionCoverageParameter,
-						claims: Type.Array(Type.Unknown(), { maxItems: 20 }),
-						supportingResults: Type.Array(Type.Unknown(), { maxItems: 40 }),
-						unsupportedClaims: Type.Array(Type.Unknown(), { maxItems: 20 }),
-						missingEvidence: Type.Array(Type.Unknown(), { maxItems: 20 }),
-						conclusion: Type.String({ maxLength: 4_000 }),
-					})
-				: (process.env.ASTRA_REQUIRED_OUTPUT_TYPE ?? process.env.ASTRA_STAGE_ID) === "research-review"
-					? Type.Object({
-							verdict: Type.String({ maxLength: 40 }),
-							scientificOutcome: scientificOutcomeParameter,
-							missionCoverage: missionCoverageParameter,
-							strengths: Type.Array(Type.String()),
-							weaknesses: Type.Array(Type.String()),
-							claimAudit: Type.Array(Type.String()),
-							requiredRepairs: Type.Array(Type.String()),
-						})
-					: Type.Unknown({ description: "Structured object containing every requiredOutputField" });
+			workerOutputType === "result-to-claim"
+				? Type.Object(
+						{
+							scientificOutcome: Type.Optional(Type.String({ maxLength: 40 })),
+							missionCoverage: Type.Optional(Type.String({ maxLength: 40 })),
+							claims: Type.Optional(Type.Array(Type.Unknown(), { maxItems: 20 })),
+							supportingResults: Type.Optional(Type.Array(Type.Unknown(), { maxItems: 40 })),
+							unsupportedClaims: Type.Optional(Type.Array(Type.Unknown(), { maxItems: 20 })),
+							missingEvidence: Type.Optional(Type.Array(Type.Unknown(), { maxItems: 20 })),
+							conclusion: Type.Optional(Type.String({ maxLength: 4_000 })),
+						},
+						{ additionalProperties: false },
+					)
+				: workerOutputType === "research-review"
+					? Type.Object(
+							{
+								verdict: Type.Optional(Type.String({ maxLength: 40 })),
+								scientificOutcome: Type.Optional(Type.String({ maxLength: 40 })),
+								missionCoverage: Type.Optional(Type.String({ maxLength: 40 })),
+								strengths: Type.Optional(Type.Array(Type.String())),
+								weaknesses: Type.Optional(Type.Array(Type.String())),
+								claimAudit: Type.Optional(Type.Array(Type.String())),
+								requiredRepairs: Type.Optional(Type.Array(Type.String())),
+							},
+							{ additionalProperties: false },
+						)
+					: Type.Record(Type.String(), Type.Unknown(), {
+							description: "Structured object; Astra validates the merged full candidate",
+						});
 
 		pi.registerTool({
 			name: "astra_submit_worker_output",
@@ -452,6 +491,31 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			parameters: Type.Object({
 				artifactType: Type.String({ description: "Exact requiredOutputType from ASTRA_TASK_CONTEXT.json" }),
 				content: workerContentParameters,
+				incrementalRevision: Type.Optional(
+					Type.Object(
+						{
+							baseEvidenceId: Type.String(),
+							baseHash: Type.String({ pattern: "^[a-f0-9]{64}$" }),
+							operations: Type.Array(
+								Type.Object(
+									{
+										op: Type.Union([Type.Literal("set"), Type.Literal("delete")]),
+										path: Type.Array(Type.String()),
+										value: Type.Optional(Type.Unknown()),
+										issueId: Type.Optional(Type.String()),
+										sourceRefs: Type.Array(Type.String()),
+										reason: Type.String({ minLength: 1 }),
+									},
+									{ additionalProperties: false },
+								),
+								{ minItems: 1 },
+							),
+							affectedCriteria: Type.Array(Type.String(), { minItems: 1 }),
+							rationale: Type.String({ minLength: 1 }),
+						},
+						{ additionalProperties: false },
+					),
+				),
 				refs: Type.Array(
 					Type.Object({
 						kind: Type.Union([
@@ -491,11 +555,17 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 				try {
 					validated = await validateWorkerSubmission(
 						packet,
-						{ artifactType: params.artifactType, content: params.content, refs: params.refs },
+						{
+							artifactType: params.artifactType,
+							content: params.content,
+							refs: params.refs,
+							incrementalRevision: params.incrementalRevision,
+						},
 						{
 							executionRoot: ctx.cwd,
 							sessionRef: `pi-session:${process.env.ASTRA_SESSION_ID ?? `${packet.jobId}:${packet.id}:${packet.attempt}`}`,
 							minSourceRefs: taskStageContract(job.definitions[packet.stageId], packet).minSourceRefs ?? 0,
+							job,
 						},
 					);
 				} catch (error) {
@@ -519,6 +589,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					status: "completed" as const,
 					artifactType: params.artifactType,
 					content: validated.content,
+					...(validated.incrementalRevision ? { incrementalRevision: validated.incrementalRevision } : {}),
 					outputRefs,
 					validationStatus: "passed" as const,
 					validationErrors: [],
@@ -752,6 +823,30 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 						acceptanceChecks: Type.Array(Type.String(), { minItems: 1 }),
 						failureSignals: Type.Array(Type.String(), { minItems: 1 }),
 						successCriteria: Type.Array(Type.String(), { minItems: 1 }),
+						responsibilityTransfers: Type.Array(
+							Type.Object(
+								{
+									sourceTaskId: Type.String({ minLength: 1 }),
+									sourceContractHash: Type.String({ pattern: "^[a-f0-9]{64}$" }),
+									sourceField: Type.Literal("acceptanceChecks"),
+									sourceIndex: Type.Integer({ minimum: 0 }),
+									exactCriterion: Type.String({ minLength: 1 }),
+									nodeId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+									issueId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+									destinationStageId: Type.String({ minLength: 1 }),
+									destinationPhase: Type.Literal("synthesis"),
+									rationale: Type.String({ minLength: 1 }),
+								},
+								{ additionalProperties: false },
+							),
+						),
+						responsibilityBindings: Type.Array(
+							Type.Object({
+								nodeId: Type.String({ minLength: 1 }),
+								stageId: Type.String({ minLength: 1 }),
+								phase: Type.Union([Type.Literal("stage"), Type.Literal("synthesis")]),
+							}),
+						),
 					}),
 					{ minItems: 1, maxItems: process.env.ASTRA_PLAN_MODE === "search" ? 4 : 2 },
 				),

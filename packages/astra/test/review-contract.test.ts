@@ -1,9 +1,41 @@
 import { describe, expect, it } from "vitest";
 import { ResearchJob } from "../src/research.ts";
+import { groupRepairCriteria, validateReviewAssessment } from "../src/review-validation.ts";
 import { DEFAULT_STAGES } from "../src/stages.ts";
 import { MemoryAstraStore } from "../src/store.ts";
 
 describe("shared review contract", () => {
+	it("groups only identical requirements after removing registered leading repair IDs", () => {
+		const required = [
+			"check source",
+			"[issue_a] check source",
+			"[issue_b] [issue_a] check source",
+			"[unknown] check source",
+			"check sources",
+			"verify [issue_a] source",
+		];
+		expect(groupRepairCriteria(required, new Set(["issue_a", "issue_b"]))).toEqual([
+			{ criterion: "check source", frozenCriteria: required.slice(0, 3) },
+			...required.slice(3).map((criterion) => ({ criterion, frozenCriteria: [criterion] })),
+		]);
+	});
+	it("identifies omitted obligation criteria and duplicated assessments without accepting them", () => {
+		const required = ["check source", "[obligation_1] check source"];
+		const assessment = {
+			criterion: "check source",
+			passed: true,
+			score: 1,
+			evidenceRefs: ["source.json"],
+			rationale: "Read source.json",
+		};
+		expect(() =>
+			validateReviewAssessment(
+				{ verdict: "pass", score: 1, verifiedRefs: ["source.json"], criteria: [assessment, assessment] },
+				required,
+			),
+		).toThrow('missing=["[obligation_1] check source"]; duplicate=["check source"]');
+	});
+
 	it.each(DEFAULT_STAGES)("rejects implicit approval and malformed assessments in $id", async (stage) => {
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			objective: "Verify the shared review boundary",

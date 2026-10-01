@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { assertAstraId } from "./contracts.ts";
 import { researchMilestones } from "./progress.ts";
@@ -170,12 +170,18 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				const state = await snapshot(entry);
 				const artifact = state?.canonical[url.searchParams.get("artifact") ?? ""];
 				const ref = url.searchParams.get("ref") ?? "";
+				if (!ref || /^[a-z][a-z\d+.-]*:/i.test(ref) || /^[\\/]/.test(ref) || ref.split(/[\\/]/).includes(".."))
+					throw new Error("invalid local evidence file reference");
 				const evidence = artifact && state?.evidence[artifact.evidenceId];
 				if (!artifact || !evidence?.refs.includes(ref)) throw new Error("文件不属于该成果的交付记录");
 				const task = state?.tasks[evidence.taskId];
 				if (!task) throw new Error("交付任务记录缺失");
 				const workspace = taskWorkspacePath(entry.root, task.jobId, task.id);
 				const path = resolve(ref.startsWith(".astra/") ? entry.root : workspace, ref);
+				if (task.jobId !== state!.frame.jobId) throw new Error("下载来源任务不属于当前作业");
+				const local = relative(workspace, path);
+				if (local === ".." || local.startsWith("../") || local.startsWith("..\\") || isAbsolute(local))
+					throw new Error("下载文件不属于来源任务");
 				const bytes = await readVersionedFile(
 					{ ...task, scope: { ...task.scope, workspaceRoot: entry.root } },
 					evidence,

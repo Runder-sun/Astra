@@ -1,7 +1,8 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, readdir, rm } from "node:fs/promises";
+import { access, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import {
 	mainDecisionManifestPath,
@@ -18,6 +19,7 @@ import {
 	writeReviewTrace,
 	writeTaskPacket,
 } from "./contracts.ts";
+import { transferableResponsibilityCandidatesFromSnapshot } from "./effective-contract.ts";
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
 import type { ResearchJob } from "./research.ts";
 import { checksum } from "./research.ts";
@@ -34,6 +36,7 @@ import {
 	prepareReviewEvidenceBundle,
 	prepareTaskWorkspace,
 	taskInputResources,
+	taskRecoveryMaterials,
 	taskResourcePath,
 } from "./task-workspace.ts";
 import type {
@@ -60,6 +63,8 @@ export interface PiChildSessionOptions {
 }
 
 interface ProcessResult {
+	costUsd: number;
+	providerError?: ProviderErrorEvent;
 	exitCode: number;
 	stdout: string;
 	stderr: string;
@@ -371,12 +376,27 @@ export class PiChildSessionRunner {
 		return new Promise((resolveResult) => {
 			let settled = false;
 			let timer: NodeJS.Timeout | undefined;
-			let providerEventBuffer = "";
-			const finish = (value: ProcessResult): void => {
+			let killTimer: NodeJS.Timeout | undefined;
+			let lineBuffer = "";
+			let stdout = "";
+			let stderr = "";
+			let costUsd = 0;
+			let providerError: ProviderErrorEvent | undefined;
+			let stop: { exitCode: number; message: string } | undefined;
+			const decoder = new StringDecoder("utf8");
+			const finish = (exitCode: number): void => {
 				if (settled) return;
 				settled = true;
 				if (timer) clearTimeout(timer);
-				resolveResult(value);
+				if (killTimer) clearTimeout(killTimer);
+				resolveResult({
+					exitCode: stop?.exitCode ?? exitCode,
+					stdout,
+					stderr: `${stderr}${stop?.message ?? ""}`,
+					jsonEvents: parseJsonLines(stdout),
+					costUsd,
+					...(providerError ? { providerError } : {}),
+				});
 			};
 			let child: ChildProcessWithoutNullStreams;
 			try {
@@ -390,62 +410,60 @@ export class PiChildSessionRunner {
 					shell: false,
 				});
 			} catch (error) {
-				finish({
-					exitCode: 1,
-					stdout: "",
-					stderr: error instanceof Error ? error.message : String(error),
-					jsonEvents: [],
-				});
+				stderr = error instanceof Error ? error.message : String(error);
+				finish(1);
 				return;
 			}
 			trackChild(child);
-			let stdout = "";
-			let stderr = "";
-			const append = (target: "stdout" | "stderr", chunk: Buffer): void => {
-				const value = chunk.toString("utf8");
-				if (target === "stderr") {
-					stderr = `${stderr}${value}`.slice(-this.maxOutputBytes);
-					return;
-				}
-				stdout = `${stdout}${value}`.slice(-this.maxOutputBytes);
-				providerEventBuffer += value;
-				const lines = providerEventBuffer.split("\n");
-				providerEventBuffer = lines.pop() ?? "";
-				const providerError = providerErrorFromJsonEvents(parseJsonLines(lines.join("\n")));
-				if (!providerError) return;
+			const stopChild = (exitCode: number, message: string): void => {
+				if (stop || settled) return;
+				stop = { exitCode, message };
 				child.kill("SIGTERM");
-				finish({
-					exitCode: 1,
-					stdout,
-					stderr: `${stderr}Pi child session stopped after provider failure: ${providerError.message}`,
-					jsonEvents: parseJsonLines(stdout),
-				});
+				killTimer = setTimeout(() => child.kill("SIGKILL"), 250);
 			};
-			child.stdout.on("data", (chunk: Buffer) => append("stdout", chunk));
-			child.stderr.on("data", (chunk: Buffer) => append("stderr", chunk));
+			const recordLine = (line: string): void => {
+				const events = parseJsonLines(line);
+				costUsd += costUsdFromJsonEvents(events);
+				providerError ??= providerErrorFromJsonEvents(events);
+				if (providerError)
+					stopChild(1, `Pi child session stopped after provider failure: ${providerError.message}`);
+			};
+			child.stdout.on("data", (chunk: Buffer) => {
+				const value = decoder.write(chunk);
+				stdout = `${stdout}${value}`.slice(-this.maxOutputBytes);
+				lineBuffer += value;
+				let end = lineBuffer.indexOf("\n");
+				while (end !== -1) {
+					recordLine(lineBuffer.slice(0, end));
+					lineBuffer = lineBuffer.slice(end + 1);
+					end = lineBuffer.indexOf("\n");
+				}
+			});
+			child.stderr.setEncoding("utf8");
+			child.stderr.on("data", (value: string) => {
+				stderr = `${stderr}${value}`.slice(-this.maxOutputBytes);
+			});
 			child.stdin.on("error", (error) => {
-				append("stderr", Buffer.from(`Pi child stdin error: ${error.message}`));
+				stderr = `${stderr}Pi child stdin error: ${error.message}`.slice(-this.maxOutputBytes);
 			});
 			child.stdin.end(prompt);
-			child.on("error", (error) =>
-				finish({ exitCode: 1, stdout, stderr: `${stderr}${error.message}`, jsonEvents: parseJsonLines(stdout) }),
-			);
-			child.on("close", (exitCode) => {
-				untrackChild(child);
-				finish({ exitCode: exitCode ?? 1, stdout, stderr, jsonEvents: parseJsonLines(stdout) });
+			child.on("error", (error) => {
+				if (!child.pid) {
+					stderr = `${stderr}${error.message}`;
+					untrackChild(child);
+					finish(1);
+				} else stopChild(1, error.message);
 			});
-			timer =
-				timeoutMs && timeoutMs > 0
-					? setTimeout(() => {
-							child.kill("SIGTERM");
-							finish({
-								exitCode: 124,
-								stdout,
-								stderr: `${stderr}Pi child session timed out after ${timeoutMs}ms`,
-								jsonEvents: parseJsonLines(stdout),
-							});
-						}, timeoutMs)
-					: undefined;
+			child.on("close", (exitCode) => {
+				const remainder = decoder.end();
+				stdout = `${stdout}${remainder}`.slice(-this.maxOutputBytes);
+				recordLine(`${lineBuffer}${remainder}`);
+				lineBuffer = "";
+				untrackChild(child);
+				finish(exitCode ?? 1);
+			});
+			if (timeoutMs && timeoutMs > 0)
+				timer = setTimeout(() => stopChild(124, `Pi child session timed out after ${timeoutMs}ms`), timeoutMs);
 		});
 	}
 
@@ -532,6 +550,10 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 		});
 		const executionRoot = await prepareTaskWorkspace(task, job);
 		const inputResources = await taskInputResources(task, job);
+		const recovery = await taskRecoveryMaterials(task, job);
+		const recoveryInstructions = recovery
+			? ` This retries ${recovery.previousTaskId}. Read the retained workspace and log through the exact recovery.readRoots in ASTRA_TASK_CONTEXT.json. These are unreviewed recovery materials, not accepted evidence. Reuse completed work selectively in the current workspace; preserve prior files. Failure: ${recovery.error?.slice(0, 1000) ?? "log unavailable"}. Write a new submission using the current task identity; never submit the previous manifest.`
+			: "";
 		const resourceRoot =
 			task.writeAuthority === "workspace-write"
 				? taskResourcePath(task.scope.workspaceRoot, task.jobId, task.id)
@@ -539,9 +561,10 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 		const result = await this.runner.runTask(
 			job.state.tasks[task.id],
 			"worker",
-			`You are the Astra worker for TaskPacket ${task.id}. Read ASTRA_TASK_CONTEXT.json in the current isolated task workspace before acting. Execute only the authored objective. Upstream structured content is inline under inputs.canonicalArtifacts unless an entry provides contentPath; read that relative JSON file when present.${task.stageId === "research-review" ? " For research-review, read inputs.reviewSummaryPath first as an index, then inspect contentPath files and direct evidence needed for every acceptance criterion and every claim. Do not truncate findings or repairs to a fixed item count. Batch targeted reads within the task budget; report any unchecked criterion or claim as unverified and require further review. Independently report scientificOutcome and missionCoverage for the primary objective, then submit strengths, weaknesses, claimAudit, and requiredRepairs as concise string arrays matching the tool schema." : ""} Upstream files are available only at the exact relative paths in inputs.files[].path. Never assume an upstream basename exists in the workspace root. Do not load raw datasets or long logs into model context; use bounded commands or small summaries. Treat the current directory as the workspace root and never access a parent .astra directory or construct host absolute paths.${resourceRoot ? ' The only writable path outside the task workspace is the predeclared "$ASTRA_RESOURCE_ROOT". For resource-producing work, create environments, datasets, checkpoints, caches, and other reusable runtime assets under "$ASTRA_RESOURCE_ROOT" by referencing that environment variable literally in commands. Do not create a resources/ directory in the task workspace or derive a resource path from the task id. Keep source code, compact resource manifests, exact command records, and reviewable logs in the task workspace.' : ""} Produce every required output field and call astra_submit_worker_output exactly once. Only cite artifact/log refs for files you actually created and source refs returned by a retrieval tool; otherwise pass refs: [] and Astra will add the session ref. Never invent a ref. Do not decide adoption, route, or stage closure.`,
+			`You are the Astra worker for TaskPacket ${task.id}. Read ASTRA_TASK_CONTEXT.json in the current isolated task workspace before acting. Execute only the authored objective. Upstream structured content is inline under inputs.canonicalArtifacts unless an entry provides contentPath; read that relative JSON file when present.${task.stageId === "research-review" ? " For research-review, read inputs.reviewSummaryPath first as an index, then inspect contentPath files and direct evidence needed for every acceptance criterion and every claim. Do not truncate findings or repairs to a fixed item count. Batch targeted reads within the task budget; report any unchecked criterion or claim as unverified and require further review. Independently report scientificOutcome and missionCoverage for the primary objective, then submit strengths, weaknesses, claimAudit, and requiredRepairs as concise string arrays matching the tool schema." : ""} Upstream files are available only at the exact relative paths in inputs.files[].path. Never assume an upstream basename exists in the workspace root. Do not load raw datasets or long logs into model context; use bounded commands or small summaries. Treat the current directory as the workspace root. Read outside it only through the exact host-declared recovery.readRoots using read, ls, find or grep; all other parent .astra paths are forbidden.${resourceRoot ? ' The only writable path outside the task workspace is the predeclared "$ASTRA_RESOURCE_ROOT". For resource-producing work, create environments, datasets, checkpoints, caches, and other reusable runtime assets under "$ASTRA_RESOURCE_ROOT" by referencing that environment variable literally in commands. Do not create a resources/ directory in the task workspace or derive a resource path from the task id. Keep source code, compact resource manifests, exact command records, and reviewable logs in the task workspace.' : ""} Produce every required output field and call astra_submit_worker_output exactly once. Only cite artifact/log refs for files you actually created and source refs returned by a retrieval tool; otherwise pass refs: [] and Astra will add the session ref. Never invent a ref. Do not decide adoption, route, or stage closure.${recoveryInstructions}`,
 			{
 				ASTRA_EXECUTION_ROOT: executionRoot,
+				ASTRA_RECOVERY_READ_ROOTS: JSON.stringify(recovery?.readRoots ?? []),
 				ASTRA_RESOURCE_ROOT: resourceRoot,
 				ASTRA_INPUT_RESOURCE_ROOTS: JSON.stringify(inputResources.map((resource) => resource.root)),
 				PIP_CACHE_DIR: resourceRoot ? join(resourceRoot, "cache", "pip") : undefined,
@@ -551,8 +574,27 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 				...Object.fromEntries(inputResources.map((resource) => [resource.envVar, resource.root])),
 			},
 		);
-		await job.recordCost(costUsdFromJsonEvents(result.jsonEvents));
-		const providerError = providerErrorFromJsonEvents(result.jsonEvents);
+		await job.recordCost(result.costUsd);
+		const retainedSessionFile = await findSessionFile(
+			this.runner.sessionDir ?? join(task.scope.workspaceRoot, ".astra", "jobs", task.jobId, "sessions"),
+			sessionId,
+		);
+		const failureLog = retainedSessionFile?.startsWith(
+			`${join(task.scope.workspaceRoot, ".astra", "jobs", task.jobId)}/`,
+		)
+			? retainedSessionFile
+			: join(taskDir(task.scope.workspaceRoot, task.jobId, task.id), "failure-log.json");
+		const retainFailure = async (error: string): Promise<string> => {
+			if (failureLog !== retainedSessionFile)
+				await writeFile(
+					failureLog,
+					`${JSON.stringify({ taskId: task.id, attempt: task.attempt, exitCode: result.exitCode, error: error.slice(-4096), stdoutTail: result.stdout.slice(-4096), stderrTail: result.stderr.slice(-4096) })}\n`,
+					"utf8",
+				);
+			return failureLog;
+		};
+
+		const providerError = result.providerError;
 		if (providerError) {
 			await job.recordChildSession({
 				sessionId,
@@ -560,6 +602,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 				taskId: task.id,
 				status: providerError.kind === "capacity" ? "interrupted" : "failed",
 				attempt: task.attempt,
+				sessionFile: await retainFailure(providerError.message),
 				error: providerError.message,
 				updatedAt: new Date().toISOString(),
 			});
@@ -581,6 +624,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 				taskId: task.id,
 				status: "failed",
 				attempt: task.attempt,
+				sessionFile: await retainFailure(result.stderr || `exit ${result.exitCode}`),
 				error: result.stderr || `exit ${result.exitCode}`,
 				updatedAt: new Date().toISOString(),
 			});
@@ -607,6 +651,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 				taskId: task.id,
 				status: "failed",
 				attempt: task.attempt,
+				sessionFile: await retainFailure(error instanceof Error ? error.message : String(error)),
 				error: error instanceof Error ? error.message : String(error),
 				updatedAt: new Date().toISOString(),
 			});
@@ -629,6 +674,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 			content: manifest.content,
 			refs: manifest.outputRefs.map((ref) => ref.ref),
 			artifactType: manifest.artifactType,
+			...(manifest.incrementalRevision ? { incrementalRevision: manifest.incrementalRevision } : {}),
 		};
 	}
 }
@@ -763,8 +809,8 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 				ASTRA_EXECUTION_ROOT: taskDir(task.scope.workspaceRoot, task.jobId, task.id),
 			},
 		);
-		await job.recordCost(costUsdFromJsonEvents(result.jsonEvents));
-		const providerError = providerErrorFromJsonEvents(result.jsonEvents);
+		await job.recordCost(result.costUsd);
+		const providerError = result.providerError;
 		if (providerError) {
 			await job.setTaskStatus(task.id, providerError.kind === "capacity" ? "ready" : "failed");
 			await job.recordChildSession({
@@ -876,25 +922,26 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		obligation?: Obligation,
 		requestedMode: "decompose" | "search" | "repair" = obligation ? "repair" : "decompose",
 	): Promise<StagePlanManifest> {
-		const stageId = job.state.frame.activeStageId;
+		const snapshot = job.state;
+		const stageId = snapshot.frame.activeStageId;
 		const definition = job.definitions[stageId];
-		const decisionRef = `stage-plan-${stageId}-${job.state.eventSeq + 1}-${Date.now()}`;
+		const decisionRef = `stage-plan-${stageId}-${snapshot.eventSeq + 1}-${Date.now()}`;
 		const planId = `plan_${decisionRef}`;
 		const sessionId = resumableMainSessionId(job);
-		const activeCanonical = Object.values(job.state.canonical)
+		const activeCanonical = Object.values(snapshot.canonical)
 			.filter((artifact) => artifact.status === "active")
 			.map((artifact) => ({ id: artifact.id, type: artifact.type, evidenceId: artifact.evidenceId }));
 		const repairEvidence = obligation
-			? Object.values(job.state.evidence)
+			? Object.values(snapshot.evidence)
 					.filter((evidence) => evidence.stageId === stageId)
 					.map((evidence) => ({
 						id: evidence.id,
 						type: evidence.type,
 						status: evidence.status,
-						task: job.state.tasks[evidence.taskId],
+						task: snapshot.tasks[evidence.taskId],
 					}))
 			: [];
-		const latestSearchBatch = Object.values(job.state.searchBatches)
+		const latestSearchBatch = Object.values(snapshot.searchBatches)
 			.filter((batch) => batch.stageId === stageId && batch.status !== "superseded")
 			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
 		const continuationBatch =
@@ -906,7 +953,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		const continuationContext = continuationBatch
 			? {
 					batch: continuationBatch,
-					evaluations: Object.values(job.state.candidateEvaluations).filter(
+					evaluations: Object.values(snapshot.candidateEvaluations).filter(
 						(evaluation) => evaluation.batchId === continuationBatch.id,
 					),
 				}
@@ -917,6 +964,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			...activeCanonical.map((artifact) => artifact.id),
 			...repairEvidence.map((evidence) => evidence.id),
 		];
+		const transferCandidates = transferableResponsibilityCandidatesFromSnapshot(snapshot, stageId, obligation?.id);
 		await job.recordChildSession({
 			sessionId,
 			role: "main-agent",
@@ -927,11 +975,11 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		});
 		const result = await this.runner.run(
 			this.cwd,
-			job.state.frame.jobId,
+			snapshot.frame.jobId,
 			decisionRef,
 			1,
 			"main-agent",
-			`You are Astra's persistent main research agent and the only authority that may define subagent work. The active capability is ${stageId}; capabilities are not a fixed pipeline. The frozen capability contract is ${JSON.stringify(definition)}. The canonical research graph projection is ${JSON.stringify(projectResearchGraph(job.state))}. Use astra_read_research_object with exact IDs to expand structured evidence, reviews and obligations before planning; follow nextOffset for complete content. To read a declared frozen UTF-8 evidence file, pass its exact files[].sourceRef as fileRef alongside the evidence or canonical ID. Binary files require a text extraction or page preview. Previous plan reviews to address: ${JSON.stringify(Object.values(job.state.reviews).filter((review) => job.state.evidence[review.evidenceId]?.type === "stage-plan" && job.state.evidence[review.evidenceId]?.stageId === stageId))}. Available canonical and repair inputs are ${JSON.stringify({ activeCanonical, repairEvidence, localEvidence })}. The requested plan mode is ${requestedMode}. ${obligation ? `This repair plan must resolve obligation ${obligation.id}: ${obligation.description}. Submit exactly one complete repair task.` : requestedMode === "search" ? `Author ${definition.searchPolicy?.minCandidates ?? 2} to ${definition.searchPolicy?.maxCandidates ?? 4} genuinely diverse candidate tasks. Give each a distinct hypothesis and use mode search; candidates run independently and will be compared by frozen criteria ${JSON.stringify(definition.searchPolicy?.criteria ?? definition.acceptanceChecks)}.${continuationContext ? ` This is bounded search round ${continuationBatch?.round ? continuationBatch.round + 1 : 1}/${continuationBatch?.maxRounds ?? definition.searchPolicy?.maxRounds ?? 2}. The previous round and independent evaluations are ${JSON.stringify(continuationContext)}. Its tie rationale was ${JSON.stringify(continuationBatch?.continuationRationale)}. Create orthogonal discriminators that can break that exact tie; do not repeat any previous hypothesis.` : " This is the first bounded search round."}` : "Author one focused execution task, or two non-overlapping tasks only when their outputs are independently useful."} ${TASK_DELIVERY_INSTRUCTIONS} Call astra_submit_stage_plan exactly once. Tasks in the same plan run concurrently in isolated workspaces: a task cannot consume another task's output from the same plan. If work has an ordering dependency, plan only the prerequisite task and let a later main-agent round plan its consumer. Every task must include every authored canonical ref it needs; full immutable contents will be materialized in its workspace. Do not perform worker work or choose the route yourself.`,
+			`You are Astra's persistent main research agent and the only authority that may define subagent work. The active capability is ${stageId}; capabilities are not a fixed pipeline. The frozen capability contract is ${JSON.stringify(definition)}. The canonical research graph projection is ${JSON.stringify(projectResearchGraph(snapshot))}. Use astra_read_research_object with exact IDs to expand structured evidence, reviews and obligations before planning; follow nextOffset for complete content. To read a declared frozen UTF-8 evidence file, pass its exact files[].sourceRef as fileRef alongside the evidence or canonical ID. Binary files require a text extraction or page preview. Previous plan reviews to address: ${JSON.stringify(Object.values(snapshot.reviews).filter((review) => snapshot.evidence[review.evidenceId]?.type === "stage-plan" && snapshot.evidence[review.evidenceId]?.stageId === stageId))}. Available canonical and repair inputs are ${JSON.stringify({ activeCanonical, repairEvidence, localEvidence })}. Exact legacy handoff candidates are ${JSON.stringify(transferCandidates)}. A candidate lists sourceTaskId, sourceContractHash, sourceIndex, exactCriterion and exactly one nodeId or issueId; do not infer or calculate source hashes. Transfer only an exact listed item to destinationPhase=synthesis, retaining every other legacy requirement. If one source criterion has both node and issue candidates, include both exact identities. The requested plan mode is ${requestedMode}. ${obligation ? `This repair plan must resolve obligation ${obligation.id}: ${obligation.description}. Submit exactly one complete repair task.` : requestedMode === "search" ? `Author ${definition.searchPolicy?.minCandidates ?? 2} to ${definition.searchPolicy?.maxCandidates ?? 4} genuinely diverse candidate tasks. Give each a distinct hypothesis and use mode search; candidates run independently and will be compared by frozen criteria ${JSON.stringify(definition.searchPolicy?.criteria ?? definition.acceptanceChecks)}.${continuationContext ? ` This is bounded search round ${continuationBatch?.round ? continuationBatch.round + 1 : 1}/${continuationBatch?.maxRounds ?? definition.searchPolicy?.maxRounds ?? 2}. The previous round and independent evaluations are ${JSON.stringify(continuationContext)}. Its tie rationale was ${JSON.stringify(continuationBatch?.continuationRationale)}. Create orthogonal discriminators that can break that exact tie; do not repeat any previous hypothesis.` : " This is the first bounded search round."}` : "Author one focused execution task, or two non-overlapping tasks only when their outputs are independently useful."} ${TASK_DELIVERY_INSTRUCTIONS} Call astra_submit_stage_plan exactly once. Tasks in the same plan run concurrently in isolated workspaces: a task cannot consume another task's output from the same plan. If work has an ordering dependency, plan only the prerequisite task and let a later main-agent round plan its consumer. Every task must include every authored canonical ref it needs; full immutable contents will be materialized in its workspace. Do not perform worker work or choose the route yourself.`,
 			{
 				ASTRA_SESSION_ID: sessionId,
 				ASTRA_PROJECT_ROOT: this.cwd,
@@ -947,8 +995,8 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			},
 			180_000,
 		);
-		await job.recordCost(costUsdFromJsonEvents(result.jsonEvents));
-		const providerError = providerErrorFromJsonEvents(result.jsonEvents);
+		await job.recordCost(result.costUsd);
+		const providerError = result.providerError;
 		if (providerError) {
 			await job.recordChildSession({
 				sessionId,
@@ -973,12 +1021,12 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			});
 			throw new Error(`Pi main-agent stage planner exited with ${result.exitCode}: ${result.stderr}`);
 		}
-		const path = stagePlanManifestPath(this.cwd, job.state.frame.jobId, planId);
+		const path = stagePlanManifestPath(this.cwd, snapshot.frame.jobId, planId);
 		let manifest: StagePlanManifest;
 		try {
 			manifest = await this.runner.waitForManifest(path, readStagePlanManifest, MANIFEST_WAIT_TIMEOUT_MS);
 			if (
-				manifest.jobId !== job.state.frame.jobId ||
+				manifest.jobId !== snapshot.frame.jobId ||
 				manifest.stageId !== stageId ||
 				manifest.decisionRef !== decisionRef ||
 				manifest.obligationId !== obligation?.id
@@ -1004,7 +1052,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			status: "completed",
 			attempt: 1,
 			sessionFile: await findSessionFile(
-				this.runner.sessionDir ?? join(this.cwd, ".astra", "jobs", job.state.frame.jobId, "sessions"),
+				this.runner.sessionDir ?? join(this.cwd, ".astra", "jobs", snapshot.frame.jobId, "sessions"),
 				sessionId,
 			),
 			manifestRef: path,
@@ -1046,8 +1094,8 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 			},
 			180_000,
 		);
-		await job.recordCost(costUsdFromJsonEvents(result.jsonEvents));
-		const providerError = providerErrorFromJsonEvents(result.jsonEvents);
+		await job.recordCost(result.costUsd);
+		const providerError = result.providerError;
 		if (providerError) {
 			await job.recordChildSession({
 				sessionId,

@@ -320,7 +320,9 @@ it.each(["local", "synthesis"] as const)(
 						});
 					}
 					if (task.repairOfEvidenceId && evidence.type !== "stage-plan") {
-						expect(task.acceptanceChecks).toContain("Verify the missing control comparison");
+						expect(task.acceptanceChecks).toContain(
+							current.normalizedRepairCriterion("Verify the missing control comparison"),
+						);
 						expect(task.requiredOutputFields).toContain(failedKind === "local" ? "baseline" : "researchQuestion");
 					}
 					return reviewFixture(current, { evidenceId: evidence.id, verdict: "pass", findings: [] });

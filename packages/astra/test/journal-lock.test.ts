@@ -1,0 +1,155 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, rm, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, it, vi } from "vitest";
+import { ResearchJob } from "../src/research.ts";
+import { JsonlAstraStore, ResearchJobLockedError } from "../src/store.ts";
+
+const roots: string[] = [];
+afterEach(async () => {
+	vi.restoreAllMocks();
+	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+async function setup() {
+	const root = await mkdtemp(join(tmpdir(), "astra-journal-lock-"));
+	roots.push(root);
+	const store = new JsonlAstraStore(root);
+	const job = await ResearchJob.create(store, { workspaceRoot: root, objective: "safe journal locks" });
+	const id = job.state.frame.jobId;
+	return { root, store, job, id, path: join(root, ".astra", "jobs", id, "journal.lock") };
+}
+async function owner(path: string, pid = 2147483646) {
+	const token = randomUUID();
+	await mkdir(path);
+	await writeFile(
+		join(path, `owner-${token}.json`),
+		JSON.stringify({ owner: "fixture", pid, token, createdAt: new Date(0).toISOString() }),
+	);
+	return token;
+}
+
+it("reclaiming a dead writer cannot remove a newer live owner lock", async () => {
+	const { root, store: first, id, path } = await setup();
+	const second = new JsonlAstraStore(root);
+	await owner(path);
+	type Reader = { readJournalLock(path: string): Promise<unknown> };
+	const reader = second as unknown as Reader;
+	const read = reader.readJournalLock.bind(reader);
+	let captured = () => {};
+	const observed = new Promise<void>((resolve) => {
+		captured = resolve;
+	});
+	let entered = () => {};
+	const firstEntered = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let release = () => {};
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	vi.spyOn(reader, "readJournalLock").mockImplementationOnce(async (current) => {
+		const previous = await read(current);
+		captured();
+		await firstEntered;
+		return previous;
+	});
+	let firstInside = false;
+	let overlap = false;
+	const competing = second
+		.withWriteLock(id, async () => {
+			overlap = firstInside;
+		})
+		.catch((error: unknown) => error);
+	await observed;
+	const owning = first.withWriteLock(id, async () => {
+		firstInside = true;
+		entered();
+		await held;
+		firstInside = false;
+	});
+	try {
+		const error = await competing;
+		expect(overlap).toBe(false);
+		expect(error).toBeInstanceOf(ResearchJobLockedError);
+	} finally {
+		release();
+		await owning;
+	}
+});
+
+it.each(["empty", "dead"])(
+	"recovers an abandoned %s directory and leaves unpublished directories alone",
+	async (kind) => {
+		const { store, id, path } = await setup();
+		const unpublished = `${path}.unpublished-fixture`;
+		await owner(unpublished);
+		if (kind === "dead") await owner(path);
+		else await mkdir(path);
+		await store.withWriteLock(id, async () => {
+			const names = await readdir(path);
+			expect(names).toHaveLength(1);
+			const record = JSON.parse(await readFile(join(path, names[0]), "utf8")) as { pid: number; token: string };
+			expect(record.pid).toBe(process.pid);
+			expect(names[0]).toBe(`owner-${record.token}.json`);
+		});
+		await expect(readdir(path)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readdir(unpublished)).toHaveLength(1);
+	},
+);
+
+it.each(["active", "unknown", "multiple", "mismatch", "file", "symlink", "owner-symlink"])(
+	"rejects %s owners without changing their files",
+	async (kind) => {
+		const { root, store, id, path } = await setup();
+		if (kind === "file") await writeFile(path, "legacy file");
+		else if (kind === "symlink") {
+			await mkdir(join(root, "other"));
+			await symlink(join(root, "other"), path);
+		} else {
+			await mkdir(path);
+			if (kind === "unknown") await writeFile(join(path, "unknown"), "retained");
+			else {
+				const token = randomUUID();
+				const content = JSON.stringify({
+					owner: "fixture",
+					pid: process.pid,
+					token: kind === "mismatch" ? randomUUID() : token,
+					createdAt: new Date().toISOString(),
+				});
+				if (kind === "owner-symlink") {
+					await writeFile(join(root, "owner"), content);
+					await symlink(join(root, "owner"), join(path, `owner-${token}.json`));
+				} else await writeFile(join(path, `owner-${token}.json`), content);
+				if (kind === "multiple") await writeFile(join(path, "unexpected"), "retained");
+			}
+		}
+		const operation = vi.fn(async () => undefined);
+		await expect(store.withWriteLock(id, operation)).rejects.toBeInstanceOf(ResearchJobLockedError);
+		expect(operation).not.toHaveBeenCalled();
+		if (kind === "file") expect(await readFile(path, "utf8")).toBe("legacy file");
+		else expect(await readdir(path)).toHaveLength(kind === "symlink" ? 0 : kind === "multiple" ? 2 : 1);
+	},
+);
+
+it("release cannot remove a new owner published after the old token was removed", async () => {
+	const { store, id, path } = await setup();
+	let nextToken = "";
+	await store.withWriteLock(id, async () => {
+		const [name] = await readdir(path);
+		await unlink(join(path, name));
+		await rmdir(path);
+		nextToken = await owner(path, process.pid);
+	});
+	expect(await readdir(path)).toEqual([`owner-${nextToken}.json`]);
+	await expect(store.withWriteLock(id, async () => undefined)).rejects.toBeInstanceOf(ResearchJobLockedError);
+});
+
+it.each(["append", "snapshot"])("releases journal locks after %s failure inside the supervisor lock", async (kind) => {
+	const { store, job, id, path } = await setup();
+	vi.spyOn(store, kind === "append" ? "append" : "writeSnapshot").mockRejectedValueOnce(new Error("fixture failure"));
+	await expect(store.withJobLock(id, "supervisor", () => job.consumeTurns(1))).rejects.toThrow("fixture failure");
+	await expect(readdir(path)).rejects.toMatchObject({ code: "ENOENT" });
+	const reopened = (await ResearchJob.open(store, id))!;
+	await store.withJobLock(id, "supervisor", () => reopened.consumeTurns(1));
+});

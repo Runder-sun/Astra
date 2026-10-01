@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CodexAppServerRunner, type CodexRunOptions } from "../src/codex-app-server.ts";
+import {
+	CodexAppServerRunner,
+	type CodexRunOptions,
+	CodexRuntimeBudgetError,
+	CodexToolBudgetError,
+} from "../src/codex-app-server.ts";
 import { NonRetryableResearchError, ProviderCapacityError } from "../src/supervisor.ts";
 
 const roots: string[] = [];
@@ -31,6 +36,66 @@ afterEach(async () => {
 });
 
 describe("official Codex app-server transport", () => {
+	it("bounds final-output correction to one attempt and retains both rejection records", async () => {
+		const request = await options();
+		const validateOutput = vi.fn(() => {
+			throw new Error("confirmation mismatch");
+		});
+		await expect(runner.run({ ...request, validateOutput })).rejects.toThrow("confirmation mismatch");
+		expect(validateOutput).toHaveBeenCalledTimes(2);
+		const events = (await readFile(request.logPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(
+			events.filter((event) => event.method === "astra/output_rejected").map((event) => event.params.retry),
+		).toEqual([true, false]);
+	});
+	it("shares the original tool budget with the correction turn", async () => {
+		const request = await options("web-search");
+		await expect(
+			runner.run({
+				...request,
+				maxToolCalls: 1,
+				validateOutput: () => {
+					throw new Error("confirmation mismatch");
+				},
+			}),
+		).rejects.toThrow("tool-call budget");
+	});
+	it("does not retry provider failures as final-output corrections", async () => {
+		const request = await options("quota");
+		const validateOutput = vi.fn();
+		await expect(runner.run({ ...request, validateOutput })).rejects.toThrow("allowance exhausted");
+		expect(validateOutput).not.toHaveBeenCalled();
+		const calls = (await readFile(join(request.cwd, "requests.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(calls.filter((call) => call.method === "turn/start")).toHaveLength(1);
+	});
+	it("reports allowed literal values when a tool reference is invalid", async () => {
+		const request = await options("tool");
+		const execute = vi.fn(async () => ({}));
+		request.tools = [
+			{
+				name: "audit_tool",
+				description: "test",
+				inputSchema: Type.Object({ query: Type.Union([Type.Literal("evidence-a"), Type.Literal("evidence-b")]) }),
+				execute,
+			},
+		];
+		await runner.run(request);
+		expect(execute).not.toHaveBeenCalled();
+		const calls = (await readFile(join(request.cwd, "requests.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const feedback = calls.find((call) => call.id === "tool-call")?.result.contentItems[0].text;
+		expect(feedback).toContain("/query");
+		expect(feedback).toContain("evidence-a");
+		expect(feedback).toContain("evidence-b");
+	});
 	it("awaits host recording of official web observations and excludes foreign threads", async () => {
 		const request = await options("web-search");
 		const observations: unknown[] = [];
@@ -156,7 +221,13 @@ describe("official Codex app-server transport", () => {
 	it.each(["timeout", "tool-budget", "approval"])("interrupts %s and closes the server", async (mode) => {
 		const request = await options(mode);
 		if (mode === "timeout") request.timeoutMs = 300;
-		await expect(runner.run(request)).rejects.toBeInstanceOf(NonRetryableResearchError);
+		await expect(runner.run(request)).rejects.toBeInstanceOf(
+			mode === "tool-budget"
+				? CodexToolBudgetError
+				: mode === "timeout"
+					? CodexRuntimeBudgetError
+					: NonRetryableResearchError,
+		);
 	});
 
 	it("does not start model work after interruption during session recording", async () => {
@@ -176,5 +247,15 @@ describe("official Codex app-server transport", () => {
 		];
 		await runner.run(request);
 		expect(execute).toHaveBeenCalledTimes(mode === "tool" ? 1 : 0);
+		if (mode === "bad-tool") {
+			const calls = (await readFile(join(request.cwd, "requests.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			expect(calls.find((call) => call.id === "tool-call")?.result).toMatchObject({
+				success: false,
+				contentItems: [{ type: "inputText", text: expect.stringContaining("/query") }],
+			});
+		}
 	});
 });

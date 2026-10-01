@@ -234,7 +234,7 @@ describe("Pi reviewer TaskPacket budget", () => {
 				},
 				task.scope.workspaceRoot,
 			);
-			return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [] };
+			return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 		});
 
 		await new PiReviewerAdapter(runner).review(evidence, job);

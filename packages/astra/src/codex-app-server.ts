@@ -14,6 +14,25 @@ export interface CodexTool {
 	execute(input: unknown): Promise<unknown>;
 }
 
+/** Exhausts one attempt, not the research job; the supervisor owns bounded recovery. */
+export class CodexToolBudgetError extends Error {
+	constructor(limit: number) {
+		super(
+			`Codex research task exceeded its tool-call budget (${limit}); recover retained work in the next bounded attempt`,
+		);
+		this.name = "CodexToolBudgetError";
+	}
+}
+
+export class CodexRuntimeBudgetError extends Error {
+	constructor(limit: number) {
+		super(
+			`Codex research task exceeded its runtime budget (${limit} ms); recover retained work in the next bounded attempt`,
+		);
+		this.name = "CodexRuntimeBudgetError";
+	}
+}
+
 export interface CodexRunOptions<S extends TSchema> {
 	cwd: string;
 	prompt: string;
@@ -32,6 +51,8 @@ export interface CodexRunOptions<S extends TSchema> {
 	timeoutMs: number;
 	logPath: string;
 	onThread(threadId: string): Promise<void>;
+	/** Opts into one same-session final-output correction, within the original runtime/tool budget. */
+	validateOutput?(output: Static<S>): void;
 }
 
 export interface CodexRunResult<T> {
@@ -247,16 +268,18 @@ export class CodexAppServerRunner {
 		let log = Promise.resolve();
 		let rejectTurn: (error: Error) => void = () => {};
 		let resolveTurn: () => void = () => {};
-		const completed = new Promise<void>((resolveComplete, reject) => {
-			resolveTurn = resolveComplete;
-			rejectTurn = (error) => {
-				failure ??= error;
-				reject(error);
-			};
-		});
+		const waitForCompletion = () =>
+			new Promise<void>((resolveComplete, reject) => {
+				resolveTurn = resolveComplete;
+				rejectTurn = (error) => {
+					failure ??= error;
+					reject(error);
+				};
+			});
+		let completed = waitForCompletion();
 		// Attach immediately: protocol failure may arrive while thread/start is still awaited.
 		void completed.catch(() => {});
-		connection.onFailure = rejectTurn;
+		connection.onFailure = (error) => rejectTurn(error);
 		const interrupt = () => {
 			if (threadId && turnId) connection.send({ id: -1, method: "turn/interrupt", params: { threadId, turnId } });
 		};
@@ -268,7 +291,7 @@ export class CodexAppServerRunner {
 		process.once("SIGTERM", abort);
 		const timer = setTimeout(() => {
 			interrupt();
-			rejectTurn(codexError("Codex research task exceeded its runtime budget"));
+			rejectTurn(new CodexRuntimeBudgetError(options.timeoutMs));
 		}, options.timeoutMs);
 		try {
 			await mkdir(dirname(options.logPath), { recursive: true });
@@ -300,7 +323,7 @@ export class CodexAppServerRunner {
 						++toolCalls > options.maxToolCalls
 					) {
 						interrupt();
-						rejectTurn(codexError("Codex research task exceeded its tool-call budget"));
+						rejectTurn(new CodexToolBudgetError(options.maxToolCalls));
 					}
 				}
 				if (method === "item/completed") {
@@ -342,8 +365,16 @@ export class CodexAppServerRunner {
 						try {
 							// A native search completion must be receipted before a subsequent host tool lists sources.
 							await log;
-							if (!tool || !Value.Check(tool.inputSchema, params.arguments))
-								throw new Error("Invalid Astra tool request");
+							if (!tool) throw new Error("Unknown Astra tool");
+							if (!Value.Check(tool.inputSchema, params.arguments))
+								throw new Error(
+									`Invalid Astra tool request: ${Value.Errors(tool.inputSchema, params.arguments)
+										.map(
+											(error) =>
+												`${error.instancePath || "/"}: ${error.message} (${JSON.stringify(error.params)})`,
+										)
+										.join("; ")}`,
+								);
 							if (toolCalls > options.maxToolCalls) throw new Error("Tool budget exhausted");
 							const value = await tool.execute(params.arguments);
 							connection.send({
@@ -430,25 +461,50 @@ export class CodexAppServerRunner {
 			);
 			await options.onThread(threadId);
 			if (failure) throw failure;
-			const turn = record(
-				await connection.request("turn/start", {
-					threadId,
-					input: [{ type: "text", text: options.prompt, text_elements: [] }],
-					outputSchema: options.schema,
-				}),
-			);
-			turnId = String(record(turn.turn).id ?? turnId);
-			await completed;
-			await log;
-			let output: unknown;
-			try {
-				output = JSON.parse(finalText);
-			} catch {
-				throw codexError("Codex did not return a JSON research result");
+			let prompt = options.prompt;
+			for (let attempt = 0; ; attempt++) {
+				if (failure) throw failure;
+				const turn = record(
+					await connection.request("turn/start", {
+						threadId,
+						input: [{ type: "text", text: prompt, text_elements: [] }],
+						outputSchema: options.schema,
+					}),
+				);
+				turnId = String(record(turn.turn).id ?? turnId);
+				await completed;
+				await log;
+				try {
+					let output: unknown;
+					try {
+						output = JSON.parse(finalText);
+					} catch {
+						throw codexError("Codex did not return a JSON research result");
+					}
+					if (!Value.Check(options.schema, output))
+						throw codexError("Codex final output does not match the requested research schema");
+					options.validateOutput?.(output as Static<S>);
+					return {
+						output: output as Static<S>,
+						model: String(started.model),
+						threadId,
+						sessionFile: options.logPath,
+					};
+				} catch (error) {
+					const reason = error instanceof Error ? error.message : String(error);
+					const retry = Boolean(options.validateOutput) && attempt === 0;
+					await appendFile(
+						options.logPath,
+						`${JSON.stringify({ method: "astra/output_rejected", params: { threadId, turnId, attempt: attempt + 1, retry, reason } })}\n`,
+						{ mode: 0o600 },
+					);
+					if (!retry) throw error;
+					prompt = `Astra final submission rejected: ${reason}. Correct only the final submission in this same session. Keep the scientific judgment and all original requirements; do not repeat research. If using a validated receipt, copy the tool's finalOutput exactly. The original tool and runtime budgets still apply. This is the only automatic correction attempt.`;
+					finalText = "";
+					completed = waitForCompletion();
+					void completed.catch(() => {});
+				}
 			}
-			if (!Value.Check(options.schema, output))
-				throw codexError("Codex final output does not match the requested research schema");
-			return { output: output as Static<S>, model: String(started.model), threadId, sessionFile: options.logPath };
 		} finally {
 			clearTimeout(timer);
 			process.off("SIGINT", abort);

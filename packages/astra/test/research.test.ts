@@ -26,7 +26,10 @@ async function workerTask(job: ResearchJob, objective: string, id = `task-${obje
 	const repairChecks = Object.values(job.state.obligations)
 		.filter((issue) => issue.status === "open")
 		.flatMap((issue) =>
-			(issue.items ?? []).map((item) => ({ issueId: item.id, criterion: `[${item.id}] ${item.criterion}` })),
+			(issue.items ?? []).map((item) => ({
+				issueId: item.id,
+				criterion: job.repairCriterion(`[${item.id}] ${item.criterion}`),
+			})),
 		);
 	const task = await job.dispatchTask({
 		repairChecks,

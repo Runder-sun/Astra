@@ -1,8 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, cp, mkdir, readFile, rename, rm } from "node:fs/promises";
+import { access, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { archiveAndPruneTasks, cleanupTaskFiles } from "./cleanup-files.ts";
 import { assertAstraId, atomicWriteJson, canonicalArtifactPath, canonicalReceiptPath, sha256 } from "./contracts.ts";
-import { planReviewStatus } from "./plan-review.ts";
+import {
+	backtrackChecksFromSnapshot,
+	buildEffectiveTaskContract,
+	EffectiveContractUnavailableError,
+	type EffectiveTaskContract,
+	planGenerationBasisHash,
+	repairContext,
+	resolveRepairInputFromSnapshot,
+	searchBatchForPlan,
+	sourceTaskContractHash,
+	taskContractMatches,
+} from "./effective-contract.ts";
+import {
+	evidenceHasCurrentPlanApprovalFromSnapshot,
+	planEvidence as planReviewEvidence,
+	planReviewStatus,
+} from "./plan-review.ts";
 import { captureGitVersion } from "./project-version.ts";
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
 import {
@@ -18,12 +35,14 @@ import { DEFAULT_STAGES, stageMap } from "./stages.ts";
 import type { AstraStore } from "./store.ts";
 import { freezeEvidenceFiles } from "./task-workspace.ts";
 import type {
+	AdoptionCompletion,
 	AstraEvent,
 	AutomationLevel,
 	BudgetLimit,
 	CandidateEvaluation,
 	CanonicalArtifact,
 	ClaimAssessment,
+	CleanupIntent,
 	DiscardedCandidateReceipt,
 	DiscardedEvidenceReceipt,
 	Evidence,
@@ -34,13 +53,12 @@ import type {
 	MissionFrame,
 	Obligation,
 	ProviderBackoffState,
-	ResearchEdge,
 	ResearchNode,
 	RetiredArtifactReceipt,
 	Review,
+	ReviewConsequences,
 	ScientificOutcome,
 	SearchBatch,
-	SearchCandidate,
 	StageDefinition,
 	StagePlanManifest,
 	StageRouteDecision,
@@ -53,6 +71,10 @@ import type {
 
 const DEFAULT_SEARCH_MAX_ROUNDS = 2;
 export const MAX_TASK_ATTEMPTS = 3;
+export class StaleResearchJobError extends Error {}
+
+export class StaleResearchInputError extends Error {}
+
 export class ResearchTaskBudgetError extends Error {
 	constructor() {
 		super("research task budget exhausted");
@@ -201,6 +223,7 @@ function mainSessionId(jobId: string): string {
 }
 
 function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
+	snapshot.cleanupIntents ??= {};
 	snapshot.stagePlans ??= {};
 	snapshot.graph ??= createResearchGraph(snapshot.frame.jobId, snapshot.frame.objective);
 	snapshot.searchBatches ??= {};
@@ -245,6 +268,31 @@ function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
 		}
 	}
 	return snapshot;
+}
+
+function dependentEvidenceRefs(snapshot: JobSnapshot, initialRefs: Iterable<string>): Set<string> {
+	const refs = new Set(initialRefs);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const evidence of Object.values(snapshot.evidence)) {
+			if (refs.has(evidence.id) || !snapshot.tasks[evidence.taskId]?.inputArtifactRefs.some((ref) => refs.has(ref)))
+				continue;
+			refs.add(evidence.id);
+			changed = true;
+		}
+		for (const artifact of Object.values(snapshot.canonical)) {
+			if (refs.has(artifact.id) && !refs.has(artifact.evidenceId)) {
+				refs.add(artifact.evidenceId);
+				changed = true;
+			}
+			if (refs.has(artifact.evidenceId) && !refs.has(artifact.id)) {
+				refs.add(artifact.id);
+				changed = true;
+			}
+		}
+	}
+	return refs;
 }
 
 export class ResearchJob {
@@ -308,6 +356,7 @@ export class ResearchJob {
 		) as Record<string, StageState>;
 		stages[firstStage].status = "running";
 		const snapshot: JobSnapshot = {
+			cleanupIntents: {},
 			version: 1,
 			stageDefinitions: structuredClone(definitions),
 			frame,
@@ -374,10 +423,11 @@ export class ResearchJob {
 	}
 
 	async reload(): Promise<void> {
-		await this.commitChain;
-		const latest = await ResearchJob.open(this.store, this.snapshot.frame.jobId);
-		if (!latest) throw new Error(`research job not found: ${this.snapshot.frame.jobId}`);
-		this.snapshot = latest.state;
+		return this.enqueue(async () => {
+			const latest = await ResearchJob.open(this.store, this.snapshot.frame.jobId);
+			if (!latest) throw new Error(`research job not found: ${this.snapshot.frame.jobId}`);
+			this.snapshot = latest.snapshot;
+		});
 	}
 
 	status(): JobStatus {
@@ -455,10 +505,12 @@ export class ResearchJob {
 	}
 
 	async consumeTurns(turns: number): Promise<void> {
-		if (!Number.isInteger(turns) || turns <= 0) throw new Error("turn usage must be a positive integer");
-		const block = this.budgetBlock({ turns });
-		if (block) throw new Error(block.reason);
-		await this.commit({ type: "budget_usage_recorded", turns, costUsd: 0 });
+		return this.exclusive(async () => {
+			if (!Number.isInteger(turns) || turns <= 0) throw new Error("turn usage must be a positive integer");
+			const block = this.budgetBlock({ turns });
+			if (block) throw new Error(block.reason);
+			await this.appendEvent({ type: "budget_usage_recorded", turns, costUsd: 0 });
+		});
 	}
 
 	async recordCost(costUsd: number): Promise<void> {
@@ -468,10 +520,12 @@ export class ResearchJob {
 	}
 
 	async refundTurns(turns: number): Promise<void> {
-		if (!Number.isInteger(turns) || turns <= 0) throw new Error("turn refund must be a positive integer");
-		const used = this.snapshot.budgetUsage?.turnsUsed ?? 0;
-		if (turns > used) throw new Error("turn refund cannot exceed turns used");
-		await this.commit({ type: "budget_turns_refunded", turns });
+		return this.exclusive(async () => {
+			if (!Number.isInteger(turns) || turns <= 0) throw new Error("turn refund must be a positive integer");
+			const used = this.snapshot.budgetUsage?.turnsUsed ?? 0;
+			if (turns > used) throw new Error("turn refund cannot exceed turns used");
+			await this.appendEvent({ type: "budget_turns_refunded", turns });
+		});
 	}
 
 	async recordProviderBackoff(backoff: ProviderBackoffState): Promise<void> {
@@ -494,17 +548,19 @@ export class ResearchJob {
 	}
 
 	async updateBudget(update: Partial<MissionFrame["budget"]>): Promise<void> {
-		const budget = { ...this.snapshot.frame.budget, ...update };
-		validateBudget(budget);
-		const usage = this.snapshot.budgetUsage ?? { turnsUsed: 0, costUsdUsed: 0 };
-		if (budget.maxTasks < Object.keys(this.snapshot.tasks).length) {
-			throw new Error("maxTasks cannot be lower than tasks already created");
-		}
-		if (budget.maxTurns < usage.turnsUsed) throw new Error("maxTurns cannot be lower than turns already used");
-		if (budget.maxCostUsd !== undefined && budget.maxCostUsd < usage.costUsdUsed) {
-			throw new Error("maxCostUsd cannot be lower than cost already used");
-		}
-		await this.commit({ type: "budget_updated", budget });
+		return this.exclusive(async () => {
+			const budget = { ...this.snapshot.frame.budget, ...update };
+			validateBudget(budget);
+			const usage = this.snapshot.budgetUsage ?? { turnsUsed: 0, costUsdUsed: 0 };
+			if (budget.maxTasks < Object.keys(this.snapshot.tasks).length) {
+				throw new Error("maxTasks cannot be lower than tasks already created");
+			}
+			if (budget.maxTurns < usage.turnsUsed) throw new Error("maxTurns cannot be lower than turns already used");
+			if (budget.maxCostUsd !== undefined && budget.maxCostUsd < usage.costUsdUsed) {
+				throw new Error("maxCostUsd cannot be lower than cost already used");
+			}
+			await this.appendEvent({ type: "budget_updated", budget });
+		});
 	}
 
 	async setAutomation(automation: AutomationLevel): Promise<void> {
@@ -536,26 +592,32 @@ export class ResearchJob {
 	}
 
 	async acquireLease(owner: string, ttlMs = 30_000): Promise<Lease> {
-		const now = Date.now();
-		const existing = this.snapshot.lease;
-		if (existing && Date.parse(existing.expiresAt) > now && existing.owner !== owner) {
-			throw new Error(`research supervisor lease held by ${existing.owner}`);
-		}
-		const lease: Lease = {
-			owner,
-			heartbeatAt: new Date(now).toISOString(),
-			expiresAt: new Date(now + ttlMs).toISOString(),
-		};
-		await this.commit({ type: "lease_acquired", lease });
-		return lease;
+		return this.exclusive(async () => {
+			const now = Date.now();
+			const existing = this.snapshot.lease;
+			if (existing && Date.parse(existing.expiresAt) > now && existing.owner !== owner) {
+				throw new Error(`research supervisor lease held by ${existing.owner}`);
+			}
+			const lease: Lease = {
+				owner,
+				heartbeatAt: new Date(now).toISOString(),
+				expiresAt: new Date(now + ttlMs).toISOString(),
+			};
+			await this.appendEvent({ type: "lease_acquired", lease });
+			return lease;
+		});
 	}
 
 	async releaseLease(owner: string): Promise<void> {
-		if (this.snapshot.lease?.owner !== owner) return;
-		await this.commit({ type: "lease_released", owner });
+		return this.exclusive(async () => {
+			if (this.snapshot.lease?.owner !== owner) return;
+			await this.appendEvent({ type: "lease_released", owner });
+		});
 	}
 
-	async recordStagePlan(plan: StagePlanManifest): Promise<StagePlanManifest> {
+	async recordStagePlan(plan: StagePlanManifest, generationSnapshot?: JobSnapshot): Promise<StagePlanManifest> {
+		plan = { ...plan };
+		delete plan.generationBasisHash;
 		if (plan.jobId !== this.snapshot.frame.jobId) throw new Error("stage plan job id does not match active job");
 		if (plan.stageId !== this.snapshot.frame.activeStageId)
 			throw new Error("stage plan does not target the active stage");
@@ -606,6 +668,75 @@ export class ResearchJob {
 					throw new Error(`stage plan references unknown input artifact ${ref}`);
 				}
 			}
+			const bindingIds = task.responsibilityBindings?.map((binding) => binding.nodeId) ?? [];
+			if (new Set(bindingIds).size !== bindingIds.length) {
+				throw new Error(`stage plan task ${task.key} duplicates a responsibility binding`);
+			}
+			const transferIds = (task.responsibilityTransfers ?? []).map(
+				(transfer) => transfer.nodeId ?? transfer.issueId,
+			);
+			if (new Set(transferIds).size !== transferIds.length)
+				throw new Error("stage plan duplicates a responsibility transfer");
+			if ((task.responsibilityTransfers?.length ?? 0) > 0) {
+				for (const transfer of task.responsibilityTransfers ?? []) {
+					const sourceTask = this.snapshot.tasks[transfer.sourceTaskId];
+					const sourceEvidence = Object.values(this.snapshot.evidence).find(
+						(evidence) => evidence.taskId === transfer.sourceTaskId,
+					);
+					if (
+						task.deliveryKind !== "local" ||
+						!sourceTask ||
+						sourceTask.stageId !== plan.stageId ||
+						sourceTask.status !== "succeeded" ||
+						!sourceEvidence ||
+						!task.inputArtifactRefs.includes(sourceEvidence.id) ||
+						transfer.sourceContractHash !== sourceTaskContractHash(sourceTask) ||
+						transfer.sourceField !== "acceptanceChecks" ||
+						!Number.isInteger(transfer.sourceIndex) ||
+						sourceTask.acceptanceChecks[transfer.sourceIndex] !== transfer.exactCriterion ||
+						transfer.destinationStageId !== plan.stageId ||
+						transfer.destinationPhase !== "synthesis" ||
+						!transfer.rationale.trim() ||
+						Boolean(transfer.nodeId) === Boolean(transfer.issueId) ||
+						!(transfer.nodeId
+							? this.backtrackChecks(plan.stageId).some(
+									(check) => check.nodeId === transfer.nodeId && check.criterion === transfer.exactCriterion,
+								) &&
+								(!sourceTask.responsibilityBindings?.length ||
+									sourceTask.responsibilityBindings.some(
+										(binding) => binding.nodeId === transfer.nodeId && binding.stageId === plan.stageId,
+									))
+							: Object.values(this.snapshot.obligations).some((obligation) =>
+									(obligation.items ?? []).some(
+										(item) =>
+											item.id === transfer.issueId &&
+											item.status === "open" &&
+											item.criterion === transfer.exactCriterion &&
+											this.snapshot.evidence[
+												this.snapshot.reviews[obligation.sourceReviewId]?.evidenceId ?? ""
+											]?.taskId === sourceTask.id,
+									),
+								))
+					)
+						throw new Error("stage plan responsibility transfer does not match a bound source requirement");
+				}
+			}
+
+			for (const binding of task.responsibilityBindings ?? []) {
+				const node = this.snapshot.graph.nodes[binding.nodeId];
+				const expectedPhase = task.deliveryKind === "synthesis" ? "synthesis" : "stage";
+				if (
+					task.deliveryKind === "local" ||
+					binding.stageId !== plan.stageId ||
+					binding.phase !== expectedPhase ||
+					!node ||
+					node.stageId !== binding.stageId ||
+					node.status !== "open" ||
+					!this.backtrackChecks(plan.stageId).some((check) => check.nodeId === binding.nodeId)
+				) {
+					throw new Error(`stage plan task ${task.key} has an invalid responsibility binding ${binding.nodeId}`);
+				}
+			}
 		}
 		if (plan.obligationId) {
 			const obligation = this.snapshot.obligations[plan.obligationId];
@@ -613,7 +744,11 @@ export class ResearchJob {
 				throw new Error("repair stage plan requires an open obligation");
 			const failed = this.snapshot.evidence[this.snapshot.reviews[obligation.sourceReviewId]?.evidenceId];
 			const failedTask = failed ? this.snapshot.tasks[failed.taskId] : undefined;
-			if (failedTask && (plan.tasks[0].deliveryKind ?? "stage") !== (failedTask.deliveryKind ?? "stage"))
+			if (
+				failedTask &&
+				(plan.tasks[0].deliveryKind ?? "stage") !== (failedTask.deliveryKind ?? "stage") &&
+				!(plan.tasks[0].deliveryKind === "local" && (plan.tasks[0].responsibilityTransfers?.length ?? 0) > 0)
+			)
 				throw new Error("repair plan must preserve the failed task delivery kind");
 		}
 		if (plan.tasks.some((task) => task.deliveryKind === "synthesis") && plan.tasks.length !== 1)
@@ -636,7 +771,10 @@ export class ResearchJob {
 		}
 		const existing = this.snapshot.stagePlans[plan.id];
 		if (existing) {
-			if (checksum(existing) !== checksum(plan))
+			if (
+				checksum({ ...existing, generationBasisHash: undefined }) !==
+				checksum({ ...plan, generationBasisHash: undefined })
+			)
 				throw new Error(`stage plan id ${plan.id} already has different content`);
 			if (
 				plan.mode === "search" &&
@@ -646,74 +784,34 @@ export class ResearchJob {
 			}
 			return structuredClone(existing);
 		}
+		if (generationSnapshot)
+			plan.generationBasisHash = planGenerationBasisHash(generationSnapshot, this.definitions, plan);
 		await this.commit({ type: "stage_plan_recorded", plan });
 		if (plan.mode === "search") await this.recordSearchBatch(plan, definition);
 		return structuredClone(plan);
 	}
 
 	private async recordSearchBatch(plan: StagePlanManifest, definition: StageDefinition): Promise<void> {
-		const now = new Date().toISOString();
-		const policy = definition.searchPolicy ?? {
-			strategy: "diverse-candidates" as const,
-			minCandidates: 2,
-			maxCandidates: 4,
-			criteria: definition.acceptanceChecks,
-		};
-		const batchId = `search_${checksum({ jobId: plan.jobId, planId: plan.id }).slice(0, 24)}`;
-		if (this.snapshot.searchBatches[batchId]) return;
-		const previousBatch = this.pendingSearchContinuation(plan.stageId);
-		const maxRounds = previousBatch?.maxRounds ?? policy.maxRounds ?? DEFAULT_SEARCH_MAX_ROUNDS;
-		const round = previousBatch ? previousBatch.round + 1 : 1;
-		if (!Number.isInteger(maxRounds) || maxRounds <= 0)
-			throw new Error("search maxRounds must be a positive integer");
-		if (round > maxRounds) throw new Error(`search round ${round} exceeds the maximum of ${maxRounds}`);
-		const nodes: ResearchNode[] = [];
-		const edges: ResearchEdge[] = [];
-		const candidates: Record<string, SearchCandidate> = {};
-		for (const task of plan.tasks) {
-			const candidateId = `candidate_${checksum({ batchId, key: task.key }).slice(0, 24)}`;
-			const node = createResearchNode({
-				id: `hypothesis_${checksum({ batchId, key: task.key }).slice(0, 24)}`,
+		if (Object.values(this.snapshot.searchBatches).some((batch) => batch.planId === plan.id)) return;
+		const batch = searchBatchForPlan(this.snapshot, definition, plan);
+		const nodes = Object.values(batch.candidates).map((candidate) =>
+			createResearchNode({
+				id: candidate.graphNodeId,
 				kind: "hypothesis",
-				statement: task.hypothesis ?? task.objective,
+				statement: candidate.hypothesis,
 				stageId: plan.stageId,
-				domainRef: candidateId,
+				domainRef: candidate.id,
 				sourceRefs: [`stage-plan:${plan.id}`, plan.sessionRef],
-			});
-			nodes.push(node);
-			edges.push(
-				createResearchEdge({
-					fromNodeId: this.snapshot.graph.rootQuestionId,
-					toNodeId: node.id,
-					kind: "refines",
-					sourceRefs: [`stage-plan:${plan.id}`],
-				}),
-			);
-			candidates[candidateId] = {
-				id: candidateId,
-				key: task.key,
-				hypothesis: node.statement,
-				status: "planned",
-				graphNodeId: node.id,
-			};
-		}
-		const batch: SearchBatch = {
-			id: batchId,
-			stageId: plan.stageId,
-			planId: plan.id,
-			round,
-			maxRounds,
-			...(previousBatch ? { previousBatchId: previousBatch.id } : {}),
-			objective: `Search alternatives for ${definition.label}`,
-			strategy: policy.strategy,
-			status: "planning",
-			minCandidates: policy.minCandidates,
-			maxCandidates: policy.maxCandidates,
-			criteria: policy.criteria,
-			candidates,
-			createdAt: now,
-			updatedAt: now,
-		};
+			}),
+		);
+		const edges = nodes.map((node) =>
+			createResearchEdge({
+				fromNodeId: this.snapshot.graph.rootQuestionId,
+				toNodeId: node.id,
+				kind: "refines",
+				sourceRefs: [`stage-plan:${plan.id}`],
+			}),
+		);
 		await this.commit({ type: "search_batch_recorded", batch, nodes, edges });
 	}
 
@@ -744,61 +842,50 @@ export class ResearchJob {
 	}
 
 	async reopenStage(targetStageId: string, decisionRef: string, reason: string): Promise<void> {
-		if (!this.definitions[targetStageId]) throw new Error(`unknown stage ${targetStageId}`);
-		const invalidArtifactIds = new Set(
-			Object.values(this.snapshot.canonical)
-				.filter(
-					(artifact) =>
-						artifact.status === "active" &&
-						this.snapshot.evidence[artifact.evidenceId]?.stageId === targetStageId,
-				)
-				.map((artifact) => artifact.id),
-		);
-		let changed = true;
-		while (changed) {
-			changed = false;
-			for (const artifact of Object.values(this.snapshot.canonical)) {
-				if (artifact.status !== "active" || invalidArtifactIds.has(artifact.id)) continue;
-				const evidence = this.snapshot.evidence[artifact.evidenceId];
-				const task = evidence ? this.snapshot.tasks[evidence.taskId] : undefined;
-				if (task?.inputArtifactRefs.some((ref) => invalidArtifactIds.has(ref))) {
-					invalidArtifactIds.add(artifact.id);
-					changed = true;
-				}
+		return this.exclusive(async () => {
+			if (!this.definitions[targetStageId]) throw new Error(`unknown stage ${targetStageId}`);
+			const already = Object.values(this.snapshot.graph.nodes).some(
+				(node) => node.kind === "objection" && node.domainRef === decisionRef && node.stageId === targetStageId,
+			);
+			if (already) {
+				await this.finishCleanupsInternal();
+				return;
 			}
-		}
-		const affectedStageIds = [
-			...new Set([
+			const invalidRefs = dependentEvidenceRefs(
+				this.snapshot,
+				Object.values(this.snapshot.evidence)
+					.filter((evidence) => evidence.stageId === targetStageId)
+					.map((evidence) => evidence.id),
+			);
+			const invalidArtifactIds = Object.values(this.snapshot.canonical)
+				.filter((artifact) => artifact.status === "active" && invalidRefs.has(artifact.id))
+				.map((artifact) => artifact.id);
+			const affectedStageIds = [...new Set([targetStageId, ...this.dependentStageIds(invalidRefs)])];
+			const cleanups = await Promise.all(invalidArtifactIds.map((id) => this.retirementIntent(id)));
+			const objection = createResearchNode({
+				kind: "objection",
+				statement: reason,
+				status: "open",
+				stageId: targetStageId,
+				domainRef: decisionRef,
+				sourceRefs: [decisionRef],
+			});
+			await this.appendEvent({
+				type: "stage_reopened",
 				targetStageId,
-				...[...invalidArtifactIds].flatMap((artifactId) => {
-					const artifact = this.snapshot.canonical[artifactId];
-					const stageId = artifact ? this.snapshot.evidence[artifact.evidenceId]?.stageId : undefined;
-					return stageId ? [stageId] : [];
-				}),
-			]),
-		];
-		for (const artifactId of invalidArtifactIds) await this.retireArtifact(artifactId);
-		const objection = createResearchNode({
-			kind: "objection",
-			statement: reason,
-			status: "open",
-			stageId: targetStageId,
-			domainRef: decisionRef,
-			sourceRefs: [decisionRef],
-		});
-		await this.commit({
-			type: "stage_reopened",
-			targetStageId,
-			affectedStageIds,
-			decisionRef,
-			reason,
-			objection,
+				affectedStageIds,
+				decisionRef,
+				reason,
+				objection,
+				cleanups,
+			});
+			await this.finishCleanupsInternal();
 		});
 	}
 
-	private async retireArtifact(artifactId: string, replacementId?: string): Promise<void> {
+	private async retirementIntent(artifactId: string, replacementId?: string): Promise<CleanupIntent> {
 		const artifact = this.snapshot.canonical[artifactId];
-		if (!artifact || artifact.status === "retired") return;
+		if (!artifact || artifact.status === "retired") throw new Error("retirement requires an existing artifact");
 		const evidence = this.snapshot.evidence[artifact.evidenceId];
 		if (!evidence) throw new Error(`canonical artifact ${artifactId} has no evidence lineage`);
 		const reviewIds = Object.values(this.snapshot.reviews)
@@ -823,68 +910,44 @@ export class ResearchJob {
 			),
 			retiredAt: new Date().toISOString(),
 		};
-		if (artifact.materializationRef) await rm(artifact.materializationRef, { force: true });
-		const archiveRefs = await this.pruneTaskFiles([evidence.taskId, ...reviewerTaskIds]);
-		if (archiveRefs.length > 0) receipt.archiveRefs = archiveRefs;
-		if (receipt.materializationReceiptRef) {
-			try {
-				await atomicWriteJson(receipt.materializationReceiptRef, {
-					schemaVersion: "astra.retired_artifact_receipt.v1",
-					...receipt,
-				});
-			} catch (error) {
-				if (
-					(error as NodeJS.ErrnoException).code !== "ENOENT" &&
-					(error as NodeJS.ErrnoException).code !== "EACCES"
-				)
-					throw error;
-			}
-		}
-		await this.commit({ type: "artifact_retired", receipt });
+		receipt.cleanupStatus = "pending";
+		return {
+			id: `retirement:${artifactId}`,
+			kind: "retirement",
+			receipt,
+			materializationRef: artifact.materializationRef,
+			status: "pending",
+			tasks: await cleanupTaskFiles(this.snapshot, [evidence.taskId, ...reviewerTaskIds]),
+		};
 	}
 
-	private async pruneTaskFiles(taskIds: string[]): Promise<string[]> {
-		const uniqueTaskIds = new Set(taskIds);
-		const jobRoot = join(this.snapshot.frame.permissions.workspaceRoot, ".astra", "jobs", this.snapshot.frame.jobId);
-		const archiveRefs: string[] = [];
-		for (const taskId of uniqueTaskIds) {
-			const archiveRoot = join(jobRoot, "archive", "tasks", taskId);
-			let archived = false;
-			try {
-				await cp(join(jobRoot, "workspaces", taskId), join(archiveRoot, "workspace"), {
-					recursive: true,
-					force: true,
-				});
-				archived = true;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	/** Intent supplies stable paths even after its logical pruning removed live evidence/reviews. */
+	private async finishCleanupsInternal(): Promise<void> {
+		for (const intent of Object.values(this.snapshot.cleanupIntents ?? {})) {
+			if (intent.status === "completed") continue;
+			const archiveRefs = await archiveAndPruneTasks(this.snapshot, intent.tasks);
+			if (intent.kind === "retirement") {
+				if (intent.materializationRef) await rm(intent.materializationRef, { force: true });
+				if (intent.receipt.materializationReceiptRef) {
+					try {
+						await atomicWriteJson(intent.receipt.materializationReceiptRef, {
+							schemaVersion: "astra.retired_artifact_receipt.v1",
+							...intent.receipt,
+							archiveRefs,
+							cleanupStatus: "completed",
+						});
+					} catch (error) {
+						if (!["ENOENT", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+					}
+				}
 			}
-			try {
-				await cp(join(jobRoot, "tasks", taskId), join(archiveRoot, "task"), {
-					recursive: true,
-					force: true,
-				});
-				archived = true;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-			if (archived) archiveRefs.push(archiveRoot);
-			try {
-				await access(join(jobRoot, "resources", taskId));
-				await mkdir(archiveRoot, { recursive: true });
-				await rm(join(archiveRoot, "resources"), { recursive: true, force: true });
-				await rename(join(jobRoot, "resources", taskId), join(archiveRoot, "resources"));
-				if (!archived) archiveRefs.push(archiveRoot);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-			await rm(join(jobRoot, "workspaces", taskId), { recursive: true, force: true });
-			await rm(join(jobRoot, "tasks", taskId), { recursive: true, force: true });
+			await this.appendEvent({
+				type: "cleanup_completed",
+				intentId: intent.id,
+				archiveRefs,
+				completedAt: new Date().toISOString(),
+			});
 		}
-		for (const session of Object.values(this.snapshot.sessions)) {
-			if (uniqueTaskIds.has(session.taskId) && session.sessionFile) await rm(session.sessionFile, { force: true });
-		}
-		return archiveRefs;
 	}
 
 	async dispatchTask(
@@ -902,58 +965,73 @@ export class ResearchJob {
 			| "createdAt"
 		> & { id?: string; agentId?: string; replayKey?: string; attempt?: number },
 	): Promise<TaskPacket> {
-		if (this.snapshot.paused) throw new Error("research job is paused");
-		const replayKey = input.replayKey ?? `${this.snapshot.frame.jobId}:${input.stageId}:${input.objective}`;
-		const duplicate = Object.values(this.snapshot.tasks).find(
-			(task) => task.replayKey === replayKey && task.status !== "failed",
-		);
-		if (duplicate) return structuredClone(duplicate);
-		if (Object.keys(this.snapshot.tasks).length >= this.snapshot.frame.budget.maxTasks) {
-			throw new ResearchTaskBudgetError();
-		}
-		this.assertCurrentInputs(input.inputArtifactRefs, input.repairOfEvidenceId);
-		if (input.role === "worker" && input.planId) {
-			if (planReviewStatus(this, input.planId) !== "passed")
-				throw new Error("worker dispatch requires an independently approved plan");
-			const planned = this.snapshot.stagePlans[input.planId]?.tasks.find(
-				(task) => input.replayKey === `stage-plan:${input.planId}:${task.key}`,
+		return this.exclusive(async () => {
+			await this.finishCleanupsInternal();
+			if (this.snapshot.paused) throw new Error("research job is paused");
+			const replayKey = input.replayKey ?? `${this.snapshot.frame.jobId}:${input.stageId}:${input.objective}`;
+			this.assertCurrentInputs(input.inputArtifactRefs, input.repairOfEvidenceId);
+			let reviewedContract: ReturnType<typeof buildEffectiveTaskContract> | undefined;
+			let legacyReviewedPlan = false;
+			if (input.role === "worker" && input.planId) {
+				if (planReviewStatus(this, input.planId) !== "passed")
+					throw new Error("worker dispatch requires an independently approved plan");
+				const plan = this.snapshot.stagePlans[input.planId];
+				const planned = plan?.tasks.find((task) => input.replayKey === `stage-plan:${input.planId}:${task.key}`);
+				if (!plan || !planned) throw new Error("worker contract differs from the reviewed plan");
+				const frozen = planReviewEvidence(this, input.planId);
+				legacyReviewedPlan = !Array.isArray(
+					(frozen?.content as { effectiveContracts?: unknown } | undefined)?.effectiveContracts,
+				);
+				if (!legacyReviewedPlan) reviewedContract = buildEffectiveTaskContract(this, plan, planned);
+			}
+			const duplicate = Object.values(this.snapshot.tasks).find(
+				(task) => task.replayKey === replayKey && task.status !== "failed",
 			);
+			if (duplicate) {
+				if (reviewedContract && !taskContractMatches(duplicate, reviewedContract))
+					throw new Error("existing worker task differs from the frozen reviewed plan");
+				if (legacyReviewedPlan && duplicate.planId !== input.planId)
+					throw new Error("legacy reviewed plan cannot dispatch a different worker task");
+				return structuredClone(duplicate);
+			}
+			if (legacyReviewedPlan)
+				throw new Error("legacy reviewed plan cannot dispatch or retry workers without a frozen contract");
+			if (Object.keys(this.snapshot.tasks).length >= this.snapshot.frame.budget.maxTasks) {
+				throw new ResearchTaskBudgetError();
+			}
+			if (input.role === "worker") {
+				const repairObligationId = input.repairOfEvidenceId
+					? this.snapshot.frame.openObligationIds.find(
+							(id) =>
+								this.snapshot.reviews[this.snapshot.obligations[id].sourceReviewId]?.evidenceId ===
+								input.repairOfEvidenceId,
+						)
+					: undefined;
+				this.assertDeliveryInputs(input.stageId, input.deliveryKind, input.inputArtifactRefs, repairObligationId);
+			}
+			const task: TaskPacket = {
+				...input,
+				stageRevision: this.snapshot.stages[input.stageId]?.revision ?? 1,
+				schemaVersion: "astra.task_packet.v1",
+				id: input.id ?? `task_${randomUUID()}`,
+				jobId: this.snapshot.frame.jobId,
+				agentId: input.agentId ?? `${input.role}_${randomUUID()}`,
+				runnerKind: "pi-session",
+				outputManifestRequired: true,
+				replayKey,
+				attempt: input.attempt ?? 1,
+				status: "ready",
+				createdAt: new Date().toISOString(),
+			};
 			if (
-				!planned ||
-				planned.objective !== input.objective ||
-				(planned.deliveryKind ?? "stage") !== (input.deliveryKind ?? "stage") ||
-				planned.requiredOutputFields.some((field) => !input.requiredOutputFields.includes(field)) ||
-				planned.acceptanceChecks.some((check) => !input.acceptanceChecks.includes(check)) ||
-				planned.inputArtifactRefs.some((ref) => !input.inputArtifactRefs.includes(ref))
+				input.role === "worker" &&
+				input.planId &&
+				(!reviewedContract || !taskContractMatches(task, reviewedContract))
 			)
-				throw new Error("worker contract differs from the reviewed plan");
-		}
-		if (input.role === "worker") {
-			const repairObligationId = input.repairOfEvidenceId
-				? this.snapshot.frame.openObligationIds.find(
-						(id) =>
-							this.snapshot.reviews[this.snapshot.obligations[id].sourceReviewId]?.evidenceId ===
-							input.repairOfEvidenceId,
-					)
-				: undefined;
-			this.assertDeliveryInputs(input.stageId, input.deliveryKind, input.inputArtifactRefs, repairObligationId);
-		}
-		const task: TaskPacket = {
-			...input,
-			stageRevision: this.snapshot.stages[input.stageId]?.revision ?? 1,
-			schemaVersion: "astra.task_packet.v1",
-			id: input.id ?? `task_${randomUUID()}`,
-			jobId: this.snapshot.frame.jobId,
-			agentId: input.agentId ?? `${input.role}_${randomUUID()}`,
-			runnerKind: "pi-session",
-			outputManifestRequired: true,
-			replayKey,
-			attempt: input.attempt ?? 1,
-			status: "ready",
-			createdAt: new Date().toISOString(),
-		};
-		await this.commit({ type: "task_dispatched", task });
-		return task;
+				throw new Error("worker contract differs from the frozen reviewed plan");
+			await this.appendEvent({ type: "task_dispatched", task });
+			return task;
+		});
 	}
 
 	unsynthesizedLocalEvidence(stageId: string): Evidence[] {
@@ -964,13 +1042,37 @@ export class ResearchJob {
 		const consumed = new Set(sourceTask?.inputArtifactRefs ?? []);
 		return Object.values(this.snapshot.evidence).filter((evidence) => {
 			const task = this.snapshot.tasks[evidence.taskId];
-			return (
-				evidence.stageId === stageId &&
-				evidence.status === "accepted" &&
-				task?.deliveryKind === "local" &&
-				(task.stageRevision ?? 1) === (this.snapshot.stages[stageId]?.revision ?? 1) &&
-				!consumed.has(evidence.id)
-			);
+			if (
+				!(
+					evidence.stageId === stageId &&
+					evidence.status === "accepted" &&
+					task?.deliveryKind === "local" &&
+					(task.stageRevision ?? 1) === (this.snapshot.stages[stageId]?.revision ?? 1) &&
+					!consumed.has(evidence.id)
+				)
+			)
+				return false;
+			try {
+				this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+				return true;
+			} catch (error) {
+				if (error instanceof StaleResearchInputError || error instanceof EffectiveContractUnavailableError)
+					return false;
+				throw error;
+			}
+		});
+	}
+
+	private dependentStageIds(invalidRefs: Set<string>): string[] {
+		return [
+			...new Set(
+				Object.values(this.snapshot.evidence)
+					.filter((evidence) => invalidRefs.has(evidence.id))
+					.map((evidence) => evidence.stageId),
+			),
+		].filter((stageId) => {
+			const artifact = this.snapshot.canonical[this.snapshot.canonicalRoute.stageArtifactIds[stageId]];
+			return !artifact || artifact.status !== "active" || invalidRefs.has(artifact.id);
 		});
 	}
 
@@ -1014,6 +1116,14 @@ export class ResearchJob {
 			)
 		)
 			throw new Error("synthesis must wait for unfinished local tasks and reviews");
+		const transferredIssueIds = new Set(
+			localInputs.flatMap((evidence) => {
+				const task = this.snapshot.tasks[evidence.taskId];
+				return (task?.responsibilityTransfers ?? []).flatMap((transfer) =>
+					transfer.issueId ? [transfer.issueId] : [],
+				);
+			}),
+		);
 		if (
 			this.snapshot.frame.openObligationIds.some((id) => {
 				const obligation = this.snapshot.obligations[id];
@@ -1021,7 +1131,8 @@ export class ResearchJob {
 				return (
 					id !== repairObligationId &&
 					obligation?.status === "open" &&
-					this.snapshot.evidence[review?.evidenceId]?.stageId === stageId
+					this.snapshot.evidence[review?.evidenceId]?.stageId === stageId &&
+					(obligation.items ?? []).some((item) => item.status === "open" && !transferredIssueIds.has(item.id))
 				);
 			})
 		)
@@ -1029,19 +1140,7 @@ export class ResearchJob {
 	}
 
 	resolveRepairInput(ref: string): string {
-		const retired =
-			this.snapshot.retiredArtifacts[ref] ??
-			Object.values(this.snapshot.retiredArtifacts).find((receipt) => receipt.evidenceId === ref);
-		const artifact =
-			this.snapshot.canonical[ref] ??
-			Object.values(this.snapshot.canonical).find((entry) => entry.evidenceId === ref);
-		if (!retired && artifact?.status !== "stale") return ref;
-		const taskId = retired?.taskId ?? (artifact ? this.snapshot.evidence[artifact.evidenceId]?.taskId : undefined);
-		const stageId = taskId ? this.snapshot.tasks[taskId]?.stageId : undefined;
-		const replacement = stageId ? this.snapshot.canonicalRoute.stageArtifactIds[stageId] : undefined;
-		if (!replacement || this.snapshot.canonical[replacement]?.status !== "active")
-			throw new Error(`Repair input ${ref} requires a reviewed active replacement before retry`);
-		return replacement;
+		return resolveRepairInputFromSnapshot(this.snapshot, ref);
 	}
 
 	private assertCurrentInputs(refs: string[], repairOfEvidenceId?: string, checked = new Set<string>()): void {
@@ -1056,7 +1155,11 @@ export class ResearchJob {
 				if (historical) {
 					for (const oldRef of this.snapshot.tasks[historical.taskId].inputArtifactRefs) {
 						const currentRef = this.resolveRepairInput(oldRef);
-						if (!refs.includes(currentRef)) throw new Error(`Repair omits current input ${currentRef}`);
+						if (!refs.includes(currentRef)) {
+							if (currentRef !== oldRef)
+								throw new StaleResearchInputError(`Repair omits current input ${currentRef}`);
+							throw new Error(`Repair omits current input ${currentRef}`);
+						}
 					}
 					// The failed snapshot is a comparison target, not a current scientific input.
 					continue;
@@ -1065,14 +1168,14 @@ export class ResearchJob {
 			if (checked.has(ref)) continue;
 			checked.add(ref);
 			if (this.snapshot.retiredArtifacts[ref] || this.snapshot.canonical[ref]?.status === "stale")
-				throw new Error(`task input version is stale: ${ref}`);
+				throw new StaleResearchInputError(`task input version is stale: ${ref}`);
 			const retiredEvidence = Object.values(this.snapshot.retiredArtifacts).some(
 				(receipt) => receipt.evidenceId === ref,
 			);
 			const staleEvidence = Object.values(this.snapshot.canonical).some(
 				(artifact) => artifact.evidenceId === ref && artifact.status === "stale",
 			);
-			if (retiredEvidence || staleEvidence) throw new Error(`task input version is stale: ${ref}`);
+			if (retiredEvidence || staleEvidence) throw new StaleResearchInputError(`task input version is stale: ${ref}`);
 			const evidence = this.snapshot.evidence[ref];
 			if (
 				evidence &&
@@ -1131,27 +1234,29 @@ export class ResearchJob {
 	}
 
 	async setTaskStatus(taskId: string, status: TaskStatus): Promise<void> {
-		const task = this.snapshot.tasks[taskId];
-		if (!task) throw new Error(`unknown task ${taskId}`);
-		if (task.status === "succeeded" && status !== "succeeded")
-			throw new Error("succeeded task cannot move backwards");
-		await this.commit({ type: "task_status", taskId, status });
-		if (
-			status === "failed" &&
-			task.role === "worker" &&
-			task.searchBatchId &&
-			task.searchCandidateId &&
-			task.attempt >= MAX_TASK_ATTEMPTS
-		) {
-			await this.markSearchCandidateFailed(task.searchBatchId, task.searchCandidateId);
-		}
+		return this.exclusive(async () => {
+			const task = this.snapshot.tasks[taskId];
+			if (!task) throw new Error(`unknown task ${taskId}`);
+			if (task.status === "succeeded" && status !== "succeeded")
+				throw new Error("succeeded task cannot move backwards");
+			await this.appendEvent({ type: "task_status", taskId, status });
+			if (
+				status === "failed" &&
+				task.role === "worker" &&
+				task.searchBatchId &&
+				task.searchCandidateId &&
+				task.attempt >= MAX_TASK_ATTEMPTS
+			) {
+				await this.markSearchCandidateFailedInternal(task.searchBatchId, task.searchCandidateId);
+			}
+		});
 	}
 
-	async markSearchCandidateFailed(batchId: string, candidateId: string): Promise<void> {
+	private async markSearchCandidateFailedInternal(batchId: string, candidateId: string): Promise<void> {
 		const batch = this.snapshot.searchBatches[batchId];
 		const candidate = batch?.candidates[candidateId];
 		if (!batch || !candidate || candidate.status === "failed") return;
-		await this.commit({
+		await this.appendEvent({
 			type: "search_candidate_updated",
 			batchId,
 			candidate: { ...candidate, status: "failed" },
@@ -1162,7 +1267,7 @@ export class ResearchJob {
 			["planning", "running", "evaluating"].includes(refreshedBatch.status) &&
 			Object.values(refreshedBatch.candidates).every((entry) => entry.status === "failed")
 		) {
-			await this.commit({
+			await this.appendEvent({
 				type: "search_batch_exhausted",
 				batchId,
 				rationale: `All search candidates failed after ${MAX_TASK_ATTEMPTS} worker attempts`,
@@ -1170,15 +1275,21 @@ export class ResearchJob {
 		}
 	}
 
+	async markSearchCandidateFailed(batchId: string, candidateId: string): Promise<void> {
+		return this.exclusive(() => this.markSearchCandidateFailedInternal(batchId, candidateId));
+	}
+
 	async failUncommittedReviewerTask(taskId: string): Promise<void> {
-		const task = this.snapshot.tasks[taskId];
-		if (!task) throw new Error(`unknown task ${taskId}`);
-		if (task.role !== "reviewer") throw new Error("only reviewer tasks may use uncommitted review recovery");
-		if (Object.values(this.snapshot.reviews).some((review) => review.reviewerTaskId === taskId)) {
-			throw new Error("committed reviewer task cannot move backwards");
-		}
-		if (task.status === "failed") return;
-		await this.commit({ type: "task_status", taskId, status: "failed" });
+		return this.exclusive(async () => {
+			const task = this.snapshot.tasks[taskId];
+			if (!task) throw new Error(`unknown task ${taskId}`);
+			if (task.role !== "reviewer") throw new Error("only reviewer tasks may use uncommitted review recovery");
+			if (Object.values(this.snapshot.reviews).some((review) => review.reviewerTaskId === taskId)) {
+				throw new Error("committed reviewer task cannot move backwards");
+			}
+			if (task.status === "failed") return;
+			await this.appendEvent({ type: "task_status", taskId, status: "failed" });
+		});
 	}
 
 	async recordChildSession(session: import("./types.ts").ChildSessionRecord): Promise<void> {
@@ -1194,14 +1305,38 @@ export class ResearchJob {
 		if (task.deliveryKind && (input.type !== task.requiredOutputType || input.stageId !== task.stageId))
 			throw new Error("evidence does not match task delivery contract");
 		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+		if (input.incrementalRevision) {
+			const revision = input.incrementalRevision;
+			const base = this.snapshot.evidence[revision.baseEvidenceId];
+			if (
+				!base ||
+				base.id !== task.repairOfEvidenceId ||
+				!task.inputArtifactRefs.includes(base.id) ||
+				base.stageId !== task.stageId ||
+				base.currentEvidenceSetId !== input.currentEvidenceSetId ||
+				checksum(base.content) !== revision.baseHash ||
+				checksum(input.content) !== revision.resultHash
+			)
+				throw new Error("incremental evidence no longer matches its declared base or merged content");
+		}
 		const files = await freezeEvidenceFiles(task, input.refs);
 		const evidence: Evidence = {
 			...input,
 			files,
 			taskVersion: task.version,
-			versionHash: checksum({ content: input.content, refs: input.refs, files, taskVersion: task.version }),
+			versionHash: checksum({
+				content: input.content,
+				refs: input.refs,
+				files,
+				taskVersion: task.version,
+				...(input.incrementalRevision ? { incrementalRevision: input.incrementalRevision } : {}),
+			}),
 			id: input.id ?? `evidence_${randomUUID()}`,
-			checksum: checksum(input.content),
+			checksum: checksum(
+				input.incrementalRevision
+					? { content: input.content, incrementalRevision: input.incrementalRevision }
+					: input.content,
+			),
 			createdAt: new Date().toISOString(),
 			status: "candidate",
 			currentEvidenceSetId: input.currentEvidenceSetId ?? `${input.stageId}::${input.taskId}`,
@@ -1233,81 +1368,206 @@ export class ResearchJob {
 		return evidence;
 	}
 
+	historicalRepairArchives(stageId: string): Array<{
+		artifactId: string;
+		type: string;
+		evidenceId: string;
+		taskId: string;
+		archiveRefs?: string[];
+	}> {
+		if (this.backtrackChecks(stageId).length === 0) return [];
+		return [
+			...Object.values(this.snapshot.retiredArtifacts),
+			...Object.values(this.snapshot.discardedEvidence).map((receipt) => ({
+				...receipt,
+				artifactId: receipt.evidenceId,
+				type: this.snapshot.tasks[receipt.taskId].requiredOutputType,
+			})),
+		].filter((receipt) => this.snapshot.tasks[receipt.taskId]?.stageId === stageId);
+	}
+
+	backtrackChecks(stageId: string): Array<{ nodeId: string; criterion: string }> {
+		return backtrackChecksFromSnapshot(this.snapshot, stageId);
+	}
+
+	repairCriterion(criterion: string): string {
+		for (const issue of Object.values(this.snapshot.obligations)) {
+			const findings = this.snapshot.reviews[issue.sourceReviewId]?.findings ?? [];
+			for (const item of issue.items ?? []) {
+				if (criterion === `[${item.id}] ${item.criterion}`)
+					return `[${item.id}] ${this.repairCriterion(item.criterion)}`;
+			}
+			if (findings.includes(criterion)) return `Verify that the reported issue is resolved: ${criterion}`;
+		}
+		return criterion;
+	}
+
+	normalizedRepairCriterion(criterion: string): string {
+		return repairContext(this.snapshot).normalize(criterion);
+	}
+
 	async recordReview(input: Omit<Review, "id" | "createdAt"> & { id?: string }): Promise<Review> {
-		const evidence = this.snapshot.evidence[input.evidenceId];
-		if (!evidence) throw new Error(`unknown evidence ${input.evidenceId}`);
-		if (input.targetVersionHash && input.targetVersionHash !== evidence.versionHash)
-			throw new Error("review target version does not match evidence");
-		const definition = this.definitions[evidence.stageId];
-		const sourceTask = this.snapshot.tasks[evidence.taskId];
-		const expectedCriteria = [
-			...new Set([
-				...(sourceTask?.acceptanceChecks ?? definition?.acceptanceChecks ?? []),
-				...(sourceTask?.successCriteria ?? []),
-				...(sourceTask?.repairChecks ?? []).map((check) => check.criterion),
-			]),
-		];
-		validateReviewAssessment(input, expectedCriteria);
-		if (
-			input.reviewerTaskId &&
-			Object.values(this.snapshot.reviews).some(
-				(review) => review.evidenceId === evidence.id && review.reviewerTaskId === input.reviewerTaskId,
+		return this.exclusive(async () => {
+			const evidence = this.snapshot.evidence[input.evidenceId];
+			if (!evidence) throw new Error(`unknown evidence ${input.evidenceId}`);
+			if (input.targetVersionHash && input.targetVersionHash !== evidence.versionHash)
+				throw new Error("review target version does not match evidence");
+			const definition = this.definitions[evidence.stageId];
+			const sourceTask = this.snapshot.tasks[evidence.taskId];
+			const expectedCriteria = [
+				...new Set([
+					...(sourceTask?.acceptanceChecks ?? definition?.acceptanceChecks ?? []),
+					...(sourceTask?.successCriteria ?? []),
+					...(sourceTask?.repairChecks ?? []).map((check) => check.criterion),
+				]),
+			];
+			validateReviewAssessment(input, expectedCriteria);
+			if (
+				input.reviewerTaskId &&
+				Object.values(this.snapshot.reviews).some(
+					(review) => review.evidenceId === evidence.id && review.reviewerTaskId === input.reviewerTaskId,
+				)
 			)
+				throw new Error("reviewer task already reviewed this evidence");
+			const review: Review = {
+				...input,
+				targetVersionHash: evidence.versionHash,
+				id: input.id ?? `review_${randomUUID()}`,
+				createdAt: new Date().toISOString(),
+			};
+			await this.appendEvent({ type: "review_recorded", review, consequences: this.reviewConsequences(review) });
+			return review;
+		});
+	}
+
+	/** Same constructor serves atomic new reviews and narrow historical repair. */
+	private reviewConsequences(review: Review): ReviewConsequences {
+		if (!["fail", "partial", "blocked"].includes(review.verdict) || review.blocking === false) return {};
+		const evidence = this.snapshot.evidence[review.evidenceId];
+		if (
+			!evidence ||
+			this.snapshot.discardedEvidence[evidence.id] ||
+			Object.values(this.snapshot.discardedCandidates).some((receipt) => receipt.evidenceId === evidence.id)
 		)
-			throw new Error("reviewer task already reviewed this evidence");
-		const review: Review = {
-			...input,
-			targetVersionHash: evidence.versionHash,
-			id: input.id ?? `review_${randomUUID()}`,
-			createdAt: new Date().toISOString(),
-		};
-		await this.commit({ type: "review_recorded", review });
-		if (["fail", "partial", "blocked"].includes(review.verdict) && review.blocking !== false) {
-			const objection = createResearchNode({
+			return {};
+		const saved = Object.values(this.snapshot.obligations).find((issue) => issue.sourceReviewId === review.id);
+		const existingObjection =
+			(saved?.graphObjectionId ? this.snapshot.graph.nodes[saved.graphObjectionId] : undefined) ??
+			Object.values(this.snapshot.graph.nodes).find(
+				(node) => node.kind === "objection" && node.domainRef === review.id,
+			);
+		const objection =
+			existingObjection ??
+			createResearchNode({
+				id: saved?.graphObjectionId ?? `research_objection_${review.id}`,
 				kind: "objection",
 				statement: review.findings.join("; ") || "review failed",
-				status: "open",
+				status: saved?.status === "resolved" ? "resolved" : "open",
 				stageId: evidence.stageId,
 				domainRef: review.id,
 				sourceRefs: [review.id, evidence.id],
 			});
-			await this.commit({
-				type: "research_node_recorded",
-				node: objection,
-				edge: createResearchEdge({
-					fromNodeId: objection.id,
-					toNodeId: `research_evidence_${evidence.id}`,
-					kind: "contradicts",
-					sourceRefs: [review.id],
-				}),
-			});
-			const obligation: Obligation = {
-				stageId: evidence.stageId,
-				evidenceId: evidence.id,
-				targetVersionHash: evidence.versionHash,
-				id: `obligation_${randomUUID()}`,
-				sourceReviewId: review.id,
-				description: review.findings.join("; ") || "review failed",
-				graphObjectionId: objection.id,
-				status: "open",
-				createdAt: new Date().toISOString(),
-			};
-			obligation.items = [
-				...new Set([
-					...(review.criteria ?? [])
-						.filter((criterion) => !criterion.passed)
-						.map((criterion) => criterion.criterion),
-					...review.findings,
-				]),
-			].map((criterion, index) => ({ id: `${obligation.id}_${index + 1}`, criterion, status: "open" }));
-			await this.commit({ type: "obligation_created", obligation });
+		const edge = createResearchEdge({
+			fromNodeId: objection.id,
+			toNodeId: `research_evidence_${evidence.id}`,
+			kind: "contradicts",
+			sourceRefs: [review.id],
+		});
+		const consequences: ReviewConsequences = {
+			...(!existingObjection ? { objection } : {}),
+			...(!this.snapshot.graph.edges[edge.id] ? { edge } : {}),
+		};
+		if (saved) return consequences;
+
+		const obligation: Obligation = {
+			stageId: evidence.stageId,
+			evidenceId: evidence.id,
+			targetVersionHash: evidence.versionHash,
+			id: `obligation_${review.id}`,
+			sourceReviewId: review.id,
+			description: review.findings.join("; ") || "review failed",
+			graphObjectionId: objection.id,
+			status: "open",
+			createdAt: review.createdAt,
+		};
+		const existingCriteria = new Set(
+			Object.values(this.snapshot.obligations)
+				.filter((issue) => {
+					const failed = this.snapshot.evidence[this.snapshot.reviews[issue.sourceReviewId]?.evidenceId];
+					return issue.status === "open" && failed?.currentEvidenceSetId === evidence.currentEvidenceSetId;
+				})
+				.flatMap((issue) => (issue.items ?? []).map((item) => this.normalizedRepairCriterion(item.criterion))),
+		);
+		obligation.items = [
+			...new Set([
+				...(review.criteria ?? []).filter((criterion) => !criterion.passed).map((criterion) => criterion.criterion),
+				...review.findings,
+			]),
+		]
+			.filter((criterion) => {
+				const normalized = this.normalizedRepairCriterion(criterion);
+				if (existingCriteria.has(normalized)) return false;
+				existingCriteria.add(normalized);
+				return true;
+			})
+			.map((criterion, index) => ({ id: `${obligation.id}_${index + 1}`, criterion, status: "open" }));
+		consequences.obligation = obligation;
+		return consequences;
+	}
+
+	private async recoverReviewsInternal(): Promise<void> {
+		for (const review of Object.values(this.snapshot.reviews)) {
+			const consequences = this.reviewConsequences(review);
+			if (Object.keys(consequences).length)
+				await this.appendEvent({ type: "review_recorded", review, consequences });
 		}
-		return review;
+	}
+
+	/** Explicit recovery only; open/reload remain read-only. */
+	async recoverPendingOperations(): Promise<void> {
+		return this.exclusive(async () => {
+			await this.finishCleanupsInternal();
+			await this.recoverReviewsInternal();
+			if (this.snapshot.paused) return;
+			for (const artifact of Object.values(this.snapshot.canonical)) {
+				if (["stale", "retired"].includes(artifact.status) || artifact.adoptionCompletedAt) continue;
+				await this.adoptEvidenceInternal(artifact.evidenceId, artifact.replacementOf);
+			}
+			for (const batch of Object.values(this.snapshot.searchBatches)) {
+				if (batch.status !== "selected") continue;
+				for (const candidate of Object.values(batch.candidates)) {
+					if (candidate.id === batch.selectedCandidateId || this.snapshot.discardedCandidates[candidate.id])
+						continue;
+					await this.pruneSearchCandidateInternal(batch.id, candidate.id);
+				}
+			}
+		});
 	}
 
 	async adoptEvidence(evidenceId: string, replacementOf?: string): Promise<CanonicalArtifact> {
+		return this.exclusive(() => this.adoptEvidenceInternal(evidenceId, replacementOf));
+	}
+
+	private async adoptEvidenceInternal(evidenceId: string, replacementOf?: string): Promise<CanonicalArtifact> {
 		const evidence = this.snapshot.evidence[evidenceId];
 		if (!evidence) throw new Error(`unknown evidence ${evidenceId}`);
+		const existing = Object.values(this.snapshot.canonical).find((artifact) => artifact.evidenceId === evidenceId);
+		if (existing) {
+			if (
+				["stale", "retired"].includes(existing.status) ||
+				(replacementOf !== undefined && replacementOf !== existing.replacementOf && replacementOf !== existing.id)
+			)
+				throw new Error("unsafe repeated evidence adoption");
+			if (existing.adoptionCompletedAt) {
+				await this.finishCleanupsInternal();
+				return structuredClone(existing);
+			}
+			if (
+				existing.status === "active" &&
+				this.snapshot.canonicalRoute.stageArtifactIds[evidence.stageId] !== existing.id
+			)
+				throw new StaleResearchInputError("historical adoption is no longer the current route");
+		}
 		const deliveryTask = this.snapshot.tasks[evidence.taskId];
 		if (evidence.type === "stage-plan") throw new Error("a reviewed plan is not a research result");
 		if (deliveryTask?.deliveryKind === "local")
@@ -1320,7 +1580,164 @@ export class ResearchJob {
 		}
 		if (evidence.type === "result-to-claim") validateClaimAssessments(evidence.content);
 		const sourceTask = this.snapshot.tasks[evidence.taskId];
-		this.assertCurrentInputs(sourceTask.inputArtifactRefs, sourceTask.repairOfEvidenceId);
+		if ((sourceTask.stageRevision ?? 1) !== (this.snapshot.stages[evidence.stageId]?.revision ?? 1))
+			throw new StaleResearchInputError("adoption stage revision is stale");
+		const ownRetirement = existing?.replacementOf
+			? this.snapshot.retiredArtifacts[existing.replacementOf]
+			: undefined;
+		const refs = sourceTask.inputArtifactRefs.filter(
+			(ref) =>
+				!(
+					ownRetirement &&
+					existing &&
+					ownRetirement.replacementId === existing.id &&
+					(ref === ownRetirement.artifactId || ref === ownRetirement.evidenceId)
+				),
+		);
+		this.assertCurrentInputs(refs, sourceTask.repairOfEvidenceId);
+		if (sourceTask.planId && !existing && !evidenceHasCurrentPlanApprovalFromSnapshot(this.snapshot, evidence))
+			throw new Error("adoption requires the frozen approved plan");
+		if (sourceTask.planId && existing) {
+			let basis = this.snapshot;
+			const history =
+				ownRetirement?.replacementId === existing.id || existing.status === "active"
+					? await this.store.readEvents(this.snapshot.frame.jobId)
+					: [];
+			if (ownRetirement?.replacementId === existing.id) {
+				// Only this adoption's historical replacement may be restored for contract checking.
+				const oldEvidence = history.find(
+					(saved) =>
+						saved.event.type === "evidence_recorded" && saved.event.evidence.id === ownRetirement.evidenceId,
+				)?.event;
+				const oldArtifact = history.find(
+					(saved) =>
+						saved.event.type === "evidence_adopted" && saved.event.artifact.id === ownRetirement.artifactId,
+				)?.event;
+				if (oldEvidence?.type !== "evidence_recorded" || oldArtifact?.type !== "evidence_adopted")
+					throw new Error("pending adoption replacement lineage unavailable");
+				const materialized = history.find(
+					(saved) =>
+						saved.event.type === "canonical_artifact_materialized" &&
+						saved.event.artifactId === ownRetirement.artifactId,
+				)?.event;
+				const retiredArtifacts = { ...this.snapshot.retiredArtifacts };
+				delete retiredArtifacts[ownRetirement.artifactId];
+				basis = {
+					...this.snapshot,
+					retiredArtifacts,
+					evidence: {
+						...this.snapshot.evidence,
+						[ownRetirement.evidenceId]: { ...oldEvidence.evidence, status: "accepted" },
+					},
+					canonical: {
+						...this.snapshot.canonical,
+						[ownRetirement.artifactId]: {
+							...oldArtifact.artifact,
+							...(materialized?.type === "canonical_artifact_materialized"
+								? {
+										materializationRef: materialized.materializationRef,
+										targetSha256: materialized.targetSha256,
+									}
+								: {}),
+							status: "active",
+						},
+					},
+				};
+			}
+			if (existing.status === "active") {
+				// This committed acceptance changed its own comparison inputs; it did not invalidate its frozen contract.
+				const planEvidence = planReviewEvidence({ state: this.snapshot }, sourceTask.planId);
+				const frozen = (
+					planEvidence?.content as
+						| { effectiveContracts?: Array<{ hash: string; contract: EffectiveTaskContract }> }
+						| undefined
+				)?.effectiveContracts?.find((entry) => entry.hash === sourceTask.effectiveContractHash);
+				const activationIndex = history.findIndex(
+					(saved) =>
+						saved.event.type === "canonical_artifact_status" &&
+						saved.event.artifactId === existing.id &&
+						saved.event.status === "active",
+				);
+				const acceptedIndex = history.findIndex(
+					(saved) =>
+						saved.event.type === "evidence_decided" &&
+						saved.event.evidenceId === evidence.id &&
+						saved.event.accepted,
+				);
+				const comparisons: Record<string, Evidence> = {};
+				for (const input of frozen?.contract.inputVersions ?? []) {
+					if (input.canonical || !input.evidenceId || !sourceTask.inputArtifactRefs.includes(input.inputRef))
+						continue;
+					let recordedIndex = -1;
+					for (let index = 0; index < acceptedIndex; index++) {
+						const event = history[index].event;
+						if (event.type === "evidence_recorded" && event.evidence.id === input.evidenceId)
+							recordedIndex = index;
+					}
+					const recorded = history[recordedIndex]?.event;
+					if (recorded?.type !== "evidence_recorded") continue;
+					const ancestor = recorded.evidence;
+					const current = this.snapshot.evidence[ancestor.id];
+					if (
+						history.some(
+							(saved, index) =>
+								index > acceptedIndex &&
+								saved.event.type === "evidence_recorded" &&
+								saved.event.evidence.id === ancestor.id,
+						)
+					)
+						throw new StaleResearchInputError(
+							`historical adoption comparison is stale after re-recording: ${ancestor.id}`,
+						);
+					if (
+						current &&
+						(current.id !== ancestor.id ||
+							current.taskId !== ancestor.taskId ||
+							current.stageId !== ancestor.stageId ||
+							current.type !== ancestor.type ||
+							current.versionHash !== ancestor.versionHash ||
+							current.versionHash !== input.versionHash ||
+							(current.currentEvidenceSetId ?? current.taskId) !==
+								(ancestor.currentEvidenceSetId ?? ancestor.taskId) ||
+							current.checksum !== ancestor.checksum)
+					)
+						throw new StaleResearchInputError(
+							`historical adoption comparison identity or version is stale: ${ancestor.id}`,
+						);
+					const discarded = this.snapshot.discardedEvidence[ancestor.id];
+					let pruneIndex = -1;
+					for (let index = acceptedIndex + 1; index < history.length; index++) {
+						const event = history[index].event;
+						if (event.type === "evidence_pruned" && event.receipt.evidenceId === ancestor.id) pruneIndex = index;
+					}
+					if (
+						ancestor.id === evidence.id ||
+						ancestor.stageId !== evidence.stageId ||
+						this.snapshot.tasks[ancestor.taskId]?.jobId !== sourceTask.jobId ||
+						(ancestor.currentEvidenceSetId ?? ancestor.taskId) !==
+							(evidence.currentEvidenceSetId ?? evidence.taskId) ||
+						ancestor.versionHash !== input.versionHash ||
+						input.inputRef !== ancestor.id ||
+						recordedIndex >= acceptedIndex ||
+						acceptedIndex >= activationIndex ||
+						(current
+							? current.status !== "rejected" ||
+								current.supersededByTaskId !== sourceTask.id ||
+								current.checksum !== ancestor.checksum
+							: discarded?.reason !== "superseded-repair" ||
+								discarded.taskId !== ancestor.taskId ||
+								discarded.checksum !== ancestor.checksum ||
+								pruneIndex <= acceptedIndex) ||
+						(input.status !== "candidate" && input.status !== "accepted" && input.status !== "rejected")
+					)
+						continue;
+					comparisons[ancestor.id] = { ...ancestor, status: input.status, supersededByTaskId: sourceTask.id };
+				}
+				if (Object.keys(comparisons).length) basis = { ...basis, evidence: { ...basis.evidence, ...comparisons } };
+			}
+			if (!evidenceHasCurrentPlanApprovalFromSnapshot(basis, evidence))
+				throw new Error("pending adoption plan is stale");
+		}
 		if (sourceTask?.searchBatchId && sourceTask.searchCandidateId) {
 			const batch = this.snapshot.searchBatches[sourceTask.searchBatchId];
 			if (batch?.selectedCandidateId !== sourceTask.searchCandidateId) {
@@ -1328,7 +1745,10 @@ export class ResearchJob {
 			}
 		}
 		const reviews = Object.values(this.snapshot.reviews).filter((review) => review.evidenceId === evidenceId);
-		if (!reviews.some((review) => review.verdict === "pass"))
+		if (
+			reviews.some((review) => review.verdict !== "pass") ||
+			!reviews.some((review) => review.verdict === "pass" && review.targetVersionHash === evidence.versionHash)
+		)
 			throw new Error("evidence requires an independent passing review");
 		const evidenceSetId = evidence.currentEvidenceSetId ?? evidence.taskId;
 		const acceptedRevisionRefs = Object.values(this.snapshot.evidence)
@@ -1342,115 +1762,265 @@ export class ResearchJob {
 		if (acceptedRevisionRefs.length !== 1 || acceptedRevisionRefs[0] !== evidenceId)
 			throw new Error("evidence revision is ambiguous");
 		const currentRouteArtifactId = this.snapshot.canonicalRoute.stageArtifactIds[evidence.stageId];
-		const replacedArtifactId = replacementOf ?? currentRouteArtifactId;
-		if (replacedArtifactId && !this.snapshot.canonical[replacedArtifactId])
-			throw new Error(`unknown replacement artifact ${replacementOf}`);
-		const artifact: CanonicalArtifact = {
-			id: `artifact_${randomUUID()}`,
-			type: evidence.type,
-			evidenceId,
-			content: evidence.content,
-			checksum: evidence.checksum,
-			status: "adoption_requested",
-			replacementOf: replacedArtifactId,
-			evidenceSnapshotHash: checksum({ stageId: evidence.stageId, acceptedRevisionRefs }),
-			sourceSha256: evidence.checksum,
-			adoptedAt: new Date().toISOString(),
-		};
-		const materialized = `${JSON.stringify(artifact.content, null, 2)}\n`;
-		artifact.targetSha256 = sha256(materialized);
-		if (replacedArtifactId) await this.retireArtifact(replacedArtifactId, artifact.id);
-		await this.commit({ type: "evidence_adopted", artifact });
-		try {
-			await access(this.snapshot.frame.permissions.workspaceRoot);
-			const artifactPath = canonicalArtifactPath(
-				this.snapshot.frame.permissions.workspaceRoot,
-				this.snapshot.frame.jobId,
-				artifact.id,
-			);
-			artifact.materializationRef = artifactPath;
-			await atomicWriteJson(artifactPath, artifact.content);
-			await atomicWriteJson(
-				canonicalReceiptPath(this.snapshot.frame.permissions.workspaceRoot, this.snapshot.frame.jobId, artifact.id),
-				{
-					schemaVersion: "astra.materialization_receipt.v1",
-					artifactId: artifact.id,
-					sourceSha256: artifact.sourceSha256,
-					targetSha256: artifact.targetSha256,
-					targetPath: artifactPath,
-					createdAt: artifact.adoptedAt,
-				},
-			);
-			await this.commit({
-				type: "canonical_artifact_materialized",
-				artifactId: artifact.id,
-				materializationRef: artifactPath,
-				targetSha256: artifact.targetSha256,
-			});
-			artifact.status = "materialized";
-			await this.commit({ type: "canonical_artifact_status", artifactId: artifact.id, status: "materialized" });
-			artifact.status = "baseline_visible";
-			await this.commit({ type: "canonical_artifact_status", artifactId: artifact.id, status: "baseline_visible" });
-			const materializedContent = await readFile(artifactPath, "utf8");
-			if (sha256(materializedContent) !== artifact.targetSha256) {
-				throw new Error(`canonical artifact ${artifact.id} failed materialization integrity verification`);
+		const replacedArtifactId = existing ? existing.replacementOf : (replacementOf ?? currentRouteArtifactId);
+		if (
+			existing &&
+			currentRouteArtifactId &&
+			currentRouteArtifactId !== existing.id &&
+			currentRouteArtifactId !== replacedArtifactId
+		)
+			throw new StaleResearchInputError("pending adoption replacement route changed");
+		const ownedReplacement = replacedArtifactId ? this.snapshot.retiredArtifacts[replacedArtifactId] : undefined;
+		if (
+			replacedArtifactId &&
+			replacedArtifactId !== existing?.id &&
+			!this.snapshot.canonical[replacedArtifactId] &&
+			!(ownedReplacement && existing && ownedReplacement.replacementId === existing.id)
+		)
+			throw new Error(`unknown replacement artifact ${replacedArtifactId}`);
+		const artifact: CanonicalArtifact = existing
+			? structuredClone(existing)
+			: {
+					id: `artifact_${randomUUID()}`,
+					type: evidence.type,
+					evidenceId,
+					content: evidence.content,
+					checksum: evidence.checksum,
+					status: "adoption_requested",
+					replacementOf: replacedArtifactId,
+					evidenceSnapshotHash: checksum({ stageId: evidence.stageId, acceptedRevisionRefs }),
+					sourceSha256: evidence.checksum,
+					adoptedAt: new Date().toISOString(),
+				};
+		artifact.targetSha256 ??= sha256(`${JSON.stringify(artifact.content, null, 2)}\n`);
+		if (!existing) await this.appendEvent({ type: "evidence_adopted", artifact });
+		const phases = ["adoption_requested", "materialized", "baseline_visible", "integration_verified", "active"];
+		if (artifact.status !== "active") {
+			try {
+				await access(this.snapshot.frame.permissions.workspaceRoot);
+				const artifactPath = canonicalArtifactPath(
+					this.snapshot.frame.permissions.workspaceRoot,
+					this.snapshot.frame.jobId,
+					artifact.id,
+				);
+				if (!artifact.materializationRef) {
+					await atomicWriteJson(artifactPath, artifact.content);
+					await atomicWriteJson(
+						canonicalReceiptPath(
+							this.snapshot.frame.permissions.workspaceRoot,
+							this.snapshot.frame.jobId,
+							artifact.id,
+						),
+						{
+							schemaVersion: "astra.materialization_receipt.v1",
+							artifactId: artifact.id,
+							sourceSha256: artifact.sourceSha256,
+							targetSha256: artifact.targetSha256,
+							targetPath: artifactPath,
+							createdAt: artifact.adoptedAt,
+						},
+					);
+					await this.appendEvent({
+						type: "canonical_artifact_materialized",
+						artifactId: artifact.id,
+						materializationRef: artifactPath,
+						targetSha256: artifact.targetSha256,
+					});
+					artifact.materializationRef = artifactPath;
+				}
+				for (const status of ["materialized", "baseline_visible"] as const) {
+					if (phases.indexOf(artifact.status) >= phases.indexOf(status)) continue;
+					await this.appendEvent({ type: "canonical_artifact_status", artifactId: artifact.id, status });
+					artifact.status = status;
+				}
+				if (sha256(await readFile(artifact.materializationRef, "utf8")) !== artifact.targetSha256)
+					throw new Error(`canonical artifact ${artifact.id} failed materialization integrity verification`);
+				if (artifact.status !== "integration_verified") {
+					await this.appendEvent({
+						type: "canonical_artifact_status",
+						artifactId: artifact.id,
+						status: "integration_verified",
+					});
+					artifact.status = "integration_verified";
+				}
+			} catch (error) {
+				// Preserve the pre-existing unavailable-workspace boundary without claiming verification.
+				if (!["ENOENT", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
 			}
-			artifact.status = "integration_verified";
-			await this.commit({
-				type: "canonical_artifact_status",
-				artifactId: artifact.id,
-				status: "integration_verified",
-			});
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "EACCES")
-				throw error;
 		}
-		artifact.status = "active";
-		await this.commit({ type: "canonical_artifact_status", artifactId: artifact.id, status: "active" });
-		for (const nodeId of this.snapshot.graph.unresolvedObjectionIds) {
-			const objection = this.snapshot.graph.nodes[nodeId];
-			if (
-				objection.stageId === evidence.stageId &&
-				objection.domainRef === this.snapshot.stages[evidence.stageId].lastRouteDecisionRef &&
-				sourceTask?.acceptanceChecks.includes(objection.statement)
-			) {
-				await this.commit({ type: "research_node_status", nodeId, status: "resolved" });
-			}
-		}
-		const artifactNode = createResearchNode({
-			id: `research_artifact_${artifact.id}`,
-			kind: "artifact",
-			statement: `${artifact.type} canonical artifact`,
-			status: "accepted",
-			stageId: evidence.stageId,
-			domainRef: artifact.id,
-			sourceRefs: [evidence.id, ...(artifact.materializationRef ? [artifact.materializationRef] : [])],
+		const completion = await this.adoptionCompletion(artifact, evidence, reviews, sourceTask, resultAssessment);
+		await this.appendEvent({
+			type: "canonical_artifact_status",
+			artifactId: artifact.id,
+			status: "active",
+			completion,
 		});
-		await this.commit({
-			type: "research_node_recorded",
-			node: artifactNode,
-			edge: createResearchEdge({
-				fromNodeId: `research_evidence_${evidence.id}`,
-				toNodeId: artifactNode.id,
-				kind: "derives",
-				sourceRefs: [artifact.id],
-			}),
-		});
-		if (artifact.type === "result-to-claim") {
-			await this.recordClaimsFromArtifact(artifact, artifactNode.id);
-			await this.commit({
-				type: "scientific_outcome_recorded",
-				outcome: resultAssessment?.outcome ?? "inconclusive",
-				missionCoverage: resultAssessment?.missionCoverage ?? "insufficient",
-				reason: resultAssessment?.reason ?? "result assessment unavailable",
-				sourceArtifactId: artifact.id,
-			});
-		}
-		await this.pruneSupersededEvidence(evidence);
-		return artifact;
+		await this.finishCleanupsInternal();
+		return structuredClone(this.snapshot.canonical[artifact.id]);
 	}
 
-	private async pruneSupersededEvidence(winner: Evidence): Promise<void> {
+	/** Compute only this adoption's verified consequences before retirement removes its lineage. */
+	private async adoptionCompletion(
+		artifact: CanonicalArtifact,
+		evidence: Evidence,
+		reviews: Review[],
+		sourceTask: TaskPacket,
+		assessment: ReturnType<typeof scientificAssessment>,
+	): Promise<AdoptionCompletion> {
+		const evidenceId = evidence.id;
+		const completion: AdoptionCompletion = {
+			nodes: [],
+			edges: [],
+			resolvedNodeIds: [],
+			repairItems: [],
+			resolvedObligations: [],
+			assessment,
+			cleanups: [],
+			completedAt: new Date().toISOString(),
+		};
+		const expectedPhase = sourceTask?.deliveryKind === "synthesis" ? "synthesis" : "stage";
+		for (const binding of sourceTask?.responsibilityBindings ?? []) {
+			if (
+				binding.stageId === evidence.stageId &&
+				binding.phase === expectedPhase &&
+				sourceTask?.deliveryKind !== "local" &&
+				this.backtrackChecks(binding.stageId).some(
+					(check) => check.nodeId === binding.nodeId && sourceTask.acceptanceChecks.includes(check.criterion),
+				)
+			) {
+				completion.resolvedNodeIds.push(binding.nodeId);
+			}
+		}
+		if (sourceTask?.deliveryKind === "synthesis") {
+			for (const transfer of sourceTask.responsibilityTransfers ?? []) {
+				if (
+					!transfer.issueId ||
+					transfer.destinationPhase !== "synthesis" ||
+					transfer.destinationStageId !== evidence.stageId
+				)
+					continue;
+				const legacyTask = this.snapshot.tasks[transfer.sourceTaskId];
+				const localEvidence = sourceTask.inputArtifactRefs
+					.map((ref) => this.snapshot.evidence[ref])
+					.find(
+						(candidate) =>
+							candidate?.status === "accepted" &&
+							this.snapshot.tasks[candidate.taskId]?.deliveryKind === "local" &&
+							this.snapshot.tasks[candidate.taskId]?.responsibilityTransfers?.some(
+								(entry) => entry.issueId === transfer.issueId,
+							),
+					);
+				const localTask = localEvidence ? this.snapshot.tasks[localEvidence.taskId] : undefined;
+				const planEvidence = localTask?.planId
+					? Object.values(this.snapshot.evidence).find(
+							(candidate) =>
+								candidate.type === "stage-plan" &&
+								this.snapshot.tasks[candidate.taskId]?.planId === localTask.planId,
+						)
+					: undefined;
+				const frozenContracts = (
+					planEvidence?.content as
+						| { effectiveContracts?: Array<{ hash: string; contract: EffectiveTaskContract }> }
+						| undefined
+				)?.effectiveContracts;
+				const frozen = frozenContracts?.find((entry) => entry.hash === localTask?.effectiveContractHash);
+				const planReviews = planEvidence
+					? Object.values(this.snapshot.reviews).filter(
+							(review) =>
+								review.evidenceId === planEvidence.id && review.targetVersionHash === planEvidence.versionHash,
+						)
+					: [];
+				const issueBinding = sourceTask.repairChecks?.find(
+					(check) => check.issueId === transfer.issueId && check.criterion === transfer.exactCriterion,
+				);
+				const targetReview = reviews.find(
+					(review) =>
+						review.verdict === "pass" &&
+						review.targetVersionHash === evidence.versionHash &&
+						review.criteria?.some(
+							(criterion) => criterion.criterion === issueBinding?.criterion && criterion.passed,
+						),
+				);
+				const issueOwner = Object.values(this.snapshot.obligations).find((obligation) =>
+					obligation.items?.some(
+						(item) =>
+							item.id === transfer.issueId &&
+							item.status === "open" &&
+							item.criterion === transfer.exactCriterion,
+					),
+				);
+				if (
+					!legacyTask ||
+					sourceTaskContractHash(legacyTask) !== transfer.sourceContractHash ||
+					legacyTask.acceptanceChecks[transfer.sourceIndex] !== transfer.exactCriterion ||
+					!localTask ||
+					!localEvidence ||
+					!planEvidence ||
+					!frozen ||
+					!taskContractMatches(localTask, frozen.contract) ||
+					!frozen.contract.responsibilityTransfers.some(
+						(entry) => entry.issueId === transfer.issueId && entry.exactCriterion === transfer.exactCriterion,
+					) ||
+					!planReviews.length ||
+					planReviews.some((review) => review.verdict !== "pass" || (review.score ?? 0) < 0.8) ||
+					!issueBinding ||
+					!targetReview ||
+					!issueOwner
+				)
+					continue;
+				completion.repairItems.push({
+					obligationId: issueOwner.id,
+					itemId: transfer.issueId,
+					reviewId: targetReview.id,
+					evidenceId,
+				});
+				if (
+					this.snapshot.obligations[issueOwner.id].items?.every(
+						(item) =>
+							item.status !== "open" || completion.repairItems.some((closed) => closed.itemId === item.id),
+					)
+				) {
+					completion.resolvedObligations.push({
+						obligationId: issueOwner.id,
+						satisfiedBy: targetReview.id,
+					});
+					if (issueOwner.graphObjectionId) {
+						completion.resolvedNodeIds.push(issueOwner.graphObjectionId);
+					}
+				}
+			}
+		}
+		const artifactNode =
+			this.snapshot.graph.nodes[`research_artifact_${artifact.id}`] ??
+			createResearchNode({
+				id: `research_artifact_${artifact.id}`,
+				kind: "artifact",
+				statement: `${artifact.type} canonical artifact`,
+				status: "accepted",
+				stageId: evidence.stageId,
+				domainRef: artifact.id,
+				sourceRefs: [evidence.id, ...(artifact.materializationRef ? [artifact.materializationRef] : [])],
+			});
+		if (!this.snapshot.graph.nodes[artifactNode.id]) completion.nodes.push(artifactNode);
+		const artifactEdge = createResearchEdge({
+			fromNodeId: `research_evidence_${evidence.id}`,
+			toNodeId: artifactNode.id,
+			kind: "derives",
+			sourceRefs: [artifact.id],
+		});
+		if (!this.snapshot.graph.edges[artifactEdge.id]) completion.edges.push(artifactEdge);
+		if (artifact.type === "result-to-claim") this.claimFacts(artifact, artifactNode.id, completion);
+		if (
+			artifact.replacementOf &&
+			artifact.replacementOf !== artifact.id &&
+			this.snapshot.canonical[artifact.replacementOf]
+		)
+			completion.cleanups.push(await this.retirementIntent(artifact.replacementOf, artifact.id));
+		completion.cleanups.push(...(await this.supersededEvidenceIntents(evidence)));
+		return completion;
+	}
+
+	private async supersededEvidenceIntents(winner: Evidence): Promise<CleanupIntent[]> {
 		const evidenceSetId = winner.currentEvidenceSetId ?? winner.taskId;
 		const superseded = Object.values(this.snapshot.evidence).filter(
 			(evidence) =>
@@ -1459,27 +2029,33 @@ export class ResearchJob {
 				(evidence.currentEvidenceSetId ?? evidence.taskId) === evidenceSetId &&
 				!Object.values(this.snapshot.canonical).some((artifact) => artifact.evidenceId === evidence.id),
 		);
+		const intents: CleanupIntent[] = [];
 		for (const evidence of superseded) {
 			const reviews = Object.values(this.snapshot.reviews).filter((review) => review.evidenceId === evidence.id);
 			const reviewIds = reviews.map((review) => review.id);
-			const archiveRefs = await this.pruneTaskFiles([
-				evidence.taskId,
-				...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
-			]);
 			const receipt: DiscardedEvidenceReceipt = {
 				evidenceId: evidence.id,
 				taskId: evidence.taskId,
 				reviewIds,
 				checksum: evidence.checksum,
 				reason: "superseded-repair",
-				...(archiveRefs.length > 0 ? { archiveRefs } : {}),
-				workspacePrunedAt: new Date().toISOString(),
+				cleanupStatus: "pending",
 			};
-			await this.commit({ type: "evidence_pruned", receipt });
+			intents.push({
+				id: `evidence:${evidence.id}`,
+				kind: "evidence",
+				receipt,
+				status: "pending",
+				tasks: await cleanupTaskFiles(this.snapshot, [
+					evidence.taskId,
+					...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
+				]),
+			});
 		}
+		return intents;
 	}
 
-	private async recordClaimsFromArtifact(artifact: CanonicalArtifact, artifactNodeId: string): Promise<void> {
+	private claimFacts(artifact: CanonicalArtifact, artifactNodeId: string, completion: AdoptionCompletion): void {
 		const content = artifact.content;
 		if (content === null || typeof content !== "object" || Array.isArray(content)) return;
 		const claims = (content as Record<string, unknown>).claims;
@@ -1495,26 +2071,35 @@ export class ResearchJob {
 						);
 			if (typeof statement !== "string" || !statement.trim()) continue;
 			const accepted = assessment === "supported" || assessment === "partially-supported";
-			const node = createResearchNode({
-				kind: "claim",
-				statement,
-				status: accepted ? "accepted" : assessment === "unresolved" ? "active" : "rejected",
-				stageId: "result-to-claim",
-				domainRef: artifact.id,
-				sourceRefs: [artifact.id],
-			});
+			const existing = Object.values(this.snapshot.graph.nodes).find(
+				(node) =>
+					node.kind === "claim" &&
+					node.domainRef === artifact.id &&
+					node.statement === statement &&
+					node.claimAssessment === assessment,
+			);
+			const node =
+				existing ??
+				createResearchNode({
+					id: `research_claim_${checksum({ artifactId: artifact.id, statement, assessment }).slice(0, 24)}`,
+					kind: "claim",
+					statement,
+					status: accepted ? "accepted" : assessment === "unresolved" ? "active" : "rejected",
+					stageId: "result-to-claim",
+					domainRef: artifact.id,
+					sourceRefs: [artifact.id],
+				});
 			node.claimAssessment = assessment;
 			node.actor = "worker";
-			await this.commit({
-				type: "research_node_recorded",
-				node,
-				edge: createResearchEdge({
-					fromNodeId: artifactNodeId,
-					toNodeId: node.id,
-					kind: accepted ? "supports" : assessment === "refuted" ? "contradicts" : "derives",
-					sourceRefs: [artifact.id],
-				}),
+			if (!existing && !completion.nodes.some((saved) => saved.id === node.id)) completion.nodes.push(node);
+			const edge = createResearchEdge({
+				fromNodeId: artifactNodeId,
+				toNodeId: node.id,
+				kind: accepted ? "supports" : assessment === "refuted" ? "contradicts" : "derives",
+				sourceRefs: [artifact.id],
 			});
+			if (!this.snapshot.graph.edges[edge.id] && !completion.edges.some((saved) => saved.id === edge.id))
+				completion.edges.push(edge);
 		}
 	}
 
@@ -1553,12 +2138,20 @@ export class ResearchJob {
 				if (issue.status !== "open" || !failed || failed.currentEvidenceSetId !== evidence.currentEvidenceSetId)
 					continue;
 				for (const item of issue.items ?? []) {
+					if (
+						this.snapshot.tasks[evidence.taskId].deliveryKind === "local" &&
+						this.snapshot.tasks[evidence.taskId].responsibilityTransfers?.some(
+							(transfer) => transfer.issueId === item.id,
+						)
+					)
+						continue;
 					const binding = this.snapshot.tasks[evidence.taskId].repairChecks?.find(
 						(check) => check.issueId === item.id,
 					);
 					if (
 						!binding ||
-						binding.criterion !== `[${item.id}] ${item.criterion}` ||
+						this.normalizedRepairCriterion(binding.criterion) !==
+							this.normalizedRepairCriterion(item.criterion) ||
 						!passingReviews.every((review) =>
 							review.criteria?.some(
 								(criterion) => criterion.criterion === binding.criterion && criterion.passed,
@@ -1631,7 +2224,11 @@ export class ResearchJob {
 		if (!batch || !candidate) throw new Error("candidate evaluation references an unknown search candidate");
 		if (candidate.evidenceId !== input.evidenceId) throw new Error("candidate evaluation evidence does not match");
 		const review = this.snapshot.reviews[input.reviewId];
-		if (!review || review.evidenceId !== input.evidenceId)
+		if (
+			!review ||
+			review.evidenceId !== input.evidenceId ||
+			review.targetVersionHash !== this.snapshot.evidence[input.evidenceId]?.versionHash
+		)
 			throw new Error("candidate evaluation review does not match");
 		if (!Number.isFinite(input.score) || input.score < 0 || input.score > 1) {
 			throw new Error("candidate evaluation score must be between zero and one");
@@ -1642,6 +2239,21 @@ export class ResearchJob {
 		if (missingCriteria.length > 0) {
 			throw new Error(`candidate evaluation omits frozen criteria: ${missingCriteria.join("; ")}`);
 		}
+		if (
+			input.verdict !== review.verdict ||
+			input.score !== (review.score ?? 0) ||
+			checksum(input.criteria) !== checksum(review.criteria ?? []) ||
+			checksum(input.findings) !== checksum(review.findings)
+		)
+			throw new Error("candidate evaluation differs from its review");
+		const existing = Object.values(this.snapshot.candidateEvaluations).find(
+			(evaluation) =>
+				evaluation.batchId === input.batchId &&
+				evaluation.candidateId === input.candidateId &&
+				evaluation.evidenceId === input.evidenceId &&
+				evaluation.reviewId === input.reviewId,
+		);
+		if (existing) return structuredClone(existing);
 		const evaluation: CandidateEvaluation = {
 			...input,
 			id: input.id ?? `candidate_evaluation_${randomUUID()}`,
@@ -1649,6 +2261,24 @@ export class ResearchJob {
 		};
 		await this.commit({ type: "candidate_evaluation_recorded", evaluation });
 		return evaluation;
+	}
+
+	async recordCandidateEvaluationFromReview(reviewId: string): Promise<CandidateEvaluation> {
+		const review = this.snapshot.reviews[reviewId];
+		const evidence = review && this.snapshot.evidence[review.evidenceId];
+		const task = evidence && this.snapshot.tasks[evidence.taskId];
+		if (!review || !evidence || !task?.searchBatchId || !task.searchCandidateId)
+			throw new Error("review does not belong to a search candidate");
+		return this.recordCandidateEvaluation({
+			batchId: task.searchBatchId,
+			candidateId: task.searchCandidateId,
+			evidenceId: evidence.id,
+			reviewId,
+			verdict: review.verdict,
+			score: review.score ?? 0,
+			criteria: review.criteria ?? [],
+			findings: review.findings,
+		});
 	}
 
 	async selectSearchCandidate(batchId: string, candidateId: string, decisionRef: string): Promise<void> {
@@ -1671,6 +2301,34 @@ export class ResearchJob {
 		if (!selectedEvaluation || selectedEvaluation.verdict !== "pass" || selectedEvaluation.score < minScore) {
 			throw new Error("selected search candidate does not satisfy the quality threshold");
 		}
+		const selectedEvidence = selected.evidenceId ? this.snapshot.evidence[selected.evidenceId] : undefined;
+		const reviews = Object.values(this.snapshot.reviews).filter(
+			(review) => review.evidenceId === selected.evidenceId,
+		);
+		const policy = this.definitions[batch.stageId]?.qualityPolicy;
+		if (
+			!selectedEvidence ||
+			reviews.some((review) => review.verdict !== "pass") ||
+			reviews.filter(
+				(review) =>
+					review.targetVersionHash === selectedEvidence.versionHash &&
+					review.verdict === "pass" &&
+					(review.score ?? 0) >= minScore,
+			).length < (policy?.minPassingReviews ?? 1)
+		)
+			throw new Error("selected search candidate lacks the configured current passing reviews");
+		const selectedReview = this.snapshot.reviews[selectedEvaluation.reviewId];
+		if (
+			!selectedReview ||
+			selectedReview.evidenceId !== selectedEvidence.id ||
+			selectedReview.targetVersionHash !== selectedEvidence.versionHash ||
+			selectedReview.verdict !== selectedEvaluation.verdict ||
+			selectedReview.score !== selectedEvaluation.score ||
+			batch.criteria.some(
+				(criterion) => !selectedEvaluation.criteria.some((item) => item.criterion === criterion && item.passed),
+			)
+		)
+			throw new Error("selected search candidate evaluation is stale or incomplete");
 		await this.commit({ type: "search_batch_decided", batchId, candidateId, decisionRef });
 		for (const candidate of Object.values(batch.candidates)) {
 			if (!candidate.evidenceId) continue;
@@ -1705,37 +2363,58 @@ export class ResearchJob {
 	}
 
 	private async pruneSearchCandidate(batchId: string, candidateId: string): Promise<void> {
-		const candidate = this.snapshot.searchBatches[batchId]?.candidates[candidateId];
+		return this.exclusive(() => this.pruneSearchCandidateInternal(batchId, candidateId));
+	}
+
+	private async pruneSearchCandidateInternal(batchId: string, candidateId: string): Promise<void> {
+		if (this.snapshot.discardedCandidates[candidateId]) return;
+		const batch = this.snapshot.searchBatches[batchId];
+		const candidate = batch?.candidates[candidateId];
 		if (!candidate) return;
 		const evidence = candidate.evidenceId ? this.snapshot.evidence[candidate.evidenceId] : undefined;
-		if (candidate.taskId) {
-			const reviewerTaskIds = candidate.evidenceId
-				? Object.values(this.snapshot.reviews)
-						.filter((review) => review.evidenceId === candidate.evidenceId)
-						.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : []))
-				: [];
-			const archiveRefs = await this.pruneTaskFiles([candidate.taskId, ...reviewerTaskIds]);
-			const receipt: DiscardedCandidateReceipt = {
-				candidateId,
-				batchId,
-				...(candidate.taskId ? { taskId: candidate.taskId } : {}),
-				...(candidate.evidenceId ? { evidenceId: candidate.evidenceId } : {}),
-				...(evidence ? { evidenceChecksum: evidence.checksum } : {}),
-				...(archiveRefs.length > 0 ? { archiveRefs } : {}),
-				workspacePrunedAt: new Date().toISOString(),
-			};
-			await this.commit({ type: "search_candidate_pruned", receipt });
-			return;
-		}
+		const reviews = evidence
+			? Object.values(this.snapshot.reviews).filter((review) => review.evidenceId === evidence.id)
+			: [];
+		const reviewIds = new Set(reviews.map((review) => review.id));
+		const obligations = Object.values(this.snapshot.obligations).filter((obligation) =>
+			reviewIds.has(obligation.sourceReviewId),
+		);
+		if (
+			Object.values(this.snapshot.obligations).some(
+				(obligation) =>
+					candidate.evidenceId &&
+					obligation.evidenceId === candidate.evidenceId &&
+					!reviewIds.has(obligation.sourceReviewId),
+			) ||
+			obligations.some(
+				(obligation) => obligation.evidenceId !== undefined && obligation.evidenceId !== candidate.evidenceId,
+			)
+		)
+			throw new Error("cannot safely archive ambiguous candidate obligations");
 		const receipt: DiscardedCandidateReceipt = {
 			candidateId,
 			batchId,
 			...(candidate.taskId ? { taskId: candidate.taskId } : {}),
 			...(candidate.evidenceId ? { evidenceId: candidate.evidenceId } : {}),
 			...(evidence ? { evidenceChecksum: evidence.checksum } : {}),
-			workspacePrunedAt: new Date().toISOString(),
+			archivedReviews: structuredClone(reviews),
+			archivedObligations: structuredClone(obligations),
+			decisionRef: batch.decisionRef,
+			reason: "unselected-search-candidate",
+			cleanupStatus: "pending",
 		};
-		await this.commit({ type: "search_candidate_pruned", receipt });
+		const intent: CleanupIntent = {
+			id: `search-candidate:${candidateId}`,
+			kind: "search-candidate",
+			receipt,
+			status: "pending",
+			tasks: await cleanupTaskFiles(this.snapshot, [
+				...(candidate.taskId ? [candidate.taskId] : []),
+				...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
+			]),
+		};
+		await this.appendEvent({ type: "cleanup_requested", intent });
+		await this.finishCleanupsInternal();
 	}
 
 	completionBlockers(): string[] {
@@ -1823,6 +2502,13 @@ export class ResearchJob {
 		if (["advance", "complete"].includes(manifest.routeAction) && this.unsynthesizedLocalEvidence(stageId).length)
 			throw new Error("route requires synthesis of accepted local evidence");
 		const currentArtifactId = this.snapshot.canonicalRoute.stageArtifactIds[stageId];
+		if (["advance", "complete"].includes(manifest.routeAction) && this.backtrackChecks(stageId).length)
+			throw new Error("route cannot advance while bound responsibility nodes remain open");
+		if (
+			["advance", "complete"].includes(manifest.routeAction) &&
+			this.snapshot.frame.openObligationIds.some((id) => this.snapshot.obligations[id]?.stageId === stageId)
+		)
+			throw new Error("route cannot advance while repair obligations remain open");
 		if (["advance", "complete"].includes(manifest.routeAction) && !currentArtifactId) {
 			throw new Error(`route decision ${manifest.routeAction} requires a canonical artifact for ${stageId}`);
 		}
@@ -1997,20 +2683,51 @@ export class ResearchJob {
 		if (refundableTurns > 0) await this.refundTurns(refundableTurns);
 	}
 
-	private commit(event: AstraEvent): Promise<void> {
-		const run = this.commitChain.then(async () => {
-			const stored = await this.store.append(this.snapshot.frame.jobId, event);
-			this.apply(stored.event, stored.timestamp);
-			this.snapshot.eventSeq = stored.seq;
-			this.snapshot.updatedAt = stored.timestamp;
-			await this.persist();
-		});
-		this.commitChain = run.catch(() => undefined);
+	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+		const run = this.commitChain.then(operation);
+		this.commitChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
 		return run;
+	}
+
+	private exclusive<T>(operation: () => Promise<T>): Promise<T> {
+		return this.enqueue(() =>
+			this.store.withWriteLock(this.snapshot.frame.jobId, async () => {
+				const seq = await this.store.readEventSeq(this.snapshot.frame.jobId);
+				if (seq !== this.snapshot.eventSeq)
+					throw new StaleResearchJobError("research job is stale; reopen before writing");
+				return operation();
+			}),
+		);
+	}
+
+	private commit(event: AstraEvent): Promise<void> {
+		return this.exclusive(() => this.appendEvent(event));
+	}
+
+	/** Only called inside exclusive: no queue reentry and no second lock. */
+	private async appendEvent(event: AstraEvent): Promise<void> {
+		const stored = await this.store.append(this.snapshot.frame.jobId, event);
+		this.apply(stored.event, stored.timestamp);
+		this.snapshot.eventSeq = stored.seq;
+		this.snapshot.updatedAt = stored.timestamp;
+		await this.persist();
 	}
 
 	private async persist(): Promise<void> {
 		await this.store.writeSnapshot(this.snapshot);
+	}
+
+	private applyCleanupIntent(intent: CleanupIntent, timestamp: string): void {
+		this.snapshot.cleanupIntents ??= {};
+		if (this.snapshot.cleanupIntents[intent.id]) return;
+		this.snapshot.cleanupIntents[intent.id] = structuredClone(intent);
+		// Original events now mean logical invalidation when cleanupStatus is pending.
+		if (intent.kind === "retirement") this.apply({ type: "artifact_retired", receipt: intent.receipt }, timestamp);
+		else if (intent.kind === "evidence") this.apply({ type: "evidence_pruned", receipt: intent.receipt }, timestamp);
+		else this.apply({ type: "search_candidate_pruned", receipt: intent.receipt }, timestamp);
 	}
 
 	private apply(event: AstraEvent, timestamp: string): void {
@@ -2091,6 +2808,14 @@ export class ResearchJob {
 							if (batch.planId === this.snapshot.tasks[evidence.taskId]?.planId) batch.status = "superseded";
 						}
 				}
+				if (event.consequences?.objection) addNodeToGraph(this.snapshot.graph, event.consequences.objection);
+				if (event.consequences?.edge) addEdgeToGraph(this.snapshot.graph, event.consequences.edge);
+				if (event.consequences?.obligation) {
+					const obligation = event.consequences.obligation;
+					this.snapshot.obligations[obligation.id] = structuredClone(obligation);
+					if (obligation.status === "open" && !this.snapshot.frame.openObligationIds.includes(obligation.id))
+						this.snapshot.frame.openObligationIds.push(obligation.id);
+				}
 				return;
 			case "repair_item_resolved": {
 				const item = this.snapshot.obligations[event.obligationId].items?.find((item) => item.id === event.itemId);
@@ -2119,15 +2844,73 @@ export class ResearchJob {
 				return;
 			}
 			case "canonical_artifact_status": {
+				if (event.completion)
+					for (const intent of event.completion.cleanups.filter((intent) => intent.kind === "retirement"))
+						this.applyCleanupIntent(intent, timestamp);
 				this.snapshot.canonical[event.artifactId].status = event.status;
 				if (event.status === "active") {
 					const artifact = this.snapshot.canonical[event.artifactId];
 					const stageId = this.snapshot.evidence[artifact.evidenceId]?.stageId;
 					if (stageId) {
 						this.snapshot.stages[stageId].invalidatedBy = undefined;
-						this.snapshot.canonicalRoute.stageArtifactIds[stageId] = artifact.id;
-						this.snapshot.canonicalRoute.revision += 1;
-						this.snapshot.canonicalRoute.updatedAt = timestamp;
+						if (this.snapshot.canonicalRoute.stageArtifactIds[stageId] !== artifact.id) {
+							this.snapshot.canonicalRoute.stageArtifactIds[stageId] = artifact.id;
+							this.snapshot.canonicalRoute.revision += 1;
+							this.snapshot.canonicalRoute.updatedAt = timestamp;
+						}
+						if (stageId === this.snapshot.frame.activeStageId && !this.snapshot.paused)
+							this.snapshot.frame.nextAction = `decide route from ${stageId}`;
+					}
+				}
+				if (event.completion) {
+					const completion = event.completion;
+					for (const node of completion.nodes) addNodeToGraph(this.snapshot.graph, node);
+					for (const edge of completion.edges) addEdgeToGraph(this.snapshot.graph, edge);
+					for (const closed of completion.repairItems)
+						this.apply({ type: "repair_item_resolved", ...closed }, timestamp);
+					for (const closed of completion.resolvedObligations)
+						this.apply({ type: "obligation_resolved", ...closed }, timestamp);
+					for (const nodeId of new Set(completion.resolvedNodeIds))
+						if (this.snapshot.graph.nodes[nodeId]?.status !== "resolved")
+							updateNodeStatus(this.snapshot.graph, nodeId, "resolved", timestamp);
+					if (completion.assessment)
+						this.apply(
+							{
+								type: "scientific_outcome_recorded",
+								...completion.assessment,
+								sourceArtifactId: event.artifactId,
+							},
+							timestamp,
+						);
+					for (const intent of completion.cleanups.filter((intent) => intent.kind !== "retirement"))
+						this.applyCleanupIntent(intent, timestamp);
+					this.snapshot.canonical[event.artifactId].adoptionCompletedAt = completion.completedAt;
+				}
+				return;
+			}
+			case "cleanup_requested":
+				this.applyCleanupIntent(event.intent, timestamp);
+				return;
+			case "cleanup_completed": {
+				const intent = this.snapshot.cleanupIntents![event.intentId];
+				intent.status = "completed";
+				intent.completedAt = event.completedAt;
+				intent.archiveRefs = event.archiveRefs;
+				const receipt =
+					intent.kind === "retirement"
+						? this.snapshot.retiredArtifacts[intent.receipt.artifactId]
+						: intent.kind === "evidence"
+							? this.snapshot.discardedEvidence[intent.receipt.evidenceId]
+							: this.snapshot.discardedCandidates[intent.receipt.candidateId];
+				receipt.cleanupStatus = "completed";
+				receipt.archiveRefs = event.archiveRefs;
+				if ("workspacePrunedAt" in receipt || intent.kind !== "retirement")
+					(receipt as DiscardedEvidenceReceipt | DiscardedCandidateReceipt).workspacePrunedAt = event.completedAt;
+				for (const task of intent.tasks) {
+					for (const session of Object.values(this.snapshot.sessions)) {
+						if (session.taskId !== task.taskId) continue;
+						const saved = task.sessions.find((entry) => entry.sessionId === session.sessionId);
+						if (saved?.present) session.sessionFile = saved.target;
 					}
 				}
 				return;
@@ -2135,40 +2918,34 @@ export class ResearchJob {
 			case "artifact_retired": {
 				const retiredArtifactId = event.receipt.artifactId;
 				const sourceStageId = this.snapshot.evidence[event.receipt.evidenceId]?.stageId;
-				if (sourceStageId) {
+				const invalidRefs = dependentEvidenceRefs(this.snapshot, [retiredArtifactId, event.receipt.evidenceId]);
+				const affectedStageIds = this.dependentStageIds(invalidRefs);
+				if (sourceStageId && affectedStageIds.includes(sourceStageId)) {
 					const sourceStage = this.snapshot.stages[sourceStageId];
 					sourceStage.status = sourceStageId === this.snapshot.frame.activeStageId ? "running" : "pending";
 					sourceStage.completedAt = undefined;
 					sourceStage.routeApproval = undefined;
 					sourceStage.invalidatedBy = retiredArtifactId;
 				}
-				const invalidRefs = new Set([retiredArtifactId, event.receipt.evidenceId]);
-				let changed = true;
-				while (changed) {
-					changed = false;
-					for (const artifact of Object.values(this.snapshot.canonical)) {
-						if (invalidRefs.has(artifact.id) || artifact.status !== "active") continue;
-						const evidence = this.snapshot.evidence[artifact.evidenceId];
-						const task = this.snapshot.tasks[evidence.taskId];
-						if (!task.inputArtifactRefs.some((ref) => invalidRefs.has(ref))) continue;
-						invalidRefs.add(artifact.id);
-						invalidRefs.add(evidence.id);
-						artifact.status = "stale";
-						artifact.invalidatedBy = retiredArtifactId;
-						const stage = this.snapshot.stages[evidence.stageId];
-						stage.status = evidence.stageId === this.snapshot.frame.activeStageId ? "running" : "pending";
-						stage.completedAt = undefined;
-						stage.routeApproval = undefined;
-						stage.invalidatedBy = retiredArtifactId;
-						stage.revision = (stage.revision ?? 1) + 1;
-						stage.executionId = undefined;
-						delete this.snapshot.canonicalRoute.stageArtifactIds[evidence.stageId];
-						delete this.snapshot.canonicalRoute.selectedCandidateIds[evidence.stageId];
-						for (const batch of Object.values(this.snapshot.searchBatches)) {
-							if (batch.stageId === evidence.stageId) batch.status = "superseded";
-						}
-						changed = true;
-					}
+				for (const artifact of Object.values(this.snapshot.canonical)) {
+					if (artifact.id === retiredArtifactId || artifact.status !== "active" || !invalidRefs.has(artifact.id))
+						continue;
+					artifact.status = "stale";
+					artifact.invalidatedBy = retiredArtifactId;
+				}
+				for (const stageId of affectedStageIds) {
+					if (stageId === sourceStageId) continue;
+					const stage = this.snapshot.stages[stageId];
+					stage.status = stageId === this.snapshot.frame.activeStageId ? "running" : "pending";
+					stage.completedAt = undefined;
+					stage.routeApproval = undefined;
+					stage.invalidatedBy = retiredArtifactId;
+					stage.revision = (stage.revision ?? 1) + 1;
+					stage.executionId = undefined;
+					delete this.snapshot.canonicalRoute.stageArtifactIds[stageId];
+					delete this.snapshot.canonicalRoute.selectedCandidateIds[stageId];
+					for (const batch of Object.values(this.snapshot.searchBatches))
+						if (batch.stageId === stageId) batch.status = "superseded";
 				}
 				for (const node of Object.values(this.snapshot.graph.nodes)) {
 					if (
@@ -2239,7 +3016,7 @@ export class ResearchJob {
 				return;
 			case "provider_backoff_cleared":
 				this.snapshot.providerBackoff = undefined;
-				this.snapshot.frame.nextAction = `dispatch ${this.snapshot.frame.activeStageId}`;
+				this.snapshot.frame.nextAction = `resume ${this.snapshot.frame.activeStageId} from saved progress`;
 				return;
 			case "automation_updated":
 				this.snapshot.frame.automation = event.automation;
@@ -2263,7 +3040,7 @@ export class ResearchJob {
 						? `decide route from ${event.gate.stageId}`
 						: event.gate.kind === "research"
 							? `main-agent reconsider ${event.gate.stageId} with user guidance`
-							: `dispatch ${this.snapshot.frame.activeStageId}`;
+							: `resume ${this.snapshot.frame.activeStageId} from saved progress`;
 				return;
 			}
 			case "job_paused":
@@ -2274,7 +3051,7 @@ export class ResearchJob {
 				this.snapshot.paused = false;
 				this.snapshot.frame.status = "running";
 				if (!this.snapshot.frame.nextAction.startsWith("replan ")) {
-					this.snapshot.frame.nextAction = `dispatch ${this.snapshot.frame.activeStageId}`;
+					this.snapshot.frame.nextAction = `resume ${this.snapshot.frame.activeStageId} from saved progress`;
 				}
 				return;
 			case "user_guidance_recorded":
@@ -2369,6 +3146,21 @@ export class ResearchJob {
 				return;
 			}
 			case "search_candidate_pruned": {
+				for (const obligation of event.receipt.archivedObligations ?? []) {
+					delete this.snapshot.obligations[obligation.id];
+					this.snapshot.frame.openObligationIds = this.snapshot.frame.openObligationIds.filter(
+						(id) => id !== obligation.id,
+					);
+				}
+				for (const obligation of event.receipt.archivedObligations ?? []) {
+					if (
+						obligation.graphObjectionId &&
+						!Object.values(this.snapshot.obligations).some(
+							(other) => other.status === "open" && other.graphObjectionId === obligation.graphObjectionId,
+						)
+					)
+						updateNodeStatus(this.snapshot.graph, obligation.graphObjectionId, "superseded", timestamp);
+				}
 				this.snapshot.discardedCandidates[event.receipt.candidateId] = structuredClone(event.receipt);
 				const prunedReviewerTaskIds = event.receipt.evidenceId
 					? Object.values(this.snapshot.reviews)
@@ -2457,6 +3249,7 @@ export class ResearchJob {
 				return;
 			}
 			case "stage_reopened":
+				for (const intent of event.cleanups ?? []) this.applyCleanupIntent(intent, timestamp);
 				for (const stageId of event.affectedStageIds) {
 					const stage = this.snapshot.stages[stageId];
 					stage.status = stageId === event.targetStageId ? "running" : "pending";
@@ -2477,7 +3270,6 @@ export class ResearchJob {
 				this.snapshot.frame.activeStageId = event.targetStageId;
 				this.snapshot.frame.nextAction = `revisit ${event.targetStageId}: ${event.reason}`;
 				this.snapshot.frame.userGate = undefined;
-				this.snapshot.paused = false;
 				return;
 		}
 	}

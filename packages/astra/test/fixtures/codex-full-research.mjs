@@ -90,7 +90,7 @@ export function fullResearchOutput(schema) {
 		if (obligation) inputs.push(state.reviews[obligation.sourceReviewId].evidenceId);
 		const count = obligation ? 1 : stage.searchPolicy?.minCandidates ?? 1;
 		const round = Object.values(state.searchBatches).filter(batch => batch.stageId === stageId).length + 1;
-		return { tasks: Array.from({ length: count }, (_, index) => ({ key: `candidate-${index}`, deliveryKind: "stage", objective: `Produce ${stageId} fixture ${index}`, inputArtifactRefs: inputs, requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, hypothesis: `Fixture round ${round} alternative ${index}` })), rationale: "Exercise the full research contract" };
+		return { tasks: Array.from({ length: count }, (_, index) => ({ key: `candidate-${index}`, deliveryKind: "stage", objective: `Produce ${stageId} fixture ${index}`, inputArtifactRefs: inputs, requiredOutputFields: stage.requiredOutputFields, acceptanceChecks: stage.acceptanceChecks, failureSignals: stage.failureSignals, successCriteria: stage.acceptanceChecks, responsibilityBindings: [], responsibilityTransfers: [], hypothesis: `Fixture round ${round} alternative ${index}` })), rationale: "Exercise the full research contract" };
 	}
 	if (fields.decision) return { decision: "accept", rationale: "Reviewed fixture" };
 	if (fields.adopt) return { adopt: true, rationale: "Adopt fixture" };

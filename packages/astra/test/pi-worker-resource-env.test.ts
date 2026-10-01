@@ -76,7 +76,7 @@ describe("Pi worker resource environment", () => {
 				},
 				runningTask.scope.workspaceRoot,
 			);
-			return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [] };
+			return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 		});
 
 		await new PiWorkerAdapter(runner).run(task, job);

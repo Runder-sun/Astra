@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { access, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
 	assertAstraId,
 	atomicWriteJson,
@@ -11,9 +11,16 @@ import {
 	workerManifestPath,
 	writeTaskPacket,
 } from "./contracts.ts";
+import { sourceTaskContractHash } from "./effective-contract.ts";
 import { sourceReceiptFilename } from "./literature.ts";
 import type { ResearchJob } from "./research.ts";
-import type { Evidence, EvidenceFileVersion, TaskPacket, WorkerOutputManifest } from "./types.ts";
+import type {
+	Evidence,
+	EvidenceFileVersion,
+	TaskPacket,
+	TaskRecoveryMaterials,
+	WorkerOutputManifest,
+} from "./types.ts";
 
 const RESEARCH_REVIEW_FIELDS: Record<string, string[]> = {
 	validation: ["researchQuestion", "scope", "nonGoals", "acceptanceCriteria", "falsifiableNextStep"],
@@ -78,6 +85,7 @@ export interface TaskInputResource {
 	taskId: string;
 	root: string;
 	envVar: string;
+	purpose?: "historical-repair";
 }
 
 export async function taskInputResources(task: TaskPacket, job: ResearchJob): Promise<TaskInputResource[]> {
@@ -106,7 +114,115 @@ export async function taskInputResources(task: TaskPacket, job: ResearchJob): Pr
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 	}
+	for (const receipt of job.historicalRepairArchives(task.stageId)) {
+		const root = join(
+			resolve(task.scope.workspaceRoot),
+			".astra",
+			"jobs",
+			task.jobId,
+			"archive",
+			"tasks",
+			receipt.taskId,
+		);
+		if (!receipt.archiveRefs?.includes(root)) continue;
+		try {
+			const metadata = await lstat(root);
+			if (metadata.isSymbolicLink())
+				throw new Error(`retired task archive may not use a symbolic link: ${receipt.taskId}`);
+			if (metadata.isDirectory())
+				resources.push({
+					artifactId: receipt.artifactId,
+					artifactType: receipt.type,
+					taskId: receipt.taskId,
+					root,
+					envVar: `ASTRA_INPUT_RESOURCE_ROOT_${resources.length}`,
+					purpose: "historical-repair",
+				});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 	return resources;
+}
+
+/** Recovery is tied to one registered predecessor, never to model-provided paths. */
+export async function taskRecoveryMaterials(
+	task: TaskPacket,
+	job: ResearchJob,
+): Promise<TaskRecoveryMaterials | undefined> {
+	if (!task.supersedesTaskId) return undefined;
+	const snapshot = job.state;
+	const registered = snapshot.tasks[task.id];
+	const previous = snapshot.tasks[task.supersedesTaskId];
+	if (
+		!registered ||
+		!previous ||
+		task.jobId !== snapshot.frame.jobId ||
+		previous.jobId !== task.jobId ||
+		registered.supersedesTaskId !== previous.id ||
+		registered.attempt !== task.attempt ||
+		registered.agentId !== task.agentId ||
+		previous.status !== "failed" ||
+		previous.role !== "worker" ||
+		task.role !== "worker" ||
+		task.attempt !== previous.attempt + 1 ||
+		previous.stageRevision !== task.stageRevision ||
+		sourceTaskContractHash(task) !== sourceTaskContractHash(previous) ||
+		sourceTaskContractHash(task) !== sourceTaskContractHash(registered) ||
+		resolve(task.scope.workspaceRoot) !== resolve(snapshot.frame.permissions.workspaceRoot) ||
+		resolve(previous.scope.workspaceRoot) !== resolve(task.scope.workspaceRoot)
+	)
+		throw new Error("retry recovery requires a registered same-job predecessor with the same task contract");
+	const project = resolve(task.scope.workspaceRoot);
+	const projectReal = await realpath(project);
+	const validatedPath = async (path: string, directory: boolean): Promise<string | undefined> => {
+		try {
+			const metadata = await lstat(path);
+			if (metadata.isSymbolicLink() || (await realpath(path)) !== join(projectReal, relative(project, path)))
+				throw new Error("retry recovery path may not escape through symbolic links");
+			if (directory ? !metadata.isDirectory() : !metadata.isFile())
+				throw new Error("retry recovery path has the wrong file type");
+			return path;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+	};
+	const workspaceRoot = await validatedPath(taskWorkspacePath(project, task.jobId, previous.id), true);
+	const session = Object.values(snapshot.sessions)
+		.filter(
+			(entry) =>
+				entry.taskId === previous.id &&
+				entry.role === "worker" &&
+				entry.attempt === previous.attempt &&
+				["failed", "interrupted"].includes(entry.status),
+		)
+		.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+	let sessionFile: string | undefined;
+	if (session?.sessionFile) {
+		const path = resolve(session.sessionFile);
+		const jobRoot = join(project, ".astra", "jobs", task.jobId);
+		const expectedSessionId = `astra-${task.jobId}-${previous.id}-${previous.attempt}`.replace(
+			/[^A-Za-z0-9._-]/g,
+			"-",
+		);
+		const piLog =
+			isInside(join(jobRoot, "sessions"), path) &&
+			session.sessionId === expectedSessionId &&
+			basename(path).endsWith(`_${expectedSessionId}.jsonl`);
+		const codexLog = path === join(jobRoot, "codex-events", `${previous.id}-${previous.attempt}.jsonl`);
+		const failureLog = path === join(taskDir(project, task.jobId, previous.id), "failure-log.json");
+		if (!piLog && !codexLog && !failureLog)
+			throw new Error("retry recovery log must belong to the same job and predecessor");
+		sessionFile = await validatedPath(path, false);
+	}
+	return {
+		previousTaskId: previous.id,
+		workspaceRoot,
+		sessionFile,
+		error: session?.error,
+		readRoots: [...(workspaceRoot ? [workspaceRoot] : []), ...(sessionFile ? [sessionFile] : [])],
+	};
 }
 
 function isInside(root: string, path: string): boolean {
@@ -207,6 +323,88 @@ async function writeEvidenceFile(root: string, path: string, content: Buffer): P
 	await writeFile(destination, content, { mode: 0o444 });
 }
 
+async function observedExecutionFiles(task: TaskPacket | undefined, prefix = "") {
+	if (!task) return [];
+	const root = join(resolve(task.scope.workspaceRoot), ".astra", "jobs", task.jobId, "codex-events");
+	const sourceRef = join(root, `${task.id}-${task.attempt}.jsonl`);
+	const log = await readEvidenceFile(sourceRef, root);
+	if (!log) return [];
+	const failures: Record<string, unknown>[] = [];
+	const searches: Record<string, unknown>[] = [];
+	for (const line of log.toString("utf8").split("\n").filter(Boolean)) {
+		const event = JSON.parse(line);
+		const item = event.params?.item;
+		if (
+			event.method === "item/completed" &&
+			item?.type === "commandExecution" &&
+			((typeof item.exitCode === "number" && item.exitCode !== 0) || item.status === "failed")
+		)
+			failures.push(item);
+		if (
+			event.method === "item/completed" &&
+			(item?.type === "webSearch" || (item?.type === "dynamicToolCall" && item.tool === "astra_search_literature"))
+		) {
+			searches.push({ emittedAtMs: event.emittedAtMs, item });
+		}
+	}
+	return [
+		{
+			name: "failed-commands",
+			schemaVersion: "astra.observed_command_failures.v1",
+			key: "failures",
+			entries: failures,
+		},
+		{
+			name: "literature-searches",
+			schemaVersion: "astra.observed_literature_searches.v1",
+			key: "searches",
+			entries: searches,
+		},
+	]
+		.filter((receipt) => receipt.entries.length)
+		.map((receipt) => ({
+			sourceRef,
+			path: `${prefix}execution/${task.id}/${receipt.name}.json`,
+			content: Buffer.from(
+				JSON.stringify(
+					{
+						schemaVersion: receipt.schemaVersion,
+						taskId: task.id,
+						attempt: task.attempt,
+						sourceLogRef: sourceRef,
+						sourceLogSha256: createHash("sha256").update(log).digest("hex"),
+						[receipt.key]: receipt.entries,
+					},
+					null,
+					2,
+				),
+			),
+		}));
+}
+
+async function repairSourceFiles(task: TaskPacket, job: ResearchJob, inputRef: string) {
+	if (inputRef !== task.repairOfEvidenceId) return [];
+	const evidence = job.state.evidence[inputRef];
+	if (!evidence) return [];
+	const root = taskDir(task.scope.workspaceRoot, task.jobId, evidence.taskId);
+	const sourceRef = join(root, "task-packet.json");
+	const content = await readEvidenceFile(sourceRef, root);
+	return [
+		...(content ? [{ sourceRef, path: `inputs/${inputRef}/repair-source-task.json`, content }] : []),
+		{
+			sourceRef: `reviews:${inputRef}`,
+			path: `inputs/${inputRef}/repair-source-reviews.json`,
+			content: Buffer.from(
+				JSON.stringify(
+					Object.values(job.state.reviews).filter((review) => review.evidenceId === inputRef),
+					null,
+					2,
+				),
+			),
+		},
+	];
+}
+
 async function materializeInputFiles(
 	inputArtifactRefs: string[],
 	task: TaskPacket,
@@ -220,6 +418,18 @@ async function materializeInputFiles(
 		const evidence = job.state.evidence[artifact?.evidenceId ?? artifactRef];
 		if (!evidence) continue;
 		const sourceRoot = taskWorkspacePath(projectRoot, task.jobId, evidence.taskId);
+		for (const file of [
+			...(await repairSourceFiles(task, job, artifactRef)),
+			...(await observedExecutionFiles(job.state.tasks[evidence.taskId], `inputs/${artifactRef}/`)),
+		]) {
+			await writeEvidenceFile(workspace, file.path, file.content);
+			inputs.push({
+				artifactId: artifactRef,
+				sourceRef: file.sourceRef,
+				path: file.path,
+				sha256: createHash("sha256").update(file.content).digest("hex"),
+			});
+		}
 		for (const sourceRef of evidence.refs) {
 			const receipt = sourceReceiptFilename(sourceRef);
 			const allowedRoot = receipt ? join(projectRoot, ".astra", "jobs", task.jobId, "sources") : sourceRoot;
@@ -243,6 +453,7 @@ async function materializeInputFiles(
 }
 
 export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): Promise<string> {
+	const recovery = await taskRecoveryMaterials(task, job);
 	const version = await job.captureTaskVersion(task.id);
 	await writeTaskPacket({ ...task, version });
 	const workspace = taskWorkspacePath(task.scope.workspaceRoot, task.jobId, task.id);
@@ -334,10 +545,21 @@ export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): 
 			{ encoding: "utf8", mode: 0o444 },
 		);
 	}
-	const evidence = relevantInputRefs.flatMap((ref) => {
+	const evidence: Array<Evidence & { contentPath: string }> = [];
+	for (const ref of relevantInputRefs) {
 		const value = snapshot.evidence[ref];
-		return value ? [value] : [];
-	});
+		if (!value) continue;
+		const contentPath = `input-evidence/${value.id}.json`;
+		const content = Buffer.from(JSON.stringify(value, null, 2));
+		await writeEvidenceFile(workspace, contentPath, content);
+		files.push({
+			artifactId: ref,
+			sourceRef: contentPath,
+			path: contentPath,
+			sha256: createHash("sha256").update(content).digest("hex"),
+		});
+		evidence.push({ ...value, contentPath });
+	}
 	const openObligations = snapshot.frame.openObligationIds.flatMap((id) => {
 		const obligation = snapshot.obligations[id];
 		return obligation ? [obligation] : [];
@@ -364,6 +586,7 @@ export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): 
 			resources,
 			omittedRefs: [],
 		},
+		recovery: recovery ?? null,
 		resources: { writableRoot: writableResourceRoot ?? null },
 		openObligations,
 		createdAt: new Date().toISOString(),
@@ -423,8 +646,24 @@ export async function prepareReviewEvidenceBundle(
 
 	const sourceTask = job.state.tasks[evidence.taskId];
 	if (!sourceTask) throw new Error(`source task not found for review evidence: ${evidence.id}`);
+	for (const file of await observedExecutionFiles(sourceTask)) {
+		await writeEvidenceFile(reviewRoot, file.path, file.content);
+		bundle.push({
+			sourceRef: file.sourceRef,
+			path: file.path,
+			sha256: createHash("sha256").update(file.content).digest("hex"),
+		});
+	}
 	const canonicalRoot = join(projectRoot, ".astra", "jobs", task.jobId, "canonical");
 	for (const inputRef of sourceTask.inputArtifactRefs) {
+		for (const file of await repairSourceFiles(sourceTask, job, inputRef)) {
+			await writeEvidenceFile(reviewRoot, file.path, file.content);
+			bundle.push({
+				sourceRef: file.sourceRef,
+				path: file.path,
+				sha256: createHash("sha256").update(file.content).digest("hex"),
+			});
+		}
 		const artifact = job.state.canonical[inputRef];
 		if (artifact)
 			await copyIntoBundle(
@@ -435,6 +674,17 @@ export async function prepareReviewEvidenceBundle(
 			);
 		const upstreamEvidence = job.state.evidence[artifact?.evidenceId ?? inputRef];
 		if (!upstreamEvidence) continue;
+		for (const file of await observedExecutionFiles(
+			job.state.tasks[upstreamEvidence.taskId],
+			`inputs/${inputRef}/`,
+		)) {
+			await writeEvidenceFile(reviewRoot, file.path, file.content);
+			bundle.push({
+				sourceRef: file.sourceRef,
+				path: file.path,
+				sha256: createHash("sha256").update(file.content).digest("hex"),
+			});
+		}
 		if (!artifact) {
 			const path = join("input-evidence", `${inputRef}.json`).split("\\").join("/");
 			const content = Buffer.from(JSON.stringify(upstreamEvidence, null, 2));

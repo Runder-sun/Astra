@@ -119,7 +119,10 @@ export interface StageState {
 
 export interface TaskPacket {
 	planId?: string;
+	effectiveContractHash?: string;
 	repairChecks?: Array<{ issueId: string; criterion: string }>;
+	responsibilityBindings?: Array<{ nodeId: string; stageId: string; phase: "stage" | "synthesis" }>;
+	responsibilityTransfers?: ResponsibilityTransfer[];
 	deliveryKind?: "stage" | "local" | "synthesis";
 	stageRevision?: number;
 	repairOfEvidenceId?: string;
@@ -173,11 +176,28 @@ export interface WorkerOutputManifest {
 	status: "completed" | "failed";
 	artifactType: string;
 	content: unknown;
+	incrementalRevision?: IncrementalRevision;
 	outputRefs: OutputRef[];
 	validationStatus: "passed" | "failed";
 	validationErrors: string[];
 	sessionRef: string;
 	createdAt: string;
+}
+
+export interface IncrementalRevision {
+	baseEvidenceId: string;
+	baseHash: string;
+	operations: Array<{
+		op: "set" | "delete";
+		path: string[];
+		value?: unknown;
+		issueId?: string;
+		sourceRefs: string[];
+		reason: string;
+	}>;
+	resultHash: string;
+	affectedCriteria: string[];
+	rationale: string;
 }
 
 export interface ReviewerOutputManifest {
@@ -277,8 +297,27 @@ export interface MainAgentDecisionManifest {
 	createdAt: string;
 }
 
+export interface ResponsibilityTransfer {
+	id: string;
+	planId: string;
+	sourceTaskId: string;
+	sourceContractHash: string;
+	sourceField: "acceptanceChecks";
+	sourceIndex: number;
+	exactCriterion: string;
+	nodeId?: string;
+	issueId?: string;
+	destinationStageId: string;
+	destinationPhase: "synthesis";
+	rationale: string;
+}
+
+export type ResponsibilityTransferProposal = Omit<ResponsibilityTransfer, "id" | "planId">;
+
 export interface PlannedTask {
+	responsibilityTransfers?: ResponsibilityTransferProposal[];
 	deliveryKind?: "stage" | "local" | "synthesis";
+	responsibilityBindings?: Array<{ nodeId: string; stageId: string; phase: "stage" | "synthesis" }>;
 	key: string;
 	objective: string;
 	inputArtifactRefs: string[];
@@ -290,6 +329,8 @@ export interface PlannedTask {
 }
 
 export interface StagePlanManifest {
+	/** Host-only fingerprint of the snapshot read before plan generation. */
+	generationBasisHash?: string;
 	schemaVersion: "astra.stage_plan_manifest.v1";
 	id: string;
 	jobId: string;
@@ -301,6 +342,14 @@ export interface StagePlanManifest {
 	sessionRef: string;
 	obligationId?: string;
 	createdAt: string;
+}
+
+export interface TaskRecoveryMaterials {
+	previousTaskId: string;
+	workspaceRoot?: string;
+	sessionFile?: string;
+	error?: string;
+	readRoots: string[];
 }
 
 export interface ChildSessionRecord {
@@ -323,6 +372,7 @@ export interface ProviderBackoffState {
 }
 
 export interface Evidence {
+	incrementalRevision?: IncrementalRevision;
 	taskVersion?: TaskVersion;
 	files?: EvidenceFileVersion[];
 	versionHash?: string;
@@ -376,6 +426,7 @@ export interface Obligation {
 }
 
 export interface CanonicalArtifact {
+	adoptionCompletedAt?: string;
 	id: string;
 	type: string;
 	evidenceId: string;
@@ -501,6 +552,7 @@ export interface StageRouteDecision {
 }
 
 export interface RetiredArtifactReceipt {
+	cleanupStatus?: "pending" | "completed";
 	artifactId: string;
 	type: string;
 	evidenceId: string;
@@ -514,23 +566,66 @@ export interface RetiredArtifactReceipt {
 }
 
 export interface DiscardedCandidateReceipt {
+	cleanupStatus?: "pending" | "completed";
+	archivedObligations?: Obligation[];
+	archivedReviews?: Review[];
+	decisionRef?: string;
+	reason?: "unselected-search-candidate";
 	candidateId: string;
 	batchId: string;
 	taskId?: string;
 	evidenceId?: string;
 	evidenceChecksum?: string;
 	archiveRefs?: string[];
-	workspacePrunedAt: string;
+	workspacePrunedAt?: string;
 }
 
 export interface DiscardedEvidenceReceipt {
+	cleanupStatus?: "pending" | "completed";
 	evidenceId: string;
 	taskId: string;
 	reviewIds: string[];
 	checksum: string;
 	reason: "superseded-repair";
 	archiveRefs?: string[];
-	workspacePrunedAt: string;
+	workspacePrunedAt?: string;
+}
+
+export interface CleanupTaskFiles {
+	taskId: string;
+	workspace: boolean;
+	task: boolean;
+	resources: boolean;
+	sessions: Array<{ sessionId: string; source: string; target: string; present: boolean }>;
+}
+
+export type CleanupIntent = {
+	id: string;
+	tasks: CleanupTaskFiles[];
+	status: "pending" | "completed";
+	archiveRefs?: string[];
+	completedAt?: string;
+} & (
+	| { kind: "retirement"; receipt: RetiredArtifactReceipt; materializationRef?: string }
+	| { kind: "evidence"; receipt: DiscardedEvidenceReceipt }
+	| { kind: "search-candidate"; receipt: DiscardedCandidateReceipt }
+);
+
+export interface ReviewConsequences {
+	objection?: ResearchNode;
+	edge?: ResearchEdge;
+	obligation?: Obligation;
+}
+
+export interface AdoptionCompletion {
+	nodes: ResearchNode[];
+	edges: ResearchEdge[];
+	resolvedNodeIds: string[];
+	repairItems: Array<{ obligationId: string; itemId: string; reviewId: string; evidenceId: string }>;
+	resolvedObligations: Array<{ obligationId: string; satisfiedBy: string }>;
+	assessment?: { outcome: ScientificOutcome; missionCoverage: MissionCoverage; reason: string };
+	cleanups: CleanupIntent[];
+	completedAt: string;
 }
 
 export interface CanonicalResearchRoute {
@@ -542,6 +637,7 @@ export interface CanonicalResearchRoute {
 }
 
 export interface JobSnapshot {
+	cleanupIntents?: Record<string, CleanupIntent>;
 	stageDefinitions?: Record<string, StageDefinition>;
 	version: 1;
 	frame: MissionFrame;
@@ -581,13 +677,20 @@ export type AstraEvent =
 	| { type: "child_session_recorded"; session: ChildSessionRecord }
 	| { type: "evidence_recorded"; evidence: Evidence }
 	| { type: "evidence_decided"; evidenceId: string; accepted: boolean; decisionRef: string }
-	| { type: "review_recorded"; review: Review }
+	| { type: "review_recorded"; review: Review; consequences?: ReviewConsequences }
 	| { type: "obligation_created"; obligation: Obligation }
 	| { type: "obligation_resolved"; obligationId: string; satisfiedBy: string }
 	| { type: "repair_item_resolved"; obligationId: string; itemId: string; reviewId: string; evidenceId: string }
 	| { type: "evidence_adopted"; artifact: CanonicalArtifact }
 	| { type: "canonical_artifact_materialized"; artifactId: string; materializationRef: string; targetSha256: string }
-	| { type: "canonical_artifact_status"; artifactId: string; status: CanonicalArtifact["status"] }
+	| {
+			type: "canonical_artifact_status";
+			artifactId: string;
+			status: CanonicalArtifact["status"];
+			completion?: AdoptionCompletion;
+	  }
+	| { type: "cleanup_requested"; intent: CleanupIntent }
+	| { type: "cleanup_completed"; intentId: string; archiveRefs: string[]; completedAt: string }
 	| { type: "artifact_retired"; receipt: RetiredArtifactReceipt }
 	| { type: "budget_usage_recorded"; turns: number; costUsd: number }
 	| { type: "budget_turns_refunded"; turns: number }
@@ -626,6 +729,7 @@ export type AstraEvent =
 			decisionRef: string;
 			reason: string;
 			objection: ResearchNode;
+			cleanups?: CleanupIntent[];
 	  };
 
 export interface StoredEvent {

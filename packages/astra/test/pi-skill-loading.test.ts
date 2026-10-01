@@ -8,7 +8,7 @@ import { writeMainDecisionManifest, writeStagePlanManifest } from "../src/contra
 import { PiChildSessionRunner, PiMainAgentAdapter } from "../src/pi-child-session.ts";
 import { ResearchJob } from "../src/research.ts";
 import { MemoryAstraStore } from "../src/store.ts";
-import type { Evidence } from "../src/types.ts";
+import type { Evidence, Obligation } from "../src/types.ts";
 import { reviewFixture } from "./review-fixture.ts";
 
 const skillsRoot = fileURLToPath(new URL("../skills/astra", import.meta.url));
@@ -139,9 +139,9 @@ describe("Pi-native Astra skills", () => {
 				automation: "full",
 			});
 			const runner = new PiChildSessionRunner({ sessionDir: join(root, "sessions") });
-			let plannerPrompt = "";
+			const plannerPrompts: string[] = [];
 			vi.spyOn(runner, "run").mockImplementation(async (_cwd, jobId, _taskId, _attempt, _role, prompt, env = {}) => {
-				plannerPrompt = prompt;
+				plannerPrompts.push(prompt);
 				const planId = env.ASTRA_STAGE_PLAN_ID;
 				const decisionRef = env.ASTRA_DECISION_REF;
 				if (!planId || !decisionRef) throw new Error("planner identity is missing");
@@ -169,18 +169,183 @@ describe("Pi-native Astra skills", () => {
 					},
 					root,
 				);
-				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [] };
+				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 			});
 
 			await new PiMainAgentAdapter(runner, root).planStage(job);
 
-			expect(plannerPrompt).toContain("run concurrently in isolated workspaces");
-			expect(plannerPrompt).toContain("cannot consume another task's output from the same plan");
-			expect(plannerPrompt).toContain("plan only the prerequisite task");
+			expect(plannerPrompts[0]).toContain("run concurrently in isolated workspaces");
+			expect(plannerPrompts[0]).toContain("cannot consume another task's output from the same plan");
+			expect(plannerPrompts[0]).toContain("plan only the prerequisite task");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("shows only the current repair obligation's exact legacy transfer candidates", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-pi-transfer-candidates-"));
+		try {
+			const sourceTask = {
+				id: "task_current_source",
+				stageId: "literature",
+				deliveryKind: "stage",
+				objective: "legacy literature delivery",
+				inputArtifactRefs: [],
+				requiredCanonicalArtifacts: [],
+				requiredOutputType: "literature",
+				requiredOutputFields: [],
+				acceptanceChecks: ["Resolve current legacy issue"],
+				failureSignals: [],
+				successCriteria: [],
+				repairChecks: [],
+				responsibilityBindings: [],
+				dependencies: [],
+				scope: { workspaceRoot: root, allowedPaths: ["."] },
+				allowedTools: [],
+				writeAuthority: "none",
+				budget: { maxTurns: 4, maxToolCalls: 8, maxRuntimeMs: 30_000 },
+				reviewGateRequired: true,
+				resumePolicy: "resume-session",
+				status: "succeeded",
+			};
+			const historicalTask = {
+				...sourceTask,
+				id: "task_historical_source",
+				acceptanceChecks: ["Resolve historical legacy issue"],
+			};
+			const currentObligation = {
+				id: "obligation_current",
+				sourceReviewId: "review_current",
+				status: "open",
+				items: [{ id: "issue_current", criterion: "Resolve current legacy issue", status: "open" }],
+			};
+			const historicalObligation = {
+				id: "obligation_historical",
+				sourceReviewId: "review_historical",
+				status: "open",
+				items: [{ id: "issue_historical", criterion: "Resolve historical legacy issue", status: "open" }],
+			};
+			const state = {
+				frame: {
+					jobId: "job_pi_transfer_candidates",
+					activeStageId: "literature",
+					eventSeq: 1,
+					permissions: { workspaceRoot: root },
+					openObligationIds: [historicalObligation.id, currentObligation.id],
+				},
+				stages: { literature: { executionId: "stage-exec-literature" } },
+				canonical: {},
+				evidence: {
+					evidence_current: {
+						id: "evidence_current",
+						taskId: sourceTask.id,
+						stageId: "literature",
+						type: "literature",
+						status: "candidate",
+					},
+					evidence_historical: {
+						id: "evidence_historical",
+						taskId: historicalTask.id,
+						stageId: "literature",
+						type: "literature",
+						status: "candidate",
+					},
+				},
+				tasks: { [sourceTask.id]: sourceTask, [historicalTask.id]: historicalTask },
+				reviews: {
+					review_current: {
+						id: "review_current",
+						evidenceId: "evidence_current",
+						findings: ["Resolve current legacy issue"],
+					},
+					review_historical: {
+						id: "review_historical",
+						evidenceId: "evidence_historical",
+						findings: ["Resolve historical legacy issue"],
+					},
+				},
+				obligations: { [currentObligation.id]: currentObligation, [historicalObligation.id]: historicalObligation },
+				graph: {
+					version: 1,
+					revision: 1,
+					rootQuestionId: "root",
+					nodes: {},
+					openQuestionIds: [],
+					activeHypothesisIds: [],
+					acceptedClaimIds: [],
+					unresolvedObjectionIds: [],
+				},
+				canonicalRoute: { stageArtifactIds: {} },
+				searchBatches: {},
+				sessions: {},
+				mainAgentSessionId: undefined,
+			};
+			const job = {
+				state,
+				definitions: {
+					literature: {
+						id: "literature",
+						workerTools: [],
+						requiredOutputFields: [],
+						outputArtifactType: "literature",
+						acceptanceChecks: [],
+						failureSignals: [],
+					},
+				},
+				recordChildSession: async () => undefined,
+				recordCost: async () => undefined,
+				unsynthesizedLocalEvidence: () => [],
+				backtrackChecks: () => [],
+				normalizedRepairCriterion: (criterion: string) => criterion,
+			} as unknown as ResearchJob;
+			const runner = new PiChildSessionRunner({ sessionDir: join(root, "sessions") });
+			const plannerPrompts: string[] = [];
+			vi.spyOn(runner, "run").mockImplementation(async (_cwd, jobId, _taskId, _attempt, _role, prompt, env = {}) => {
+				plannerPrompts.push(prompt);
+				const planId = env.ASTRA_STAGE_PLAN_ID;
+				const decisionRef = env.ASTRA_DECISION_REF;
+				if (!planId || !decisionRef) throw new Error("planner identity is missing");
+				const obligationId = env.ASTRA_OBLIGATION_ID;
+				await writeStagePlanManifest(
+					{
+						schemaVersion: "astra.stage_plan_manifest.v1",
+						id: planId,
+						jobId,
+						stageId: "literature",
+						decisionRef,
+						mode: obligationId ? "repair" : "decompose",
+						...(obligationId ? { obligationId } : {}),
+						tasks: [
+							{
+								key: "repair-current",
+								objective: "repair current issue",
+								inputArtifactRefs: [],
+								requiredOutputFields: ["resources"],
+								acceptanceChecks: ["current issue is repaired"],
+								failureSignals: [],
+								successCriteria: [],
+							},
+						],
+						rationale: "test the planning entry",
+						sessionRef: "pi-session:planner",
+						createdAt: new Date().toISOString(),
+					},
+					root,
+				);
+				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
+			});
+
+			const adapter = new PiMainAgentAdapter(runner, root);
+			await adapter.planStage(job, currentObligation as unknown as Obligation, "repair");
+
+			expect(plannerPrompts[0]).toContain(`"issueId":"issue_current"`);
+			expect(plannerPrompts[0]).not.toContain("issue_historical");
+			await adapter.planStage(job);
+			expect(plannerPrompts[1]).toContain("Exact legacy handoff candidates are [].");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 	it("tells the main agent that a grounded negative final review is valid evidence", async () => {
 		const root = await mkdtemp(join(tmpdir(), "astra-pi-negative-review-"));
@@ -213,7 +378,7 @@ describe("Pi-native Astra skills", () => {
 					},
 					root,
 				);
-				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [] };
+				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 			});
 			const evidence: Evidence = {
 				id: "evidence_negative_review",
@@ -312,7 +477,7 @@ describe("Pi-native Astra skills", () => {
 					},
 					root,
 				);
-				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [] };
+				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 			});
 
 			await new PiMainAgentAdapter(runner, root).decideRoute(job);
@@ -372,7 +537,7 @@ describe("Pi-native Astra skills", () => {
 						},
 						root,
 					);
-					return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [] };
+					return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 				},
 			);
 
@@ -397,7 +562,7 @@ describe("Pi-native Astra skills", () => {
 				automation: "full",
 			});
 			const runner = new PiChildSessionRunner({ sessionDir: join(root, "sessions") });
-			vi.spyOn(runner, "run").mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", jsonEvents: [] });
+			vi.spyOn(runner, "run").mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 });
 			vi.spyOn(runner, "waitForManifest").mockRejectedValue(new Error("manifest missing"));
 			const evidence: Evidence = {
 				id: "evidence_missing_manifest",

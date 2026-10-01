@@ -1,4 +1,5 @@
-import { planReviewStatus } from "./plan-review.ts";
+import { planReviewStatusFromSnapshot } from "./plan-review.ts";
+import { stageMap } from "./stages.ts";
 import type { JobSnapshot } from "./types.ts";
 
 /** Evidence-backed milestones; execution success alone never marks a delivery accepted. */
@@ -32,7 +33,7 @@ export function researchMilestones(state: JobSnapshot) {
 					(item) => item.type === "stage-plan" && state.tasks[item.taskId]?.planId === plan.id,
 				);
 				const reviews = Object.values(state.reviews).filter((review) => review.evidenceId === evidence?.id);
-				const status = planReviewStatus({ state }, plan.id);
+				const status = planReviewStatusFromSnapshot(state, state.stageDefinitions ?? stageMap(), plan.id);
 				return { id: plan.id, createdAt: plan.createdAt, status, reviews };
 			});
 		const repairs = Object.values(state.obligations).filter(
@@ -44,7 +45,9 @@ export function researchMilestones(state: JobSnapshot) {
 			revision: stage.revision ?? 1,
 			status: stage.invalidatedBy
 				? "stale"
-				: artifactId && state.canonical[artifactId]?.status === "active"
+				: artifactId &&
+						state.canonical[artifactId]?.status === "active" &&
+						state.canonical[artifactId]?.adoptionCompletedAt
 					? "adopted"
 					: stage.status,
 			invalidatedBy: stage.invalidatedBy,

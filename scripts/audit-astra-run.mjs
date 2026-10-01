@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -209,8 +210,25 @@ const archivedTaskRoots = new Set(
 	[...discardedCandidateReceipts, ...discardedEvidenceReceipts, ...retiredArtifacts]
 		.flatMap((receipt) => receipt.archiveRefs ?? []).filter((path) => existsSync(path)).map((path) => resolve(path)),
 );
+const completedSessionMoves = new Map();
+for (const intent of Object.values(snapshot.cleanupIntents ?? {})) {
+	if (intent.status !== "completed") continue;
+	for (const task of intent.tasks) {
+		const taskArchive = resolve(jobRoot, "archive", "tasks", task.taskId);
+		if (!events.some((entry) => entry.event?.type === "cleanup_completed" &&
+			entry.event.intentId === intent.id && entry.event.archiveRefs.some((path) => resolve(path) === taskArchive))) continue;
+		for (const moved of task.sessions) {
+			const target = resolve(taskArchive, "sessions", `${createHash("sha256").update(moved.sessionId).digest("hex")}.jsonl`);
+			const current = sessionRecordsById.get(moved.sessionId);
+			if (!moved.present || resolve(moved.target) !== target || current?.taskId !== task.taskId ||
+				!current.sessionFile || resolve(current.sessionFile) !== target) continue;
+			completedSessionMoves.set(JSON.stringify([task.taskId, moved.sessionId, resolve(moved.source)]), target);
+		}
+	}
+}
 const codexSessionAudits = backend === "codex" ? [...sessionRecordsByFile].map(([path, session]) => {
-	const entries = readJsonl(path);
+	const archivedPath = completedSessionMoves.get(JSON.stringify([session.taskId, session.sessionId, path]));
+	const entries = readJsonl(archivedPath ?? path);
 	const identities = entries.filter((entry) => entry.method === "astra/session");
 	const current = entries.slice(entries.findLastIndex((entry) => entry.method === "astra/session"));
 	const finalIndex = current.findLastIndex((entry) => entry.method === "item/completed" &&

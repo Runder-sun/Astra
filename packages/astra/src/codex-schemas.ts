@@ -66,6 +66,33 @@ export const codexPlanSchema = Type.Object(
 					acceptanceChecks: Type.Array(text, { minItems: 1 }),
 					failureSignals: Type.Array(text, { minItems: 1 }),
 					successCriteria: Type.Array(text, { minItems: 1 }),
+					responsibilityTransfers: Type.Array(
+						Type.Object(
+							{
+								sourceTaskId: text,
+								sourceContractHash: Type.String({ pattern: "^[a-f0-9]{64}$" }),
+								sourceField: Type.Literal("acceptanceChecks"),
+								sourceIndex: Type.Integer({ minimum: 0 }),
+								exactCriterion: text,
+								nodeId: Type.Union([text, Type.Null()]),
+								issueId: Type.Union([text, Type.Null()]),
+								destinationStageId: text,
+								destinationPhase: Type.Literal("synthesis"),
+								rationale: text,
+							},
+							{ additionalProperties: false },
+						),
+					),
+					responsibilityBindings: Type.Array(
+						Type.Object(
+							{
+								nodeId: text,
+								stageId: text,
+								phase: Type.Union([Type.Literal("stage"), Type.Literal("synthesis")]),
+							},
+							{ additionalProperties: false },
+						),
+					),
 					hypothesis: text,
 				},
 				{ additionalProperties: false },

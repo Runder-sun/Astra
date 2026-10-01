@@ -1,6 +1,8 @@
+import { fork } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
 import { ResearchJob } from "../src/research.ts";
 import { JsonlAstraStore, MemoryAstraStore } from "../src/store.ts";
@@ -68,4 +70,54 @@ it("rejects an event sequence gap instead of silently skipping state", async () 
 		},
 	]);
 	await expect(ResearchJob.open(store, job.state.frame.jobId)).rejects.toThrow(/sequence/);
+});
+
+it("checks memory journal currency without cloning the whole journal on every commit", async () => {
+	const store = new MemoryAstraStore();
+	const job = await ResearchJob.create(store, { workspaceRoot: "/tmp", objective: "bounded sequence reads" });
+	const read = vi.spyOn(store, "readEvents");
+	for (let index = 0; index < 30; index++) await job.consumeTurns(1);
+	expect(read).not.toHaveBeenCalled();
+	expect((await ResearchJob.open(store, job.state.frame.jobId))?.state.budgetUsage?.turnsUsed).toBe(30);
+});
+
+it("rejects competing real processes opened at the same journal sequence", async () => {
+	const root = await mkdtemp(join(tmpdir(), "astra-writer-process-"));
+	roots.push(root);
+	const store = new JsonlAstraStore(root);
+	const job = await ResearchJob.create(store, { workspaceRoot: root, objective: "concurrent writers" });
+	const children = [0, 1].map(() =>
+		fork(fileURLToPath(new URL("./fixtures/journal-writer.mjs", import.meta.url)), [root, job.state.frame.jobId], {
+			execArgv: ["--experimental-strip-types"],
+			stdio: ["ignore", "ignore", "pipe", "ipc"],
+		}),
+	);
+	try {
+		await Promise.all(
+			children.map(
+				(child) =>
+					new Promise<void>((resolve, reject) => {
+						child.once("message", () => resolve());
+						child.once("error", reject);
+						child.once("exit", () => reject(new Error("writer exited before barrier")));
+					}),
+			),
+		);
+		const results = children.map(
+			(child) =>
+				new Promise<{ committed: boolean }>((resolve, reject) => {
+					child.once("message", (message) => resolve(message as { committed: boolean }));
+					child.once("error", reject);
+				}),
+		);
+		for (const child of children) child.send("go");
+		expect((await Promise.all(results)).filter((result) => result.committed)).toHaveLength(1);
+		const reopened = (await ResearchJob.open(store, job.state.frame.jobId))!;
+		expect(reopened.state.budgetUsage?.turnsUsed).toBe(1);
+		const events = await store.readEvents(job.state.frame.jobId);
+		expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => index + 1));
+		expect((await store.loadSnapshot(job.state.frame.jobId))?.eventSeq).toBe(events.length);
+	} finally {
+		for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
+	}
 });

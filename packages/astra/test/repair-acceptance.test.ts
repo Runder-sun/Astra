@@ -21,12 +21,26 @@ function decision(job: ResearchJob, fields: Partial<MainAgentDecisionManifest>):
 	};
 }
 
-async function candidate(job: ResearchJob, key: string, currentEvidenceSetId?: string) {
+async function candidate(
+	job: ResearchJob,
+	key: string,
+	currentEvidenceSetId?: string,
+	responsibilityBindings: Array<{ nodeId: string; stageId: string; phase: "stage" | "synthesis" }> = [],
+) {
 	const repairChecks = currentEvidenceSetId
 		? Object.values(job.state.obligations).flatMap((issue) =>
-				(issue.items ?? []).map((item) => ({ issueId: item.id, criterion: `[${item.id}] ${item.criterion}` })),
+				(issue.items ?? []).map((item) => ({
+					issueId: item.id,
+					criterion: job.repairCriterion(`[${item.id}] ${item.criterion}`),
+				})),
 			)
 		: [];
+	const responsibilityChecks = responsibilityBindings.flatMap((binding) =>
+		job
+			.backtrackChecks(binding.stageId)
+			.filter((check) => check.nodeId === binding.nodeId)
+			.map((check) => check.criterion),
+	);
 	const task = await job.dispatchTask({
 		repairChecks,
 		stageId: "validation",
@@ -37,7 +51,12 @@ async function candidate(job: ResearchJob, key: string, currentEvidenceSetId?: s
 		requiredCanonicalArtifacts: [],
 		requiredOutputType: "validation",
 		requiredOutputFields: ["result"],
-		acceptanceChecks: ["result is verified", ...repairChecks.map((check) => check.criterion)],
+		acceptanceChecks: [
+			"result is verified",
+			...repairChecks.map((check) => check.criterion),
+			...responsibilityChecks,
+		],
+		responsibilityBindings,
 		failureSignals: ["unverified result"],
 		dependencies: [],
 		scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
@@ -60,6 +79,205 @@ async function candidate(job: ResearchJob, key: string, currentEvidenceSetId?: s
 }
 
 describe("repair acceptance", () => {
+	it("adopts an accepted repair after pause and resume closes its plan obligations", async () => {
+		const store = new MemoryAstraStore();
+		const job = await ResearchJob.create(store, {
+			objective: "resume accepted repair adoption",
+			workspaceRoot: "/workspace",
+			automation: "full",
+		});
+		const failed = await candidate(job, "before-repair");
+		await job.recordReview(
+			reviewFixture(job, { evidenceId: failed.id, verdict: "fail", findings: ["result is missing"] }),
+		);
+		const supervisor = new ResearchSupervisor(job, store, {
+			worker: {
+				run: async (task) => ({ artifactType: task.requiredOutputType, content: { result: "repaired" }, refs: [] }),
+			},
+			reviewer: {
+				review: async (evidence, currentJob) =>
+					reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] }),
+			},
+			mainAgent: {
+				planStage: async (_job, obligation) => ({
+					schemaVersion: "astra.stage_plan_manifest.v1",
+					id: "plan_resume_repair",
+					jobId: job.state.frame.jobId,
+					stageId: "validation",
+					decisionRef: "plan_resume_repair",
+					obligationId: obligation?.id,
+					mode: "repair",
+					tasks: [
+						{
+							key: "repair",
+							objective: "deliver repaired result",
+							inputArtifactRefs: [failed.id],
+							requiredOutputFields: job.definitions.validation.requiredOutputFields,
+							acceptanceChecks: ["result is verified"],
+							failureSignals: [],
+							successCriteria: ["result delivered"],
+						},
+					],
+					rationale: "repair",
+					sessionRef: "fixture:main",
+					createdAt: new Date().toISOString(),
+				}),
+				decideEvidence: async (evidence) => {
+					await job.pause("pause after repair acceptance decision");
+					return decision(job, { evidenceId: evidence.id, decision: "accept" });
+				},
+				decideAdoption: async (evidence) =>
+					decision(job, { decisionType: "adoption", evidenceId: evidence.id, adopt: true }),
+				decideSearch: async () => {
+					throw new Error("No search expected");
+				},
+				decideRoute: async (_job, obligation) =>
+					decision(job, {
+						decisionType: "route",
+						routeAction: obligation ? "backtrack" : "advance",
+						targetStageId: obligation ? "validation" : "literature",
+					}),
+			},
+		});
+		await supervisor.tick();
+		const repaired = Object.values(job.state.evidence).find(
+			(evidence) => evidence.id !== failed.id && evidence.type === "validation",
+		)!;
+		expect(job.state.paused).toBe(true);
+		expect(repaired.status).toBe("accepted");
+		expect(job.state.obligations[Object.keys(job.state.obligations)[0]!]?.status).toBe("resolved");
+		expect(Object.values(job.state.canonical).some((artifact) => artifact.evidenceId === repaired.id)).toBe(false);
+		await job.resume();
+		await supervisor.tick();
+		expect(Object.values(job.state.canonical).some((artifact) => artifact.evidenceId === repaired.id)).toBe(true);
+	});
+
+	it.each([false, true])(
+		"executes same-stage backtrack repair while preserving a pending pause (%s)",
+		async (pauseDuringDecision) => {
+			const store = new MemoryAstraStore();
+			const job = await ResearchJob.create(store, {
+				objective: "repair current stage",
+				workspaceRoot: "/workspace",
+				automation: "full",
+			});
+			const failed = await candidate(job, "failed");
+			await job.recordReview(
+				reviewFixture(job, { evidenceId: failed.id, verdict: "fail", findings: ["result is missing"] }),
+			);
+			let plans = 0;
+			let strategies = 0;
+			const supervisor = new ResearchSupervisor(job, store, {
+				worker: { run: async () => ({ artifactType: "validation", content: { result: "repaired" }, refs: [] }) },
+				reviewer: {
+					review: async (evidence, currentJob) =>
+						reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] }),
+				},
+				mainAgent: {
+					planStage: async (_job, obligation) => {
+						plans += 1;
+						return {
+							schemaVersion: "astra.stage_plan_manifest.v1",
+							id: "plan_same_stage",
+							jobId: job.state.frame.jobId,
+							stageId: "validation",
+							decisionRef: "plan_same_stage",
+							obligationId: obligation?.id,
+							tasks: [
+								{
+									key: "repair",
+									objective: "deliver repaired result",
+									inputArtifactRefs: [failed.id],
+									requiredOutputFields: DEFAULT_STAGES[0].requiredOutputFields,
+									acceptanceChecks: ["result is verified"],
+									failureSignals: [],
+									successCriteria: ["result delivered"],
+								},
+							],
+							rationale: "repair",
+							sessionRef: "fixture:main",
+							createdAt: new Date().toISOString(),
+						};
+					},
+					decideEvidence: async (evidence) => decision(job, { evidenceId: evidence.id, decision: "accept" }),
+					decideAdoption: async (evidence) =>
+						decision(job, { decisionType: "adoption", evidenceId: evidence.id, adopt: true }),
+					decideSearch: async () => {
+						throw new Error("No search expected");
+					},
+					decideRoute: async (_job, obligation) => {
+						if (obligation) {
+							strategies += 1;
+							if (pauseDuringDecision) await job.pause("pause during route decision");
+							return decision(job, {
+								decisionType: "route",
+								routeAction: "backtrack",
+								targetStageId: "validation",
+								rationale: "repair missing result",
+							});
+						}
+						return decision(job, { decisionType: "route", routeAction: "advance", targetStageId: "literature" });
+					},
+				},
+			});
+			await supervisor.tick();
+			if (pauseDuringDecision) {
+				expect(job.state.paused).toBe(true);
+				expect(plans).toBe(0);
+				expect(strategies).toBe(1);
+				return;
+			}
+			expect(plans).toBe(1);
+			expect(strategies).toBe(1);
+			expect(job.state.canonicalRoute.stageArtifactIds.validation).toBeDefined();
+			expect(job.state.graph.unresolvedObjectionIds).toEqual([]);
+			expect(job.state.frame.activeStageId).toBe("literature");
+		},
+	);
+
+	it("normalizes findings inherited through multiple historical obligation bindings", async () => {
+		const job = await ResearchJob.create(new MemoryAstraStore(), {
+			objective: "Recover repeated repair failures",
+			workspaceRoot: "/workspace",
+		});
+		const original = await candidate(job, "original");
+		const finding = "The raw data is inaccessible";
+		await job.recordReview(reviewFixture(job, { evidenceId: original.id, verdict: "fail", findings: [finding] }));
+		const first = Object.values(job.state.obligations)[0].items?.find((item) => item.criterion === finding);
+		const inherited = `[${first?.id}] ${finding}`;
+		const task = await job.dispatchTask({
+			...job.state.tasks[original.taskId],
+			id: "legacy_repair",
+			replayKey: "legacy_repair",
+			acceptanceChecks: [finding, inherited],
+			successCriteria: [],
+		});
+		await job.setTaskStatus(task.id, "succeeded");
+		const evidence = await job.recordEvidence({
+			taskId: task.id,
+			stageId: "validation",
+			type: "validation",
+			content: {},
+			refs: [],
+		});
+		await job.recordReview(
+			reviewFixture(job, {
+				evidenceId: evidence.id,
+				verdict: "fail",
+				findings: ["Historical criteria contradict restored files"],
+			}),
+		);
+		const issue = Object.values(job.state.obligations)[1];
+		for (const item of issue.items ?? []) {
+			if (item.criterion === finding || item.criterion === inherited) {
+				const inner = item.criterion === inherited ? `[${first?.id}] ` : "";
+				expect(job.repairCriterion(`[${item.id}] ${item.criterion}`)).toBe(
+					`[${item.id}] ${inner}Verify that the reported issue is resolved: ${finding}`,
+				);
+			}
+		}
+		expect(first?.criterion).toBe(finding);
+	});
 	it.each(["ask-user", "advance", "complete"] as const)(
 		"keeps unresolved issues blocking when repair strategy is %s",
 		async (routeAction) => {
@@ -105,7 +323,7 @@ describe("repair acceptance", () => {
 			else expect(job.state.frame.nextAction).toContain("Open repair obligations");
 		},
 	);
-	it("routes an open repair upstream and rebinds its retired input before closing the original issues", async () => {
+	it.each([false, true])("rebinds retired repair inputs before plan review (omitted by plan: %s)", async (omitted) => {
 		const store = new MemoryAstraStore();
 		const job = await ResearchJob.create(store, {
 			objective: "Repair upstream without losing obligations",
@@ -117,7 +335,7 @@ describe("repair acceptance", () => {
 		await job.decideEvidence(original.id, true);
 		const oldArtifact = await job.adoptEvidence(original.id);
 		await job.applyRouteDecision(
-			decision(job, { decisionType: "route", routeAction: "advance", targetStageId: "literature" }),
+			decision(job, { decisionType: "route", routeAction: "backtrack", targetStageId: "literature" }),
 		);
 		const downstream = await job.dispatchTask({
 			...job.state.tasks[original.taskId],
@@ -136,9 +354,8 @@ describe("repair acceptance", () => {
 			content: { result: "bad input" },
 			refs: [],
 		});
-		await job.recordReview(
-			reviewFixture(job, { evidenceId: failed.id, verdict: "fail", findings: ["repair upstream scope"] }),
-		);
+		const finding = "The raw data is inaccessible";
+		await job.recordReview(reviewFixture(job, { evidenceId: failed.id, verdict: "fail", findings: [finding] }));
 		const obligation = Object.values(job.state.obligations)[0];
 		let newArtifactId = "";
 		let repairRuns = 0;
@@ -149,6 +366,13 @@ describe("repair acceptance", () => {
 					expect(task.inputArtifactRefs).toContain(newArtifactId);
 					expect(task.inputArtifactRefs).not.toContain(oldArtifact.id);
 					expect(task.repairOfEvidenceId).toBe(failed.id);
+					expect(task.acceptanceChecks).not.toContain(finding);
+					expect(task.acceptanceChecks).toContain(`Verify that the reported issue is resolved: ${finding}`);
+					const item = obligation.items?.find((entry) => entry.criterion === finding);
+					expect(task.repairChecks).toContainEqual({
+						issueId: item?.id,
+						criterion: `Verify that the reported issue is resolved: ${finding}`,
+					});
 					return {
 						artifactType: task.requiredOutputType,
 						content: { result: "rechecked with new input" },
@@ -157,7 +381,14 @@ describe("repair acceptance", () => {
 				},
 			},
 			reviewer: {
-				review: async (evidence) => reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] }),
+				review: async (evidence) => {
+					if (evidence.type === "stage-plan") {
+						const inputs = job.state.tasks[evidence.taskId].inputArtifactRefs;
+						expect(inputs).toContain(newArtifactId);
+						expect(inputs).not.toContain(oldArtifact.id);
+					}
+					return reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] });
+				},
 			},
 			mainAgent: {
 				planStage: async (_job, issue) => ({
@@ -175,7 +406,7 @@ describe("repair acceptance", () => {
 						{
 							key: "repair",
 							objective: "Recheck the downstream result",
-							inputArtifactRefs: [newArtifactId],
+							inputArtifactRefs: omitted ? [] : [newArtifactId],
 							requiredOutputFields: job.definitions.literature.requiredOutputFields,
 							acceptanceChecks: ["repaired inputs checked"],
 							failureSignals: ["old inputs reused"],
@@ -203,7 +434,10 @@ describe("repair acceptance", () => {
 		expect(job.state.frame.activeStageId).toBe("validation");
 		expect(repairRuns).toBe(0);
 		expect(job.state.obligations[obligation.id].status).toBe("open");
-		const replacement = await candidate(job, "repaired-upstream");
+		const replacementBindings = job
+			.backtrackChecks("validation")
+			.map(({ nodeId }) => ({ nodeId, stageId: "validation", phase: "stage" as const }));
+		const replacement = await candidate(job, "repaired-upstream", undefined, replacementBindings);
 		await job.recordReview(reviewFixture(job, { evidenceId: replacement.id, verdict: "pass", findings: [] }));
 		await job.decideEvidence(replacement.id, true);
 		newArtifactId = (await job.adoptEvidence(replacement.id)).id;
@@ -380,74 +614,107 @@ describe("repair acceptance", () => {
 		expect(job.state.frame.openObligationIds).toHaveLength(1);
 	});
 
-	it("carries stage checks and the backtrack defect into repair review, then closes only that defect", async () => {
-		const store = new MemoryAstraStore();
-		const job = await ResearchJob.create(store, {
-			objective: "Finish a governed backtrack",
-			workspaceRoot: "/workspace",
-			automation: "full",
-		});
-		await job.reopenStage("literature", "backtrack_sources", "repair missing source receipts");
-		const unrelatedObjection = job.state.graph.unresolvedObjectionIds[0];
-		await job.reopenStage("validation", "backtrack_layout", "repair clipped content and verify page bounds");
-		const plan: StagePlanManifest = {
-			schemaVersion: "astra.stage_plan_manifest.v1",
-			id: "plan_backtrack",
-			jobId: job.state.frame.jobId,
-			stageId: "validation",
-			decisionRef: "plan_backtrack",
-			tasks: [
-				{
-					key: "repair",
-					objective: "Repair the identified defect",
-					inputArtifactRefs: [],
-					requiredOutputFields: DEFAULT_STAGES[0].requiredOutputFields,
-					acceptanceChecks: ["model-authored extra check"],
-					failureSignals: ["model-authored failure"],
-					successCriteria: ["new result delivered"],
+	it.each([false, true])(
+		"carries backtrack checks across later routes (%s) and closes only reviewed defects",
+		async (continueRoute) => {
+			const store = new MemoryAstraStore();
+			const job = await ResearchJob.create(store, {
+				objective: "Finish a governed backtrack",
+				workspaceRoot: "/workspace",
+				automation: "full",
+			});
+			await job.reopenStage("literature", "backtrack_sources", "repair missing source receipts");
+			const unrelatedObjection = job.state.graph.unresolvedObjectionIds[0];
+			await job.applyRouteDecision(
+				decision(job, {
+					stageId: "literature",
+					decisionType: "route",
+					routeAction: "backtrack",
+					targetStageId: "validation",
+					rationale: "repair clipped content and verify page bounds",
+				}),
+			);
+			if (continueRoute) {
+				await job.applyRouteDecision(
+					decision(job, {
+						decisionType: "route",
+						routeAction: "backtrack",
+						targetStageId: "validation",
+						rationale: "repair missing figure caption",
+					}),
+				);
+				await job.applyRouteDecision(decision(job, { decisionType: "route", routeAction: "continue" }));
+				await job.reload();
+			}
+			const plan: StagePlanManifest = {
+				schemaVersion: "astra.stage_plan_manifest.v1",
+				id: "plan_backtrack",
+				jobId: job.state.frame.jobId,
+				stageId: "validation",
+				decisionRef: "plan_backtrack",
+				tasks: [
+					{
+						key: "repair",
+						objective: "Repair the identified defect",
+						inputArtifactRefs: [],
+						requiredOutputFields: DEFAULT_STAGES[0].requiredOutputFields,
+						acceptanceChecks: ["model-authored extra check"],
+						failureSignals: ["model-authored failure"],
+						successCriteria: ["new result delivered"],
+					},
+				],
+				rationale: "Apply the review finding",
+				sessionRef: "fixture:main",
+				createdAt: new Date().toISOString(),
+			};
+			const supervisor = new ResearchSupervisor(job, store, {
+				worker: {
+					run: async (task) => ({ artifactType: task.requiredOutputType, content: { repaired: true }, refs: [] }),
 				},
-			],
-			rationale: "Apply the review finding",
-			sessionRef: "fixture:main",
-			createdAt: new Date().toISOString(),
-		};
-		const supervisor = new ResearchSupervisor(job, store, {
-			worker: {
-				run: async (task) => ({ artifactType: task.requiredOutputType, content: { repaired: true }, refs: [] }),
-			},
-			reviewer: {
-				review: async (evidence, currentJob) => {
-					if (evidence.type === "stage-plan")
-						return reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] });
-					const task = job.state.tasks[evidence.taskId];
-					expect(task.acceptanceChecks).toEqual(
-						expect.arrayContaining([
-							...DEFAULT_STAGES[0].acceptanceChecks,
-							"model-authored extra check",
-							"repair clipped content and verify page bounds",
-						]),
-					);
-					expect(task.failureSignals).toEqual(expect.arrayContaining(DEFAULT_STAGES[0].failureSignals));
-					return reviewFixture(currentJob, { evidenceId: evidence.id, ...{ verdict: "pass", findings: [] } });
+				reviewer: {
+					review: async (evidence, currentJob) => {
+						if (evidence.type === "stage-plan")
+							return reviewFixture(currentJob, { evidenceId: evidence.id, verdict: "pass", findings: [] });
+						const task = job.state.tasks[evidence.taskId];
+						if (continueRoute)
+							expect(task.acceptanceChecks).toEqual(
+								expect.arrayContaining([
+									expect.stringContaining(
+										"Verify that the backtrack issue is resolved: repair missing figure caption",
+									),
+								]),
+							);
+						expect(task.acceptanceChecks).toEqual(
+							expect.arrayContaining([
+								...DEFAULT_STAGES[0].acceptanceChecks,
+								"model-authored extra check",
+								expect.stringContaining(
+									"Verify that the backtrack issue is resolved: repair clipped content and verify page bounds",
+								),
+							]),
+						);
+						expect(task.failureSignals).toEqual(expect.arrayContaining(DEFAULT_STAGES[0].failureSignals));
+						return reviewFixture(currentJob, { evidenceId: evidence.id, ...{ verdict: "pass", findings: [] } });
+					},
 				},
-			},
-			mainAgent: {
-				planStage: async () => plan,
-				decideEvidence: async (evidence) => decision(job, { evidenceId: evidence.id, decision: "accept" }),
-				decideAdoption: async (evidence) =>
-					decision(job, { decisionType: "adoption", evidenceId: evidence.id, adopt: true }),
-				decideSearch: async () => {
-					throw new Error("No search expected");
+				mainAgent: {
+					planStage: async () => plan,
+					decideEvidence: async (evidence) => decision(job, { evidenceId: evidence.id, decision: "accept" }),
+					decideAdoption: async (evidence) =>
+						decision(job, { decisionType: "adoption", evidenceId: evidence.id, adopt: true }),
+					decideSearch: async () => {
+						throw new Error("No search expected");
+					},
+					decideRoute: async () =>
+						decision(job, { decisionType: "route", routeAction: "advance", targetStageId: "literature" }),
 				},
-				decideRoute: async () =>
-					decision(job, { decisionType: "route", routeAction: "advance", targetStageId: "literature" }),
-			},
-		});
-		await supervisor.tick();
-		expect(job.state.graph.unresolvedObjectionIds).toEqual([unrelatedObjection]);
-		expect(job.state.canonicalRoute.stageArtifactIds.validation).toBeDefined();
-		expect(job.state.frame.activeStageId).toBe("literature");
-		await job.reload();
-		expect(job.state.graph.unresolvedObjectionIds).toEqual([unrelatedObjection]);
-	});
+			});
+			await supervisor.tick();
+			expect(job.state.graph.unresolvedObjectionIds).toEqual([unrelatedObjection]);
+			expect(job.state.canonicalRoute.stageArtifactIds.validation).toBeDefined();
+			expect(job.state.frame.activeStageId).toBe("literature");
+			await job.reload();
+			expect(job.state.graph.unresolvedObjectionIds).toEqual([unrelatedObjection]);
+		},
+	);
 });

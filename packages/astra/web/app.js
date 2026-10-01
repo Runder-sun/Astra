@@ -78,8 +78,10 @@ function renderDetails() {
 	const artifact = state.canonical[state.canonicalRoute.stageArtifactIds[stageId]];
 	if (artifact) {
 		panel.append(node("h3", "正式交付"));
-		for (const ref of state.evidence[artifact.evidenceId]?.refs || []) {
-			if (!ref.startsWith(".astra/")) continue;
+		const delivery = state.evidence[artifact.evidenceId];
+		const declared = delivery?.files ? delivery.files.map(file => file.sourceRef).filter(ref => delivery.refs.includes(ref)) : delivery?.refs || [];
+		for (const ref of declared) {
+			if (!ref || /^[a-z][a-z\d+.-]*:/i.test(ref) || /^[\\/]/.test(ref) || ref.split(/[\\/]/).includes("..")) continue;
 			const link = node("a", ref.split("/").pop()); link.href = `/api/file?${new URLSearchParams({id: selected, artifact: artifact.id, ref})}`; link.target = "_blank"; link.rel = "noopener";
 			const row = node("p"); row.append(link); panel.append(row);
 		}
