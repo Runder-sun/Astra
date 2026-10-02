@@ -22,6 +22,15 @@ export async function cleanupTaskFiles(snapshot: JobSnapshot, taskIds: string[])
 			workspace: await exists(join(root, "workspaces", taskId)),
 			task: await exists(join(root, "tasks", taskId)),
 			resources: await exists(join(root, "resources", taskId)),
+			workspaceHash: (await exists(join(root, "workspaces", taskId)))
+				? await treeHash(join(root, "workspaces", taskId))
+				: undefined,
+			taskHash: (await exists(join(root, "tasks", taskId)))
+				? await treeHash(join(root, "tasks", taskId))
+				: undefined,
+			resourcesHash: (await exists(join(root, "resources", taskId)))
+				? await treeHash(join(root, "resources", taskId))
+				: undefined,
 			sessions: await Promise.all(
 				Object.values(snapshot.sessions)
 					.filter((session) => session.taskId === taskId && session.sessionFile)
@@ -37,6 +46,7 @@ export async function cleanupTaskFiles(snapshot: JobSnapshot, taskIds: string[])
 							`${createHash("sha256").update(session.sessionId).digest("hex")}.jsonl`,
 						),
 						present: await exists(session.sessionFile!),
+						expectedHash: (await exists(session.sessionFile!)) ? await treeHash(session.sessionFile!) : undefined,
 					})),
 			),
 		})),
@@ -73,24 +83,29 @@ async function sourceMatchesArchive(source: string, target: string): Promise<boo
 	return true;
 }
 
-async function archiveCopy(source: string, target: string, present: boolean): Promise<boolean> {
+async function archiveCopy(source: string, target: string, present: boolean, expectedHash?: string): Promise<boolean> {
+	if (!present) return false;
+	if (!expectedHash) throw new Error(`cleanup expected hash missing; destructive recovery blocked: ${source}`);
 	if (resolve(source) === resolve(target)) {
-		if (!(await exists(target))) throw new Error(`cleanup archive missing: ${target}`);
+		if (!(await exists(target)) || (await treeHash(target)) !== expectedHash)
+			throw new Error(`cleanup archive missing or integrity failed: ${target}`);
 		return true;
 	}
-	if (!present) return false;
 	const sourceExists = await exists(source);
 	if (await exists(target)) {
+		if ((await treeHash(target)) !== expectedHash)
+			throw new Error(`cleanup archive conflicts with expected hash: ${target}`);
 		if (sourceExists && !(await sourceMatchesArchive(source, target)))
 			throw new Error(`cleanup archive conflicts with source: ${target}`);
 		return true;
 	}
 	if (!sourceExists) throw new Error(`cleanup source and archive both missing: ${source}`);
+	if ((await treeHash(source)) !== expectedHash) throw new Error(`cleanup source hash mismatch: ${source}`);
 	await mkdir(dirname(target), { recursive: true });
 	const staging = `${target}.cleanup-copy`;
 	await rm(staging, { recursive: true, force: true });
 	await cp(source, staging, { recursive: true, force: false, verbatimSymlinks: true });
-	if ((await treeHash(source)) !== (await treeHash(staging)))
+	if ((await treeHash(source)) !== expectedHash || (await treeHash(staging)) !== expectedHash)
 		throw new Error(`cleanup archive verification failed: ${source}`);
 	await rename(staging, target);
 	return true;
@@ -100,27 +115,43 @@ async function archiveCopy(source: string, target: string, present: boolean): Pr
 export async function archiveAndPruneTasks(snapshot: JobSnapshot, tasks: CleanupTaskFiles[]): Promise<string[]> {
 	const root = join(snapshot.frame.permissions.workspaceRoot, ".astra", "jobs", snapshot.frame.jobId);
 	const archiveRefs: string[] = [];
+	// Validate every legacy intent before any source is removed.
+	for (const task of tasks) {
+		for (const [present, hash, path] of [
+			[task.workspace, task.workspaceHash, "workspace"],
+			[task.task, task.taskHash, "task"],
+			[task.resources, task.resourcesHash, "resources"],
+			...task.sessions.map((session) => [session.present, session.expectedHash, session.source] as const),
+		] as const)
+			if (present && !hash)
+				throw new Error(`cleanup expected hash missing; destructive recovery blocked: ${task.taskId}/${path}`);
+	}
 	for (const task of tasks) {
 		const archive = join(root, "archive", "tasks", task.taskId);
 		let archived = false;
-		for (const [folder, target, present] of [
-			["workspaces", "workspace", task.workspace],
-			["tasks", "task", task.task],
+		for (const [folder, target, present, expectedHash] of [
+			["workspaces", "workspace", task.workspace, task.workspaceHash],
+			["tasks", "task", task.task, task.taskHash],
 		] as const) {
-			if (await archiveCopy(join(root, folder, task.taskId), join(archive, target), present)) archived = true;
+			if (await archiveCopy(join(root, folder, task.taskId), join(archive, target), present, expectedHash))
+				archived = true;
 		}
 		for (const session of task.sessions)
-			if (await archiveCopy(session.source, session.target, session.present)) archived = true;
+			if (await archiveCopy(session.source, session.target, session.present, session.expectedHash)) archived = true;
 		if (task.resources) {
 			const source = join(root, "resources", task.taskId);
 			const target = join(archive, "resources");
 			if (await exists(source)) {
+				if ((await treeHash(source)) !== task.resourcesHash)
+					throw new Error(`cleanup resource hash mismatch: ${source}`);
 				if (await exists(target)) throw new Error(`cleanup resource archive conflicts with source: ${target}`);
 				await mkdir(archive, { recursive: true });
 				await rename(source, target);
 			} else if (!(await exists(target))) {
 				throw new Error(`cleanup resource source and archive both missing: ${source}`);
 			}
+			if ((await treeHash(target)) !== task.resourcesHash)
+				throw new Error(`cleanup resource archive hash mismatch: ${target}`);
 			archived = true;
 		}
 		if (archived) archiveRefs.push(archive);

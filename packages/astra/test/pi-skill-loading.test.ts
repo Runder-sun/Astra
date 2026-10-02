@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { writeMainDecisionManifest, writeStagePlanManifest } from "../src/contracts.ts";
 import { PiChildSessionRunner, PiMainAgentAdapter } from "../src/pi-child-session.ts";
 import { ResearchJob } from "../src/research.ts";
+import { DEFAULT_STAGES } from "../src/stages.ts";
 import { MemoryAstraStore } from "../src/store.ts";
 import type { Evidence, Obligation } from "../src/types.ts";
 import { reviewFixture } from "./review-fixture.ts";
@@ -149,6 +150,7 @@ describe("Pi-native Astra skills", () => {
 					{
 						schemaVersion: "astra.stage_plan_manifest.v1",
 						id: planId,
+						mode: "decompose",
 						jobId,
 						stageId: "validation",
 						decisionRef,
@@ -185,119 +187,51 @@ describe("Pi-native Astra skills", () => {
 	it("shows only the current repair obligation's exact legacy transfer candidates", async () => {
 		const root = await mkdtemp(join(tmpdir(), "astra-pi-transfer-candidates-"));
 		try {
-			const sourceTask = {
-				id: "task_current_source",
-				stageId: "literature",
-				deliveryKind: "stage",
-				objective: "legacy literature delivery",
-				inputArtifactRefs: [],
-				requiredCanonicalArtifacts: [],
-				requiredOutputType: "literature",
-				requiredOutputFields: [],
-				acceptanceChecks: ["Resolve current legacy issue"],
-				failureSignals: [],
-				successCriteria: [],
-				repairChecks: [],
-				responsibilityBindings: [],
-				dependencies: [],
-				scope: { workspaceRoot: root, allowedPaths: ["."] },
-				allowedTools: [],
-				writeAuthority: "none",
-				budget: { maxTurns: 4, maxToolCalls: 8, maxRuntimeMs: 30_000 },
-				reviewGateRequired: true,
-				resumePolicy: "resume-session",
-				status: "succeeded",
-			};
-			const historicalTask = {
-				...sourceTask,
-				id: "task_historical_source",
-				acceptanceChecks: ["Resolve historical legacy issue"],
-			};
-			const currentObligation = {
-				id: "obligation_current",
-				sourceReviewId: "review_current",
-				status: "open",
-				items: [{ id: "issue_current", criterion: "Resolve current legacy issue", status: "open" }],
-			};
-			const historicalObligation = {
-				id: "obligation_historical",
-				sourceReviewId: "review_historical",
-				status: "open",
-				items: [{ id: "issue_historical", criterion: "Resolve historical legacy issue", status: "open" }],
-			};
-			const state = {
-				frame: {
-					jobId: "job_pi_transfer_candidates",
-					activeStageId: "literature",
-					eventSeq: 1,
-					permissions: { workspaceRoot: root },
-					openObligationIds: [historicalObligation.id, currentObligation.id],
-				},
-				stages: { literature: { executionId: "stage-exec-literature" } },
-				canonical: {},
-				evidence: {
-					evidence_current: {
-						id: "evidence_current",
-						taskId: sourceTask.id,
-						stageId: "literature",
-						type: "literature",
-						status: "candidate",
-					},
-					evidence_historical: {
-						id: "evidence_historical",
-						taskId: historicalTask.id,
-						stageId: "literature",
-						type: "literature",
-						status: "candidate",
-					},
-				},
-				tasks: { [sourceTask.id]: sourceTask, [historicalTask.id]: historicalTask },
-				reviews: {
-					review_current: {
-						id: "review_current",
-						evidenceId: "evidence_current",
-						findings: ["Resolve current legacy issue"],
-					},
-					review_historical: {
-						id: "review_historical",
-						evidenceId: "evidence_historical",
-						findings: ["Resolve historical legacy issue"],
-					},
-				},
-				obligations: { [currentObligation.id]: currentObligation, [historicalObligation.id]: historicalObligation },
-				graph: {
-					version: 1,
-					revision: 1,
-					rootQuestionId: "root",
-					nodes: {},
-					openQuestionIds: [],
-					activeHypothesisIds: [],
-					acceptedClaimIds: [],
-					unresolvedObjectionIds: [],
-				},
-				canonicalRoute: { stageArtifactIds: {} },
-				searchBatches: {},
-				sessions: {},
-				mainAgentSessionId: undefined,
-			};
-			const job = {
-				state,
-				definitions: {
-					literature: {
-						id: "literature",
-						workerTools: [],
-						requiredOutputFields: [],
-						outputArtifactType: "literature",
-						acceptanceChecks: [],
-						failureSignals: [],
-					},
-				},
-				recordChildSession: async () => undefined,
-				recordCost: async () => undefined,
-				unsynthesizedLocalEvidence: () => [],
-				backtrackChecks: () => [],
-				normalizedRepairCriterion: (criterion: string) => criterion,
-			} as unknown as ResearchJob;
+			const job = await ResearchJob.create(new MemoryAstraStore(), {
+				jobId: "job_pi_transfer_candidates",
+				objective: "exact legacy transfer candidates",
+				workspaceRoot: root,
+				definitions: [{ ...DEFAULT_STAGES.find((stage) => stage.id === "literature")! }],
+			});
+			const obligations: Obligation[] = [];
+			for (const name of ["current", "historical"]) {
+				const criterion = `Resolve ${name} legacy issue`;
+				const task = await job.dispatchTask({
+					stageId: "literature",
+					stageExecutionId: "stage_exec_literature",
+					role: "worker",
+					objective: `legacy ${name} delivery`,
+					inputArtifactRefs: [],
+					requiredCanonicalArtifacts: [],
+					requiredOutputType: "literature",
+					requiredOutputFields: [],
+					acceptanceChecks: [criterion],
+					failureSignals: [],
+					successCriteria: [],
+					repairChecks: [],
+					responsibilityBindings: [],
+					dependencies: [],
+					scope: { workspaceRoot: root, allowedPaths: ["."] },
+					allowedTools: [],
+					writeAuthority: "none",
+					budget: { maxTurns: 4, maxToolCalls: 8, maxRuntimeMs: 30_000 },
+					reviewGateRequired: true,
+					resumePolicy: "resume-session",
+				});
+				await job.setTaskStatus(task.id, "succeeded");
+				const evidence = await job.recordEvidence({
+					taskId: task.id,
+					stageId: task.stageId,
+					type: task.requiredOutputType,
+					content: {},
+					refs: [],
+				});
+				const review = await job.recordReview(
+					reviewFixture(job, { evidenceId: evidence.id, verdict: "fail", findings: [criterion] }),
+				);
+				obligations.push(Object.values(job.state.obligations).find((item) => item.sourceReviewId === review.id)!);
+			}
+			const [currentObligation, historicalObligation] = obligations;
 			const runner = new PiChildSessionRunner({ sessionDir: join(root, "sessions") });
 			const plannerPrompts: string[] = [];
 			vi.spyOn(runner, "run").mockImplementation(async (_cwd, jobId, _taskId, _attempt, _role, prompt, env = {}) => {
@@ -336,10 +270,10 @@ describe("Pi-native Astra skills", () => {
 			});
 
 			const adapter = new PiMainAgentAdapter(runner, root);
-			await adapter.planStage(job, currentObligation as unknown as Obligation, "repair");
+			await adapter.planStage(job, currentObligation, "repair");
 
-			expect(plannerPrompts[0]).toContain(`"issueId":"issue_current"`);
-			expect(plannerPrompts[0]).not.toContain("issue_historical");
+			expect(plannerPrompts[0]).toContain(`"issueId":"${currentObligation.items![0].id}"`);
+			expect(plannerPrompts[0]).not.toContain(historicalObligation.items![0].id);
 			await adapter.planStage(job);
 			expect(plannerPrompts[1]).toContain("Exact legacy handoff candidates are [].");
 		} finally {
@@ -366,7 +300,7 @@ describe("Pi-native Astra skills", () => {
 				await writeMainDecisionManifest(
 					{
 						schemaVersion: "astra.main_agent_decision_manifest.v1",
-						manifestId: `manifest_${decisionRef}`,
+						manifestId: `decision_${decisionRef}`,
 						jobId,
 						decisionType: "evidence",
 						decisionRef,
@@ -464,7 +398,7 @@ describe("Pi-native Astra skills", () => {
 				await writeMainDecisionManifest(
 					{
 						schemaVersion: "astra.main_agent_decision_manifest.v1",
-						manifestId: `manifest_${decisionRef}`,
+						manifestId: `decision_${decisionRef}`,
 						jobId,
 						decisionType: "route",
 						decisionRef,
@@ -524,7 +458,7 @@ describe("Pi-native Astra skills", () => {
 					await writeMainDecisionManifest(
 						{
 							schemaVersion: "astra.main_agent_decision_manifest.v1",
-							manifestId: `manifest_${decisionRef}`,
+							manifestId: `decision_${decisionRef}`,
 							jobId,
 							decisionType: "route",
 							decisionRef,

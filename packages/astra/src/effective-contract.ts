@@ -492,9 +492,13 @@ export function searchBatchForPlan(
 		criteria: definition.acceptanceChecks,
 	};
 	const latest = Object.values(snapshot.searchBatches)
-		.filter((batch) => batch.stageId === plan.stageId && batch.status !== "superseded")
+		.filter(
+			(batch) =>
+				batch.stageId === plan.stageId &&
+				(batch.stageRevision ?? 1) === (snapshot.stages[plan.stageId].revision ?? 1),
+		)
 		.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
-	const previous = latest?.status === "exhausted" && latest.round < latest.maxRounds ? latest : undefined;
+	const previous = latest && ["exhausted", "superseded"].includes(latest.status) ? latest : undefined;
 	const maxRounds = previous?.maxRounds ?? policy.maxRounds ?? 2;
 	const round = previous ? previous.round + 1 : 1;
 	if (!Number.isInteger(maxRounds) || maxRounds <= 0) throw new Error("search maxRounds must be a positive integer");

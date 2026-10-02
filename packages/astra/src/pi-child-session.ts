@@ -6,9 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import {
 	mainDecisionManifestPath,
-	readJson,
 	readReviewerOutputManifest,
-	readStagePlanManifest,
 	readWorkerOutputManifest,
 	stagePlanManifestPath,
 	TASK_DELIVERY_INSTRUCTIONS,
@@ -928,6 +926,14 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		const decisionRef = `stage-plan-${stageId}-${snapshot.eventSeq + 1}-${Date.now()}`;
 		const planId = `plan_${decisionRef}`;
 		const sessionId = resumableMainSessionId(job);
+		await job.registerMainAgentCall({
+			id: decisionRef,
+			type: "plan",
+			planId,
+			mode: requestedMode,
+			obligationId: obligation?.id,
+			manifestRef: stagePlanManifestPath(this.cwd, snapshot.frame.jobId, planId),
+		});
 		const activeCanonical = Object.values(snapshot.canonical)
 			.filter((artifact) => artifact.status === "active")
 			.map((artifact) => ({ id: artifact.id, type: artifact.type, evidenceId: artifact.evidenceId }));
@@ -1024,7 +1030,11 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		const path = stagePlanManifestPath(this.cwd, snapshot.frame.jobId, planId);
 		let manifest: StagePlanManifest;
 		try {
-			manifest = await this.runner.waitForManifest(path, readStagePlanManifest, MANIFEST_WAIT_TIMEOUT_MS);
+			manifest = await this.runner.waitForManifest(
+				path,
+				async () => (await job.readMainAgentCallDelivery(decisionRef)) as StagePlanManifest,
+				MANIFEST_WAIT_TIMEOUT_MS,
+			);
 			if (
 				manifest.jobId !== snapshot.frame.jobId ||
 				manifest.stageId !== stageId ||
@@ -1069,6 +1079,15 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 	): Promise<MainAgentDecisionManifest> {
 		const decisionRef = `decision-${type}-${job.state.eventSeq + 1}-${Date.now()}`;
 		const sessionId = resumableMainSessionId(job);
+		await job.registerMainAgentCall({
+			id: decisionRef,
+			type,
+			manifestId: `decision_${decisionRef}`,
+			manifestRef: mainDecisionManifestPath(this.cwd, job.state.frame.jobId, type, decisionRef),
+			evidenceId: env.ASTRA_EVIDENCE_ID,
+			searchBatchId: env.ASTRA_SEARCH_BATCH_ID,
+			obligationId: env.ASTRA_REPAIR_OBLIGATION_ID || env.ASTRA_OBLIGATION_ID,
+		});
 		await job.recordChildSession({
 			sessionId,
 			role: "main-agent",
@@ -1125,7 +1144,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		try {
 			manifest = await this.runner.waitForManifest(
 				path,
-				async (manifestPath) => readJson<MainAgentDecisionManifest>(manifestPath),
+				async () => (await job.readMainAgentCallDelivery(decisionRef)) as MainAgentDecisionManifest,
 				MANIFEST_WAIT_TIMEOUT_MS,
 			);
 		} catch (error) {

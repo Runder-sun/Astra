@@ -42,6 +42,8 @@ export type UserGate =
 	  }
 	| {
 			kind: "research";
+			decisionRef?: string;
+			planId?: string;
 			stageId: string;
 			question: string;
 			reason: string;
@@ -297,6 +299,28 @@ export interface MainAgentDecisionManifest {
 	createdAt: string;
 }
 
+export interface MainAgentCall {
+	jobId: string;
+	id: string;
+	type: "plan" | MainAgentDecisionManifest["decisionType"];
+	manifestRef: string;
+	manifestId?: string;
+	stageId: string;
+	stageRevision: number;
+	stageExecutionId?: string;
+	planId?: string;
+	mode?: StagePlanManifest["mode"];
+	obligationId?: string;
+	evidenceId?: string;
+	searchBatchId?: string;
+	basisEventSeq: number;
+	basisHash: string;
+	deliveryHash?: string;
+	applied?: boolean;
+	completed?: boolean;
+	abandoned?: boolean;
+}
+
 export interface ResponsibilityTransfer {
 	id: string;
 	planId: string;
@@ -426,6 +450,7 @@ export interface Obligation {
 }
 
 export interface CanonicalArtifact {
+	mainAgentDecisionRef?: string;
 	adoptionCompletedAt?: string;
 	id: string;
 	type: string;
@@ -504,6 +529,9 @@ export interface SearchCandidate {
 }
 
 export interface SearchBatch {
+	acceptanceCompleted?: boolean;
+	stageRevision?: number;
+	stageExecutionId?: string;
 	id: string;
 	stageId: string;
 	planId: string;
@@ -539,6 +567,8 @@ export interface CandidateEvaluation {
 }
 
 export interface StageRouteDecision {
+	continuedPlanId?: string;
+	negativeSearchBatchId?: string;
 	consequencesCompleted?: boolean;
 	consequencesSupersededBy?: string;
 	id: string;
@@ -598,7 +628,10 @@ export interface CleanupTaskFiles {
 	workspace: boolean;
 	task: boolean;
 	resources: boolean;
-	sessions: Array<{ sessionId: string; source: string; target: string; present: boolean }>;
+	workspaceHash?: string;
+	taskHash?: string;
+	resourcesHash?: string;
+	sessions: Array<{ sessionId: string; source: string; target: string; present: boolean; expectedHash?: string }>;
 }
 
 export type CleanupIntent = {
@@ -667,6 +700,7 @@ export interface CanonicalResearchRoute {
 }
 
 export interface JobSnapshot {
+	mainAgentCalls?: Record<string, MainAgentCall>;
 	cleanupIntents?: Record<string, CleanupIntent>;
 	stageDefinitions?: Record<string, StageDefinition>;
 	version: 1;
@@ -697,11 +731,19 @@ export interface JobSnapshot {
 }
 
 export type AstraEvent =
+	| { type: "main_agent_call_recorded"; call: MainAgentCall }
+	| { type: "main_agent_delivery_recorded"; callId: string; deliveryHash: string }
+	| { type: "main_agent_call_finished"; callId: string; abandoned?: boolean }
 	| { type: "job_created"; snapshot: JobSnapshot }
 	| { type: "task_version_recorded"; taskId: string; version: TaskVersion }
 	| { type: "lease_acquired"; lease: Lease }
 	| { type: "lease_released"; owner: string }
-	| { type: "stage_plan_recorded"; plan: StagePlanManifest }
+	| {
+			type: "stage_plan_recorded";
+			plan: StagePlanManifest;
+			continueDecisionRef?: string;
+			search?: { batch: SearchBatch; nodes: ResearchNode[]; edges: ResearchEdge[] };
+	  }
 	| { type: "task_dispatched"; task: TaskPacket }
 	| { type: "task_status"; taskId: string; status: TaskStatus }
 	| { type: "child_session_recorded"; session: ChildSessionRecord }
@@ -714,7 +756,12 @@ export type AstraEvent =
 			decisionRef: string;
 			consequences?: EvidenceAcceptanceConsequences;
 	  }
-	| { type: "evidence_acceptance_recovered"; evidenceId: string; consequences: EvidenceAcceptanceConsequences }
+	| {
+			type: "evidence_acceptance_recovered";
+			evidenceId: string;
+			consequences: EvidenceAcceptanceConsequences;
+			searchSelection?: { batchId: string; candidateId: string; decisionRef: string };
+	  }
 	| { type: "review_recorded"; review: Review; consequences?: ReviewConsequences }
 	| { type: "obligation_created"; obligation: Obligation }
 	| { type: "obligation_resolved"; obligationId: string; satisfiedBy: string }
@@ -738,9 +785,19 @@ export type AstraEvent =
 	| { type: "automation_updated"; automation: AutomationLevel }
 	| { type: "user_gate_required"; gate: UserGate }
 	| { type: "user_gate_approved"; gate: UserGate; approvedAt: string }
-	| { type: "job_paused"; reason: string }
+	| { type: "job_paused"; reason: string; decisionRef?: string }
 	| { type: "job_resumed" }
-	| { type: "user_guidance_recorded"; node: ResearchNode }
+	| {
+			type: "user_guidance_recorded";
+			node: ResearchNode;
+			supersession?: {
+				stageId: string;
+				taskIds: string[];
+				batchIds: string[];
+				resume: boolean;
+				continueDecisionRef?: string;
+			};
+	  }
 	| { type: "active_stage_work_superseded"; stageId: string; taskIds: string[]; reason: string }
 	| {
 			type: "scientific_outcome_recorded";
@@ -756,7 +813,13 @@ export type AstraEvent =
 	| { type: "candidate_evaluation_recorded"; evaluation: CandidateEvaluation }
 	| { type: "search_batch_exhausted"; batchId: string; rationale: string }
 	| { type: "search_batch_continued"; batchId: string; decisionRef: string; rationale: string }
-	| { type: "search_batch_decided"; batchId: string; candidateId: string; decisionRef: string }
+	| {
+			type: "search_batch_decided";
+			batchId: string;
+			candidateId: string;
+			decisionRef: string;
+			acceptance?: { evidenceId: string; consequences: EvidenceAcceptanceConsequences };
+	  }
 	| { type: "search_candidate_pruned"; receipt: DiscardedCandidateReceipt }
 	| { type: "evidence_pruned"; receipt: DiscardedEvidenceReceipt }
 	| { type: "route_decided"; decision: StageRouteDecision; consequences?: RouteConsequences }

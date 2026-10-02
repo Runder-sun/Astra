@@ -15,9 +15,11 @@ import {
 	taskDir,
 	writeReviewerOutputManifest,
 } from "../src/contracts.ts";
+import { buildEffectiveTaskContract, semanticContractHash } from "../src/effective-contract.ts";
 import { PiChildSessionRunner, PiReviewerAdapter } from "../src/pi-child-session.ts";
 import { preparePlanEvidence } from "../src/plan-review.ts";
 import { ResearchJob } from "../src/research.ts";
+import { DEFAULT_STAGES } from "../src/stages.ts";
 import { JsonlAstraStore } from "../src/store.ts";
 import { NonRetryableResearchError, ResearchSupervisor } from "../src/supervisor.ts";
 import type {
@@ -37,7 +39,7 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function setup(separated = false) {
+async function setup(separated = false, requiredReviews?: number) {
 	const root = await mkdtemp(join(tmpdir(), "astra-adoption-review-"));
 	roots.push(root);
 	const data = separated ? await mkdtemp(join(tmpdir(), "astra-adoption-data-")) : root;
@@ -47,6 +49,14 @@ async function setup(separated = false) {
 		workspaceRoot: root,
 		objective: "Offline recovery",
 		automation: "full",
+		...(requiredReviews
+			? {
+					definitions: DEFAULT_STAGES.map((definition) => ({
+						...definition,
+						qualityPolicy: { ...definition.qualityPolicy!, minPassingReviews: requiredReviews },
+					})),
+				}
+			: {}),
 	});
 	return { root, store, job };
 }
@@ -384,9 +394,9 @@ it("A2 recovers a real Pi retry after an attempt=1 failure without output", asyn
 	expect(reopened.state.budgetUsage?.turnsUsed).toBe(2);
 });
 
-it("A2 recovers a search review with one candidate evaluation and no blocking obligation", async () => {
-	const { root, job, store } = await setup();
-	await job.recordStagePlan({
+it.each([1, 2])("A2 supervisor recovers search reviews using independent ordinals (N=%s)", async (required) => {
+	const { root, job, store } = await setup(false, required);
+	const plan = await job.recordStagePlan({
 		schemaVersion: "astra.stage_plan_manifest.v1",
 		id: "recovery-search",
 		jobId: job.state.frame.jobId,
@@ -407,26 +417,42 @@ it("A2 recovers a search review with one candidate evaluation and no blocking ob
 		sessionRef: "offline",
 		createdAt: new Date().toISOString(),
 	});
+	const pe = await preparePlanEvidence(job, plan);
+	await job.recordReview(reviewFixture(job, { evidenceId: pe.id, verdict: "pass", findings: [], blocking: false }));
 	const batch = Object.values(job.state.searchBatches)[0];
 	const candidate = Object.values(batch.candidates)[0];
+	const contract = buildEffectiveTaskContract(job, plan, plan.tasks[0]);
 	await delivery(job, "candidate", {
-		searchBatchId: batch.id,
-		searchCandidateId: candidate.id,
-		acceptanceChecks: batch.criteria,
+		...contract,
+		effectiveContractHash: semanticContractHash(contract),
+		replayKey: `stage-plan:${plan.id}:${candidate.key}`,
 	});
-	await job.updateBudget({ maxTurns: 1 });
+	const second = buildEffectiveTaskContract(job, plan, plan.tasks[1]);
+	const blocked = await job.dispatchTask({
+		...second,
+		effectiveContractHash: semanticContractHash(second),
+		replayKey: `stage-plan:${plan.id}:${plan.tasks[1].key}`,
+	});
+	await job.setTaskStatus(blocked.id, "blocked");
+	await job.updateBudget({ maxTurns: required });
 	const { adapter, run } = piReviewer(root, "fail");
 	interrupt(store, (event) => event.type === "review_recorded");
 	await supervisor(job, store, adapter).tick();
-	expect(Object.values(job.state.reviews)).toEqual([expect.objectContaining({ verdict: "fail", blocking: false })]);
+	expect(Object.values(job.state.reviews).filter((review) => review.evidenceId !== pe.id)).toEqual([
+		expect.objectContaining({ verdict: "fail", blocking: false }),
+	]);
 	expect(Object.values(job.state.candidateEvaluations)).toHaveLength(1);
 	expect(Object.values(job.state.obligations)).toHaveLength(0);
 	const reopened = (await ResearchJob.open(store, job.state.frame.jobId))!;
 	await supervisor(reopened, store, adapter).tick();
-	expect(Object.values(reopened.state.candidateEvaluations)).toHaveLength(1);
-	expect(Object.values(reopened.state.reviews)).toHaveLength(1);
-	expect(run).toHaveBeenCalledOnce();
-	expect(reopened.state.budgetUsage?.turnsUsed).toBe(1);
+	expect(Object.values(reopened.state.candidateEvaluations)).toHaveLength(required);
+	const reviews = Object.values(reopened.state.reviews).filter((review) => review.evidenceId !== pe.id);
+	expect(reviews).toHaveLength(required);
+	expect(new Set(reviews.map((review) => reopened.state.tasks[review.reviewerTaskId!].replayKey)).size).toBe(required);
+	expect(run).toHaveBeenCalledTimes(required);
+	expect(reopened.state.budgetUsage?.turnsUsed).toBe(required);
+	await supervisor(reopened, store, adapter).tick();
+	expect(run).toHaveBeenCalledTimes(required);
 });
 
 it.each([false, true])(

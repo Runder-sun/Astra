@@ -690,6 +690,7 @@ describe("Codex research backend", () => {
 			new CodexAppServerRunner({ executable: process.execPath, prefixArgs: [fixture] }),
 		);
 		const plan = await adapters.planStage(job);
+		await job.recordStagePlan(plan, job.state);
 		const task = await job.dispatchTask({
 			...plan.tasks[0],
 			responsibilityTransfers: [],

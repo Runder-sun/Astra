@@ -23,6 +23,8 @@ import {
 import { recordCodexWebSources } from "./codex-web-sources.ts";
 import {
 	atomicWriteJson,
+	mainDecisionManifestPath,
+	stagePlanManifestPath,
 	TASK_DELIVERY_INSTRUCTIONS,
 	taskDir,
 	taskStageContract,
@@ -96,17 +98,18 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 		options: Omit<CodexRunOptions<S>, "onThread" | "logPath" | "threadId">,
 		consume: (result: CodexRunResult<Static<S>>) => Promise<{ value: T; manifestRef: string }>,
 	): Promise<T> {
-		const previous = Object.values(job.state.sessions).find(
+		const initial = job.state;
+		const previous = Object.values(initial.sessions).find(
 			(session) => session.role === role && session.taskId === taskId && session.status === "interrupted",
 		);
 		let sessionId =
-			role === "main-agent" ? job.state.sessions[job.state.mainAgentSessionId]?.sessionId : previous?.sessionId;
+			role === "main-agent" ? initial.sessions[initial.mainAgentSessionId]?.sessionId : previous?.sessionId;
 		if (sessionId?.startsWith("codex-pending-")) sessionId = undefined;
 		const logPath = join(
-			job.state.frame.permissions.workspaceRoot,
+			initial.frame.permissions.workspaceRoot,
 			".astra",
 			"jobs",
-			job.state.frame.jobId,
+			initial.frame.jobId,
 			"codex-events",
 			`${taskId}-${attempt}.jsonl`,
 		);
@@ -130,6 +133,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 				},
 			});
 			const submitted = await consume(result);
+			if (role === "main-agent") await job.readMainAgentCallDelivery(taskId);
 			await job.recordChildSession({
 				sessionId: result.threadId,
 				role,
@@ -219,8 +223,9 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 		}
 		await atomicWriteJson(sourceLedger, [...sources]);
 		for (const inputRef of task.inputArtifactRefs) {
-			const artifact = job.state.canonical[inputRef];
-			const evidence = job.state.evidence[artifact?.evidenceId ?? inputRef];
+			const state = job.state;
+			const artifact = state.canonical[inputRef];
+			const evidence = state.evidence[artifact?.evidenceId ?? inputRef];
 			for (const ref of evidence?.refs ?? []) {
 				if (await readSourceRecord(task.scope.workspaceRoot, task.jobId, ref)) sources.add(ref);
 			}
@@ -924,60 +929,75 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 		const stageId = job.state.frame.activeStageId;
 		const id = `plan_${randomUUID()}`;
 		const inputArtifactRefs = [...new Set([...Object.keys(job.state.canonical), ...Object.keys(job.state.evidence)])];
-		return this.main(
-			job,
-			id,
-			Type.Object(
-				{
-					...codexPlanSchema.properties,
-					tasks: Type.Array(
-						Type.Object(
-							{
-								...codexPlanSchema.properties.tasks.items.properties,
-								inputArtifactRefs: inputArtifactRefs.length
-									? Type.Array(Type.String({ enum: inputArtifactRefs }), {
-											maxItems: inputArtifactRefs.length,
-										})
-									: Type.Array(Type.String(), { maxItems: 0 }),
-							},
-							{ additionalProperties: false },
-						),
-						{
-							minItems:
-								requestedMode === "search" ? (job.definitions[stageId].searchPolicy?.minCandidates ?? 2) : 1,
-							maxItems: obligation || requestedMode === "repair" ? 1 : requestedMode === "search" ? 4 : 2,
-						},
-					),
-				},
-				{ additionalProperties: false },
-			),
-			`Design actionable worker assignments for the active capability ${stageId} in mode ${requestedMode}. ${obligation ? `Resolve obligation ${obligation.id} with one complete repair task. Read its source review and all open requirements for the same evidence lineage from the indexed state; do not copy historical ID wrappers into criteria.` : requestedMode === "search" ? "Create diverse independent candidates within searchPolicy bounds. Inspect previous batches and evaluations before continuing a search." : "Create one focused task, or two independently useful tasks."} Stage and synthesis tasks must include every requiredOutputFields field from the capability contract. Accepted local inputs awaiting synthesis: ${JSON.stringify(job.unsynthesizedLocalEvidence(stageId).map((evidence) => evidence.id))}. Read relevant previous plan reviews by their IDs in research-summary.json; their full criteria and findings are in research-context.json. Use exact existing artifact/evidence IDs as inputs. Concurrent tasks cannot depend on one another. Each task.objective must instruct its worker to perform this capability and deliver its outputs, not to plan dispatch, enter a stage or declare pipeline completion. Success criteria must assess delivered results, not readiness to start. Set responsibilityBindings explicitly: use [] for local work; set responsibilityTransfers to [] unless an independently reviewed exact handoff is necessary. Legacy handoff candidates, including sourceTaskId, sourceContractHash, sourceIndex, exactCriterion, and exactly one nodeId or issueId, are listed in research-summary.json transferableResponsibilities. Transfer only a listed item and set destinationStageId to the current stage, destinationPhase to synthesis, and a rationale. If one source requirement has both a node and issue candidate, include both exact identities. The host rejects text matching, unbound strings, wrong source fingerprints and duplicates. Keep every unlisted source requirement inherited. Synthesis must carry transferred responsibilities and bind exact unresolved objection nodeIds from research-summary.json that it will resolve. Never assign by similar wording. Only you are planning: do not execute these assignments yourself, and do not copy that restriction into worker objectives. Workers must perform the work and verification permitted by their capability contract.`,
-			async (result) => {
-				const value: StagePlanManifest = {
-					...result.output,
-					tasks: result.output.tasks.map((task) => ({
-						...task,
-						responsibilityTransfers: task.responsibilityTransfers.map(({ nodeId, issueId, ...transfer }) => ({
-							...transfer,
-							...(nodeId === null ? {} : { nodeId }),
-							...(issueId === null ? {} : { issueId }),
-						})),
-					})),
-					schemaVersion: "astra.stage_plan_manifest.v1",
+		return job
+			.registerMainAgentCall({
+				id,
+				type: "plan",
+				planId: id,
+				mode: requestedMode,
+				obligationId: obligation?.id,
+				manifestRef: stagePlanManifestPath(job.state.frame.permissions.workspaceRoot, job.state.frame.jobId, id),
+			})
+			.then(() =>
+				this.main(
+					job,
 					id,
-					jobId: job.state.frame.jobId,
-					stageId,
-					decisionRef: id,
-					mode: requestedMode,
-					obligationId: obligation?.id,
-					sessionRef: `codex-session:${result.threadId}`,
-					createdAt: new Date().toISOString(),
-				};
-				const manifestRef = await writeStagePlanManifest(value, job.state.frame.permissions.workspaceRoot);
-				return { value, manifestRef };
-			},
-			obligation?.id,
-		);
+					Type.Object(
+						{
+							...codexPlanSchema.properties,
+							tasks: Type.Array(
+								Type.Object(
+									{
+										...codexPlanSchema.properties.tasks.items.properties,
+										inputArtifactRefs: inputArtifactRefs.length
+											? Type.Array(Type.String({ enum: inputArtifactRefs }), {
+													maxItems: inputArtifactRefs.length,
+												})
+											: Type.Array(Type.String(), { maxItems: 0 }),
+									},
+									{ additionalProperties: false },
+								),
+								{
+									minItems:
+										requestedMode === "search"
+											? (job.definitions[stageId].searchPolicy?.minCandidates ?? 2)
+											: 1,
+									maxItems: obligation || requestedMode === "repair" ? 1 : requestedMode === "search" ? 4 : 2,
+								},
+							),
+						},
+						{ additionalProperties: false },
+					),
+					`Design actionable worker assignments for the active capability ${stageId} in mode ${requestedMode}. ${obligation ? `Resolve obligation ${obligation.id} with one complete repair task. Read its source review and all open requirements for the same evidence lineage from the indexed state; do not copy historical ID wrappers into criteria.` : requestedMode === "search" ? "Create diverse independent candidates within searchPolicy bounds. Inspect previous batches and evaluations before continuing a search." : "Create one focused task, or two independently useful tasks."} Stage and synthesis tasks must include every requiredOutputFields field from the capability contract. Accepted local inputs awaiting synthesis: ${JSON.stringify(job.unsynthesizedLocalEvidence(stageId).map((evidence) => evidence.id))}. Read relevant previous plan reviews by their IDs in research-summary.json; their full criteria and findings are in research-context.json. Use exact existing artifact/evidence IDs as inputs. Concurrent tasks cannot depend on one another. Each task.objective must instruct its worker to perform this capability and deliver its outputs, not to plan dispatch, enter a stage or declare pipeline completion. Success criteria must assess delivered results, not readiness to start. Set responsibilityBindings explicitly: use [] for local work; set responsibilityTransfers to [] unless an independently reviewed exact handoff is necessary. Legacy handoff candidates, including sourceTaskId, sourceContractHash, sourceIndex, exactCriterion, and exactly one nodeId or issueId, are listed in research-summary.json transferableResponsibilities. Transfer only a listed item and set destinationStageId to the current stage, destinationPhase to synthesis, and a rationale. If one source requirement has both a node and issue candidate, include both exact identities. The host rejects text matching, unbound strings, wrong source fingerprints and duplicates. Keep every unlisted source requirement inherited. Synthesis must carry transferred responsibilities and bind exact unresolved objection nodeIds from research-summary.json that it will resolve. Never assign by similar wording. Only you are planning: do not execute these assignments yourself, and do not copy that restriction into worker objectives. Workers must perform the work and verification permitted by their capability contract.`,
+					async (result) => {
+						const value: StagePlanManifest = {
+							...result.output,
+							tasks: result.output.tasks.map((task) => ({
+								...task,
+								responsibilityTransfers: task.responsibilityTransfers.map(
+									({ nodeId, issueId, ...transfer }) => ({
+										...transfer,
+										...(nodeId === null ? {} : { nodeId }),
+										...(issueId === null ? {} : { issueId }),
+									}),
+								),
+							})),
+							schemaVersion: "astra.stage_plan_manifest.v1",
+							id,
+							jobId: job.state.frame.jobId,
+							stageId,
+							decisionRef: id,
+							mode: requestedMode,
+							obligationId: obligation?.id,
+							sessionRef: `codex-session:${result.threadId}`,
+							createdAt: new Date().toISOString(),
+						};
+						const manifestRef = await writeStagePlanManifest(value, job.state.frame.permissions.workspaceRoot);
+						return { value, manifestRef };
+					},
+					obligation?.id,
+				),
+			);
 	}
 
 	private decision<S extends TSchema>(
@@ -986,24 +1006,38 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 		schema: S,
 		prompt: string,
 		fields: (output: Static<S>) => Partial<MainAgentDecisionManifest>,
+		target: { evidenceId?: string; searchBatchId?: string; obligationId?: string } = {},
 	): Promise<MainAgentDecisionManifest> {
 		const id = `decision_${randomUUID()}`;
-		return this.main(job, id, schema, prompt, async (result) => {
-			const value: MainAgentDecisionManifest = {
-				schemaVersion: "astra.main_agent_decision_manifest.v1",
+		const state = job.state;
+		const stageId = state.frame.activeStageId;
+		return job
+			.registerMainAgentCall({
+				id,
+				type,
 				manifestId: id,
-				jobId: job.state.frame.jobId,
-				decisionType: type,
-				decisionRef: id,
-				stageId: job.state.frame.activeStageId,
-				rationale: "",
-				...fields(result.output),
-				sessionRef: `codex-session:${result.threadId}`,
-				createdAt: new Date().toISOString(),
-			};
-			const manifestRef = await writeMainDecisionManifest(value, job.state.frame.permissions.workspaceRoot);
-			return { value, manifestRef };
-		});
+				...target,
+				manifestRef: mainDecisionManifestPath(state.frame.permissions.workspaceRoot, state.frame.jobId, type, id),
+			})
+			.then(() =>
+				this.main(job, id, schema, prompt, async (result) => {
+					const current = job.state;
+					const value: MainAgentDecisionManifest = {
+						schemaVersion: "astra.main_agent_decision_manifest.v1",
+						manifestId: id,
+						jobId: current.frame.jobId,
+						decisionType: type,
+						decisionRef: id,
+						stageId,
+						rationale: "",
+						...fields(result.output),
+						sessionRef: `codex-session:${result.threadId}`,
+						createdAt: new Date().toISOString(),
+					};
+					const manifestRef = await writeMainDecisionManifest(value, current.frame.permissions.workspaceRoot);
+					return { value, manifestRef };
+				}),
+			);
 	}
 
 	decideEvidence(evidence: Evidence, job: ResearchJob): Promise<MainAgentDecisionManifest> {
@@ -1013,6 +1047,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 			codexEvidenceDecisionSchema,
 			`Accept, reject, or defer evidence ${evidence.id} using its independent reviews. A rigorous negative whole-research review is valid evidence; acceptance does not endorse the research hypothesis.`,
 			(output) => ({ ...output, evidenceId: evidence.id }),
+			{ evidenceId: evidence.id },
 		);
 	}
 
@@ -1023,6 +1058,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 			codexAdoptionSchema,
 			`Decide whether reviewed evidence ${evidence.id} should become the canonical version of this stage. Adoption automatically replaces its previous canonical version.`,
 			(output) => ({ ...output, evidenceId: evidence.id }),
+			{ evidenceId: evidence.id },
 		);
 	}
 
@@ -1046,6 +1082,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 					);
 				return { ...output, selectedCandidateId: output.selectedCandidateId ?? undefined, searchBatchId: batch.id };
 			},
+			{ searchBatchId: batch.id },
 		);
 	}
 
@@ -1073,6 +1110,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 				targetStageId: output.targetStageId ?? undefined,
 				question: output.question ?? undefined,
 			}),
+			{ obligationId: obligation?.id },
 		);
 	}
 }

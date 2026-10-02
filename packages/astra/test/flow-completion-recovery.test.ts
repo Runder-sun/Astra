@@ -210,7 +210,9 @@ it.each([false, true])(
 		await supervisor.tick();
 		expect(worker).toHaveBeenCalledOnce();
 		const task = Object.values(job.state.tasks).find((task) => task.role === "worker")!;
-		expect(task.status).toBe(snapshot ? "succeeded" : "running");
+		expect(task.status).toBe("succeeded");
+		expect(Object.values(job.state.evidence).filter((evidence) => evidence.taskId === task.id)).toHaveLength(1);
+		expect(job.state.frame.nextAction).not.toContain("infrastructure failure");
 		const prepared = JSON.parse(
 			await readFile(join(root, ".astra/jobs", task.jobId, "tasks", task.id, "evidence-completion.json"), "utf8"),
 		);
@@ -1103,6 +1105,7 @@ it.each(["codex", "pi"] as const)(
 				);
 				const supervisor = completionSupervisor(job, store, adapter);
 				const turns = job.state.budgetUsage!.turnsUsed;
+				await job.updateBudget({ maxTurns: turns + 1 });
 				await supervisor.tick();
 				expect(run).toHaveBeenCalledOnce();
 				const workers = Object.values(job.state.tasks).filter((task) => task.role === "worker");
@@ -1111,7 +1114,8 @@ it.each(["codex", "pi"] as const)(
 				expect(workers[0].status).toBe("succeeded");
 				expect(Object.values(job.state.evidence).filter((e) => e.type !== "stage-plan")).toHaveLength(1);
 				expect(job.state.paused).toBe(true);
-				expect(job.state.frame.nextAction).toContain("injected completion");
+				expect(job.state.frame.userGate).toMatchObject({ kind: "budget", limit: "maxTurns" });
+				expect(job.state.frame.nextAction).not.toContain("infrastructure failure");
 				expect(job.state.budgetUsage!.turnsUsed).toBe(turns + 1);
 				await supervisor.tick();
 				expect(run).toHaveBeenCalledOnce();
@@ -1187,6 +1191,7 @@ it("R1 supervisor still retries execution failure with no durable output", async
 it("R1 saves returned output before auxiliary accounting failure", async () => {
 	const { job, store } = await setup();
 	await approvedCompletionPlan(job, true);
+	await job.updateBudget({ maxTurns: (job.state.budgetUsage?.turnsUsed ?? 0) + 1 });
 	const run = vi.fn(async (task: TaskPacket) => ({
 		artifactType: task.requiredOutputType,
 		content: { content: "returned" },
@@ -1195,12 +1200,17 @@ it("R1 saves returned output before auxiliary accounting failure", async () => {
 	vi.spyOn(job, "clearProviderBackoff").mockRejectedValueOnce(new Error("injected auxiliary bookkeeping failure"));
 	await completionSupervisor(job, store, { run }).tick();
 	expect(run).toHaveBeenCalledOnce();
-	expect(job.state.paused).toBe(true);
+	expect(job.state.frame.userGate).toMatchObject({ kind: "budget", limit: "maxTurns" });
+	expect(job.state.frame.nextAction).not.toContain("infrastructure failure");
+	const before = job.state;
+	await completionSupervisor(job, store, { run }).tick();
+	expect(run).toHaveBeenCalledOnce();
+	expect(Object.values(job.state.evidence)).toEqual(Object.values(before.evidence));
 	expect(Object.values(job.state.evidence).filter((e) => e.type !== "stage-plan")).toHaveLength(1);
 });
 
 it.each(["snapshot", "replay"] as const)(
-	"R2 supervisor's ask-user returned during pause survives %s and installs its gate on resume",
+	"R2 supervisor does not first apply a returned ask-user while paused (%s)",
 	async (storage) => {
 		const { job, store } = await setup();
 		const result = await delivery(job, "canonical", { deliveryKind: "stage", requiredOutputType: "validation" });
@@ -1225,7 +1235,8 @@ it.each(["snapshot", "replay"] as const)(
 			},
 		});
 		await supervisor.tick();
-		expect(job.state.routeDecisions[decision.decisionRef].consequencesCompleted).not.toBe(true);
+		expect(job.state.routeDecisions[decision.decisionRef]).toBeUndefined();
+		expect(job.state.budgetUsage!.turnsUsed).toBe(1);
 		expect(job.state.frame.nextAction).toBe("paused: explicit pause while deciding");
 		const replayStore = storage === "snapshot" ? store : new MemoryAstraStore();
 		if (storage === "replay")
@@ -1234,18 +1245,11 @@ it.each(["snapshot", "replay"] as const)(
 		const reopened = (await ResearchJob.open(replayStore, job.state.frame.jobId))!;
 		await reopened.recoverPendingOperations();
 		expect(reopened.state.frame.nextAction).toBe("paused: explicit pause while deciding");
+		expect(reopened.state.routeDecisions[decision.decisionRef]).toBeUndefined();
 		await reopened.resume();
-		expect(reopened.state.paused).toBe(true);
-		await completionSupervisor(reopened, replayStore, { run: forbidden }).tick();
-		expect(forbidden).not.toHaveBeenCalled();
-		expect(reopened.state.frame.userGate).toEqual(
-			expect.objectContaining({ kind: "research", question: "Which source?" }),
-		);
-		await expect(reopened.resume()).rejects.toThrow(/guidance/);
-		await reopened.resumeWithGuidance("Use source A");
-		await reopened.recoverPendingOperations();
 		expect(reopened.state.paused).toBe(false);
 		expect(reopened.state.frame.userGate).toBeUndefined();
+		expect(forbidden).not.toHaveBeenCalled();
 	},
 );
 

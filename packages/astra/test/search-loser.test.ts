@@ -2,6 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
+import { buildEffectiveTaskContract, semanticContractHash } from "../src/effective-contract.ts";
+import { preparePlanEvidence } from "../src/plan-review.ts";
 import { ResearchJob } from "../src/research.ts";
 import { MemoryAstraStore } from "../src/store.ts";
 import { reviewFixture } from "./review-fixture.ts";
@@ -18,7 +20,7 @@ it.each([
 		let job = await ResearchJob.create(store, { objective: "Choose one viable alternative", workspaceRoot: root });
 		await job.reload();
 		const definition = job.definitions.validation;
-		await job.recordStagePlan({
+		const plan = await job.recordStagePlan({
 			schemaVersion: "astra.stage_plan_manifest.v1",
 			id: "audit_search_plan",
 			jobId: job.state.frame.jobId,
@@ -39,30 +41,16 @@ it.each([
 			sessionRef: "fixture",
 			createdAt: new Date().toISOString(),
 		});
+		const pe = await preparePlanEvidence(job, plan);
+		await job.recordReview(reviewFixture(job, { evidenceId: pe.id, verdict: "pass", findings: [] }));
 		const batch = Object.values(job.state.searchBatches)[0]!;
 		const candidates = Object.values(batch.candidates);
 		for (const [index, candidate] of candidates.entries()) {
+			const contract = buildEffectiveTaskContract(job, plan, plan.tasks[index]);
 			const task = await job.dispatchTask({
-				stageId: "validation",
-				stageExecutionId: "validation",
-				role: "worker",
-				objective: candidate.hypothesis,
-				inputArtifactRefs: [],
-				requiredCanonicalArtifacts: [],
-				requiredOutputType: "validation",
-				requiredOutputFields: definition.requiredOutputFields,
-				acceptanceChecks: definition.acceptanceChecks,
-				failureSignals: definition.failureSignals,
-				successCriteria: [],
-				dependencies: [],
-				scope: { workspaceRoot: root, allowedPaths: ["."] },
-				allowedTools: ["read"],
-				writeAuthority: "none",
-				budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 30000 },
-				reviewGateRequired: true,
-				resumePolicy: "resume-session",
-				searchBatchId: batch.id,
-				searchCandidateId: candidate.id,
+				...contract,
+				effectiveContractHash: semanticContractHash(contract),
+				replayKey: `stage-plan:${plan.id}:${candidate.key}`,
 			});
 			await job.setTaskStatus(task.id, "succeeded");
 			const evidence = await job.recordEvidence({
@@ -101,6 +89,8 @@ it.each([
 				...old,
 				id: "unrelated_task",
 				replayKey: "unrelated",
+				planId: undefined,
+				effectiveContractHash: undefined,
 				searchBatchId: undefined,
 				searchCandidateId: undefined,
 			});

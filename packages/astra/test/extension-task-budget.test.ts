@@ -9,6 +9,7 @@ import {
 	type ExtensionFactory,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { taskPacketPath, writeTaskPacket } from "../src/contracts.ts";
 import { createAstraExtension } from "../src/extension.ts";
@@ -18,6 +19,7 @@ import { JsonlAstraStore } from "../src/store.ts";
 import { prepareTaskWorkspace, taskWorkspacePath } from "../src/task-workspace.ts";
 import type { TaskPacket } from "../src/types.ts";
 import { incrementalContentHash } from "../src/worker-submission.ts";
+import { reviewFixture } from "./review-fixture.ts";
 
 const tempRoots: string[] = [];
 
@@ -110,6 +112,87 @@ async function setup(role: "worker" | "reviewer" = "worker"): Promise<{ fixture:
 }
 
 describe("Astra TaskPacket inner-loop controls", () => {
+	it.each([false, true])(
+		"M4 valid Pi adoption submission enforces same capability at the source (cross=%s)",
+		async (cross) => {
+			const root = await mkdtemp(join(tmpdir(), "astra-pi-replacement-source-"));
+			tempRoots.push(root);
+			const seed = await createTask(root);
+			const store = new JsonlAstraStore(root);
+			let job = (await ResearchJob.open(store, seed.jobId))!;
+			const accepted = [];
+			for (const [index, stageId] of [cross ? "literature" : "validation", "validation"].entries()) {
+				const task = await job.dispatchTask({
+					...seed,
+					id: `replacement_${index}`,
+					replayKey: `replacement_${index}`,
+					stageId,
+					stageExecutionId: job.state.stages[stageId].executionId ?? `stage_exec_${stageId}`,
+					requiredOutputType: stageId,
+					requiredOutputFields: ["content"],
+				});
+				await job.setTaskStatus(task.id, "succeeded");
+				const evidence = await job.recordEvidence({
+					taskId: task.id,
+					stageId,
+					type: stageId,
+					content: { content: index },
+					refs: [],
+				});
+				await job.recordReview(reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] }));
+				await job.decideEvidence(evidence.id, true);
+				accepted.push(evidence);
+			}
+			const old = await job.adoptEvidence(accepted[0].id);
+			vi.stubEnv("ASTRA_PROJECT_ROOT", root);
+			vi.stubEnv("ASTRA_JOB_ID", job.state.frame.jobId);
+			vi.stubEnv("ASTRA_ROLE", "main-agent");
+			vi.stubEnv("ASTRA_SESSION_ID", "real-pi-submission");
+			vi.stubEnv("ASTRA_DECISION_TYPE", "adoption");
+			vi.stubEnv("ASTRA_DECISION_REF", "replacement_submission");
+			vi.stubEnv("ASTRA_EVIDENCE_ID", accepted[1].id);
+			const fixture = createFixture(
+				createAstraExtension({ jobId: job.state.frame.jobId, role: "main-agent" }),
+				root,
+			);
+			const submit = fixture.tools.get("astra_submit_main_decision")!;
+			const params = {
+				decisionType: "adoption",
+				decisionRef: "replacement_submission",
+				evidenceId: accepted[1].id,
+				adopt: true,
+				replacementOf: old.id,
+				rationale: "Replace the reviewed original",
+			};
+			expect(Value.Check(submit.parameters, params)).toBe(true);
+			const response = await submit.execute("replacement", params, undefined, undefined, fixture.context);
+			expect(response.terminate).toBe(true);
+			const before = job.state;
+			if (cross) {
+				await expect(job.adoptEvidence(accepted[1].id, old.id)).rejects.toThrow(/same|replacement/);
+				expect(job.state).toEqual(before);
+				return;
+			}
+			const append = store.append.bind(store);
+			let hit = false;
+			const spy = vi.spyOn(store, "append").mockImplementation(async (id, event) => {
+				if (!hit && event.type === "canonical_artifact_status" && event.status === "active") {
+					hit = true;
+					vi.spyOn(store, "writeSnapshot").mockRejectedValueOnce(new Error("Active snapshot failed"));
+				}
+				return append(id, event);
+			});
+			await expect(job.adoptEvidence(accepted[1].id, old.id)).rejects.toThrow(/snapshot/);
+			spy.mockRestore();
+			job = (await ResearchJob.open(store, job.state.frame.jobId))!;
+			expect(job.state.retiredArtifacts[old.id]).toBeDefined();
+			const adopted = await job.adoptEvidence(accepted[1].id, old.id);
+			expect(adopted.status).toBe("active");
+			const completed = job.state;
+			await job.adoptEvidence(accepted[1].id, old.id);
+			expect(job.state).toEqual(completed);
+		},
+	);
 	it("submits a literature increment through the extension and records the merged evidence", async () => {
 		const root = await mkdtemp(join(tmpdir(), "astra-extension-incremental-"));
 		tempRoots.push(root);

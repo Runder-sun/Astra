@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { stagePlanManifestPath, writeStagePlanManifest } from "../src/contracts.ts";
 import {
 	buildEffectiveTaskContract,
 	planGenerationBasisHash,
@@ -71,6 +72,17 @@ const decision = (job: ResearchJob, fields: Partial<MainAgentDecisionManifest>):
 		...fields,
 	}) as MainAgentDecisionManifest;
 
+async function savePlanDelivery(job: ResearchJob, value: StagePlanManifest) {
+	await job.registerMainAgentCall({
+		id: value.decisionRef,
+		type: "plan",
+		planId: value.id,
+		mode: value.mode,
+		manifestRef: stagePlanManifestPath(job.state.frame.permissions.workspaceRoot, job.state.frame.jobId, value.id),
+	});
+	await writeStagePlanManifest(value, job.state.frame.permissions.workspaceRoot);
+}
+
 it("reuses the saved plan after pausing during planning", async () => {
 	const store = new MemoryAstraStore();
 	const job = await ResearchJob.create(store, {
@@ -83,6 +95,7 @@ it("reuses the saved plan after pausing during planning", async () => {
 		planStage: vi.fn(async () => {
 			calls++;
 			const value = plan(job, `plan_${calls}`);
+			await savePlanDelivery(job, value);
 			await job.pause("operator pause while planner returns");
 			return value;
 		}),
@@ -96,16 +109,25 @@ it("reuses the saved plan after pausing during planning", async () => {
 		worker: { run: vi.fn() },
 		reviewer: {
 			review: vi.fn(async (evidence: Evidence) => {
+				const review = reviewFixture(job, {
+					evidenceId: evidence.id,
+					verdict: "pass",
+					findings: [],
+					blocking: false,
+				});
+				await job.recordReview(review);
 				await job.pause("pause after independent plan review");
-				return reviewFixture(job, { evidenceId: evidence.id, verdict: "pass", findings: [] });
+				return review;
 			}),
 		},
 	});
 	await supervisor.tick();
-	expect(Object.keys(job.state.stagePlans)).toEqual(["plan_1"]);
+	expect(Object.keys(job.state.stagePlans)).toEqual([]);
+	expect(job.state.mainAgentCalls?.plan_1.deliveryHash).toBeTruthy();
 	expect(Object.values(job.state.tasks)).toHaveLength(0);
 	await job.resume();
 	await supervisor.tick();
+	expect(Object.keys(job.state.stagePlans)).toEqual(["plan_1"]);
 	expect(calls).toBe(1);
 	expect(Object.values(job.state.reviews)).toHaveLength(1);
 	expect(job.status().budget.turnsUsed).toBe(2);
@@ -279,6 +301,7 @@ it("restores an unfrozen search plan without duplicating its batch or planning t
 			const value = plan(job, "paused_search");
 			value.mode = "search";
 			value.tasks = [value.tasks[0], { ...value.tasks[0], key: "second", objective: "alternative result" }];
+			await savePlanDelivery(job, value);
 			await job.pause("pause before search freeze");
 			return value;
 		}),
@@ -296,12 +319,13 @@ it("restores an unfrozen search plan without duplicating its batch or planning t
 	const worker = { run: vi.fn() };
 	const supervisor = new ResearchSupervisor(job, store, { mainAgent, reviewer, worker });
 	await supervisor.tick();
-	const saved = job.state.stagePlans.paused_search;
-	expect(saved.generationBasisHash).toBe(planGenerationBasisHash(job.state, job.definitions, saved));
+	expect(job.state.stagePlans.paused_search).toBeUndefined();
+	expect(job.state.mainAgentCalls?.paused_search.deliveryHash).toBeTruthy();
 	expect(Object.values(job.state.tasks)).toHaveLength(0);
 	await job.reload();
 	await job.resume();
 	await supervisor.tick();
+	expect(job.state.stagePlans.paused_search.generationBasisHash).toBeTruthy();
 	expect(mainAgent.planStage).toHaveBeenCalledOnce();
 	expect(reviewer.review).toHaveBeenCalledOnce();
 	expect(worker.run).not.toHaveBeenCalled();
@@ -310,7 +334,7 @@ it("restores an unfrozen search plan without duplicating its batch or planning t
 	expect(job.status().budget.turnsUsed).toBe(2);
 	const events = await store.readEvents(job.state.frame.jobId);
 	const planIndex = events.findIndex((stored) => stored.event.type === "stage_plan_recorded");
-	expect(events[planIndex + 1].event.type).toBe("search_batch_recorded");
+	expect(events[planIndex].event).toMatchObject({ type: "stage_plan_recorded", search: { batch: { round: 1 } } });
 });
 
 it.each(["during-planning", "after-planning", "stage-revision", "input-version"] as const)(

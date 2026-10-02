@@ -2,7 +2,9 @@ import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildEffectiveTaskContract, semanticContractHash } from "../src/effective-contract.ts";
 import { PiChildSessionRunner } from "../src/pi-child-session.ts";
+import { preparePlanEvidence } from "../src/plan-review.ts";
 import { ResearchJob } from "../src/research.ts";
 import { buildResearchBoard, formatResearchBoard } from "../src/research-board.ts";
 import { DEFAULT_STAGES } from "../src/stages.ts";
@@ -282,10 +284,12 @@ describe("Research Kernel v2", () => {
 	});
 
 	it("exhausts a continued search round without discarding its evaluated lineage", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-continued-search-"));
+		tempRoots.push(root);
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			jobId: "job_search_continue",
 			objective: "break a tie between candidate methods",
-			workspaceRoot: "/workspace",
+			workspaceRoot: root,
 		});
 		const searchPlan = {
 			schemaVersion: "astra.stage_plan_manifest.v1" as const,
@@ -309,31 +313,21 @@ describe("Research Kernel v2", () => {
 			createdAt: new Date().toISOString(),
 		};
 		await job.recordStagePlan(searchPlan);
+		const pe = await preparePlanEvidence(job, searchPlan);
+		await job.recordReview(reviewFixture(job, { evidenceId: pe.id, verdict: "pass", findings: [], blocking: false }));
 		const firstBatch = Object.values(job.state.searchBatches)[0];
 		if (!firstBatch) throw new Error("first search batch missing");
 
 		for (const candidate of Object.values(firstBatch.candidates)) {
+			const contract = buildEffectiveTaskContract(
+				job,
+				searchPlan,
+				searchPlan.tasks.find((task) => task.key === candidate.key)!,
+			);
 			const task = await job.dispatchTask({
-				stageId: "validation",
-				stageExecutionId: "stage_exec_validation",
-				role: "worker",
-				objective: candidate.hypothesis,
-				inputArtifactRefs: [],
-				requiredCanonicalArtifacts: [],
-				requiredOutputType: "validation",
-				requiredOutputFields: job.definitions.validation.requiredOutputFields,
-				acceptanceChecks: firstBatch.criteria,
-				failureSignals: job.definitions.validation.failureSignals,
-				dependencies: [],
-				scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
-				allowedTools: ["read"],
-				writeAuthority: "none",
-				budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 30_000 },
-				reviewGateRequired: true,
-				resumePolicy: "resume-session",
-				successCriteria: firstBatch.criteria,
-				searchBatchId: firstBatch.id,
-				searchCandidateId: candidate.id,
+				...contract,
+				effectiveContractHash: semanticContractHash(contract),
+				replayKey: `stage-plan:${searchPlan.id}:${candidate.key}`,
 			});
 			await job.setTaskStatus(task.id, "succeeded");
 			const evidence = await job.recordEvidence({
@@ -375,8 +369,8 @@ describe("Research Kernel v2", () => {
 			continuationRationale: "the frozen criteria remain tied",
 		});
 		expect(Object.values(exhausted.candidates)).toHaveLength(2);
-		expect(Object.values(job.state.evidence)).toHaveLength(2);
-		expect(Object.values(job.state.reviews)).toHaveLength(2);
+		expect(Object.values(job.state.evidence).filter((evidence) => evidence.type !== "stage-plan")).toHaveLength(2);
+		expect(Object.values(job.state.reviews).filter((review) => review.evidenceId !== pe.id)).toHaveLength(2);
 		expect(Object.values(job.state.candidateEvaluations)).toHaveLength(2);
 		for (const candidate of Object.values(exhausted.candidates)) {
 			expect(job.state.graph.nodes[candidate.graphNodeId]?.status).toBe("superseded");
@@ -582,31 +576,18 @@ describe("Research Kernel v2", () => {
 			sessionRef: "pi-session:main",
 			createdAt: new Date().toISOString(),
 		});
+		const plan = job.state.stagePlans.plan_cleanup_search;
+		const pe = await preparePlanEvidence(job, plan);
+		await job.recordReview(reviewFixture(job, { evidenceId: pe.id, verdict: "pass", findings: [], blocking: false }));
 		const batch = Object.values(job.state.searchBatches)[0];
 		if (!batch) throw new Error("search batch missing");
 		const candidates = Object.values(batch.candidates);
 		for (const [index, candidate] of candidates.entries()) {
+			const contract = buildEffectiveTaskContract(job, plan, plan.tasks.find((task) => task.key === candidate.key)!);
 			const task = await job.dispatchTask({
-				stageId: "validation",
-				stageExecutionId: "stage_exec_validation",
-				role: "worker",
-				objective: candidate.hypothesis,
-				inputArtifactRefs: [],
-				requiredCanonicalArtifacts: [],
-				requiredOutputType: "validation",
-				requiredOutputFields: job.definitions.validation.requiredOutputFields,
-				acceptanceChecks: job.definitions.validation.acceptanceChecks,
-				failureSignals: job.definitions.validation.failureSignals,
-				dependencies: [],
-				scope: { workspaceRoot: root, allowedPaths: ["."] },
-				allowedTools: ["read"],
-				writeAuthority: "none",
-				budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 30_000 },
-				reviewGateRequired: true,
-				resumePolicy: "resume-session",
-				successCriteria: job.definitions.validation.acceptanceChecks,
-				searchBatchId: batch.id,
-				searchCandidateId: candidate.id,
+				...contract,
+				effectiveContractHash: semanticContractHash(contract),
+				replayKey: `stage-plan:${plan.id}:${candidate.key}`,
 			});
 			await job.setTaskStatus(task.id, "running");
 			await job.setTaskStatus(task.id, "succeeded");
@@ -662,7 +643,7 @@ describe("Research Kernel v2", () => {
 		await job.selectSearchCandidate(batch.id, candidates[0]?.id ?? "", "select-best-candidate");
 
 		expect(job.state.searchBatches[batch.id]?.selectedCandidateId).toBe(candidates[0]?.id);
-		expect(Object.values(job.state.evidence)).toHaveLength(1);
+		expect(Object.values(job.state.evidence).filter((evidence) => evidence.type !== "stage-plan")).toHaveLength(1);
 		expect(Object.values(job.state.discardedCandidates)).toHaveLength(1);
 		if (!loserTaskId) throw new Error("loser task missing");
 		await expect(

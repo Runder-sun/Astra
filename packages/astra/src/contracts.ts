@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import type {
+	MainAgentCall,
 	MainAgentDecisionManifest,
 	ReviewerOutputManifest,
 	ReviewPacket,
@@ -263,3 +264,94 @@ export type ChildManifest =
 	| ReviewerOutputManifest
 	| MainAgentDecisionManifest
 	| StagePlanManifest;
+
+/** Read only the registered historical path, rejecting symlinks in it or its parents. */
+export async function readMainAgentDelivery(
+	root: string,
+	call: MainAgentCall,
+): Promise<StagePlanManifest | MainAgentDecisionManifest> {
+	const expected =
+		call.type === "plan"
+			? stagePlanManifestPath(root, call.jobId, call.planId!)
+			: mainDecisionManifestPath(root, call.jobId, call.type, call.id);
+	if (resolve(call.manifestRef) !== expected)
+		throw new Error("main-agent delivery path does not match registered identity");
+	let path = resolve(root);
+	for (const part of relative(path, expected).split(sep)) {
+		path = join(path, part);
+		if ((await lstat(path)).isSymbolicLink()) throw new Error(`main-agent delivery symlink rejected: ${path}`);
+	}
+	const manifest =
+		call.type === "plan"
+			? await readStagePlanManifest(expected)
+			: await readJson<MainAgentDecisionManifest>(expected);
+	if (
+		manifest.jobId !== call.jobId ||
+		manifest.decisionRef !== call.id ||
+		((call.type === "plan" || call.type === "route" || manifest.stageId !== undefined) &&
+			manifest.stageId !== call.stageId) ||
+		typeof manifest.rationale !== "string" ||
+		!manifest.rationale.trim() ||
+		typeof manifest.sessionRef !== "string" ||
+		!manifest.sessionRef ||
+		typeof manifest.createdAt !== "string" ||
+		!Number.isFinite(Date.parse(manifest.createdAt))
+	)
+		throw new Error("main-agent delivery common identity/schema mismatch");
+	if (call.type === "plan") {
+		if (!("tasks" in manifest)) throw new Error("main-agent plan schema mismatch");
+		if (manifest.id !== call.planId || manifest.mode !== call.mode || manifest.obligationId !== call.obligationId)
+			throw new Error("main-agent plan id/mode/obligation mismatch");
+		for (const task of manifest.tasks)
+			for (const field of [
+				task.inputArtifactRefs,
+				task.requiredOutputFields,
+				task.acceptanceChecks,
+				task.failureSignals,
+				task.successCriteria,
+			])
+				if (!Array.isArray(field) || field.some((value) => typeof value !== "string"))
+					throw new Error("main-agent plan task schema mismatch");
+	} else {
+		if ("tasks" in manifest) throw new Error("main-agent decision cannot contain plan tasks");
+		if (
+			manifest.schemaVersion !== "astra.main_agent_decision_manifest.v1" ||
+			manifest.manifestId !== call.manifestId ||
+			manifest.decisionType !== call.type ||
+			manifest.evidenceId !== call.evidenceId ||
+			manifest.searchBatchId !== call.searchBatchId
+		)
+			throw new Error("main-agent decision identity/schema mismatch");
+		if (call.type === "evidence" && !["accept", "reject", "defer"].includes(manifest.decision ?? ""))
+			throw new Error("invalid main-agent evidence decision");
+		if (
+			call.type === "adoption" &&
+			(typeof manifest.adopt !== "boolean" ||
+				(manifest.replacementOf !== undefined && typeof manifest.replacementOf !== "string"))
+		)
+			throw new Error("invalid main-agent adoption decision");
+		if (
+			call.type === "search-selection" &&
+			(Boolean(manifest.selectedCandidateId) === Boolean(manifest.continueSearch) ||
+				(manifest.selectedCandidateId !== undefined && typeof manifest.selectedCandidateId !== "string") ||
+				(manifest.continueSearch !== undefined && typeof manifest.continueSearch !== "boolean"))
+		)
+			throw new Error("invalid main-agent search decision");
+		if (
+			call.type === "route" &&
+			(!["continue", "search", "advance", "backtrack", "ask-user", "complete"].includes(
+				manifest.routeAction ?? "",
+			) ||
+				(manifest.evidenceRefs !== undefined &&
+					(!Array.isArray(manifest.evidenceRefs) ||
+						manifest.evidenceRefs.some((ref) => typeof ref !== "string"))) ||
+				(manifest.newQuestions !== undefined &&
+					(!Array.isArray(manifest.newQuestions) ||
+						manifest.newQuestions.some((question) => typeof question !== "string"))) ||
+				(manifest.question !== undefined && typeof manifest.question !== "string") ||
+				(manifest.targetStageId !== undefined && typeof manifest.targetStageId !== "string"))
+		)
+			throw new Error("invalid main-agent route decision");
+	}
+	return manifest;
+}

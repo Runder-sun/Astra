@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mainDecisionManifestPath, writeMainDecisionManifest } from "../src/contracts.ts";
 import { ResearchJob } from "../src/research.ts";
 import { DEFAULT_STAGES } from "../src/stages.ts";
 import { MemoryAstraStore } from "../src/store.ts";
@@ -134,8 +135,22 @@ describe("repair acceptance", () => {
 					createdAt: new Date().toISOString(),
 				}),
 				decideEvidence: async (evidence) => {
+					const saved = decision(job, { evidenceId: evidence.id, decision: "accept" });
+					await job.registerMainAgentCall({
+						id: saved.decisionRef,
+						type: "evidence",
+						manifestId: saved.manifestId,
+						evidenceId: evidence.id,
+						manifestRef: mainDecisionManifestPath(
+							workspaceRoot,
+							job.state.frame.jobId,
+							"evidence",
+							saved.decisionRef,
+						),
+					});
+					await writeMainDecisionManifest(saved, workspaceRoot);
 					await job.pause("pause after repair acceptance decision");
-					return decision(job, { evidenceId: evidence.id, decision: "accept" });
+					return saved;
 				},
 				decideAdoption: async (evidence) =>
 					decision(job, { decisionType: "adoption", evidenceId: evidence.id, adopt: true }),
@@ -155,11 +170,13 @@ describe("repair acceptance", () => {
 			(evidence) => evidence.id !== failed.id && evidence.type === "validation",
 		)!;
 		expect(job.state.paused).toBe(true);
-		expect(repaired.status).toBe("accepted");
-		expect(job.state.obligations[Object.keys(job.state.obligations)[0]!]?.status).toBe("resolved");
+		expect(repaired.status).toBe("candidate");
+		expect(job.state.obligations[Object.keys(job.state.obligations)[0]!]?.status).toBe("open");
 		expect(Object.values(job.state.canonical).some((artifact) => artifact.evidenceId === repaired.id)).toBe(false);
 		await job.resume();
 		await supervisor.tick();
+		expect(job.state.evidence[repaired.id].status).toBe("accepted");
+		expect(job.state.obligations[Object.keys(job.state.obligations)[0]!]?.status).toBe("resolved");
 		expect(Object.values(job.state.canonical).some((artifact) => artifact.evidenceId === repaired.id)).toBe(true);
 	});
 

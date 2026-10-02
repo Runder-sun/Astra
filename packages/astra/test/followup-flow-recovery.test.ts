@@ -525,15 +525,17 @@ async function cleanupScenario(kind: "retirement" | "evidence" | "search-candida
 		createdAt: "now",
 	};
 	await job.recordStagePlan(plan);
+	const pe = await preparePlanEvidence(job, plan);
+	await job.recordReview(reviewFixture(job, { evidenceId: pe.id, verdict: "pass", findings: [], blocking: false }));
 	const batch = Object.values(job.state.searchBatches)[0];
 	const candidates = Object.values(batch.candidates);
 	let old: Evidence | undefined;
 	for (const [index, candidate] of candidates.entries()) {
+		const contract = buildEffectiveTaskContract(job, plan, plan.tasks[index]);
 		const task = await job.dispatchTask({
-			...taskInput(job, candidate.key),
-			acceptanceChecks: [...new Set(["verified", ...batch.criteria])],
-			searchBatchId: batch.id,
-			searchCandidateId: candidate.id,
+			...contract,
+			effectiveContractHash: semanticContractHash(contract),
+			replayKey: `stage-plan:${plan.id}:${candidate.key}`,
 		});
 		await job.setTaskStatus(task.id, "succeeded");
 		const item = await job.recordEvidence({
@@ -765,8 +767,9 @@ it.each(["paused", "budget", "failure"])("T6 supervisor recovers before new mode
 	} else await supervisor.tick();
 	expect(forbidden).not.toHaveBeenCalled();
 	expect(current.state.budgetUsage?.turnsUsed).toBe(mode === "budget" ? 1 : 0);
-	expect(Object.values(current.state.canonical)[0].status).toBe(mode === "budget" ? "active" : "adoption_requested");
+	expect(Object.values(current.state.canonical)[0].status).toBe(mode === "failure" ? "adoption_requested" : "active");
 	expect(current.state.paused).toBe(mode !== "failure");
+	if (mode === "paused") expect(current.state.frame.nextAction).toBe("paused: preserve pause");
 });
 
 it.each(["review-only", "objection-only", "resolved", "missing-resolved-objection"])(
