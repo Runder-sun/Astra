@@ -613,18 +613,20 @@ export async function prepareReviewEvidenceBundle(
 		versionedEvidence?: Evidence,
 		originalRef = sourceRef,
 	): Promise<void> => {
-		const copyKey = `${source}\0${sourceRef}`;
-		if (copiedSources.has(copyKey)) return;
 		const content = versionedEvidence
 			? await readVersionedFile(task, versionedEvidence, originalRef, source, allowedRoot)
 			: await readEvidenceFile(source, allowedRoot);
 		if (!content) return;
+		const sha256 = createHash("sha256").update(content).digest("hex");
+		const copyKey = `${sourceRef}\0${sha256}`;
+		if (copiedSources.has(copyKey)) return;
+		if (sourceReceiptFilename(originalRef)) path = join("sources", sha256, basename(path));
 		await writeEvidenceFile(reviewRoot, path, content);
 		copiedSources.add(copyKey);
 		bundle.push({
 			sourceRef,
 			path: path.split("\\").join("/"),
-			sha256: createHash("sha256").update(content).digest("hex"),
+			sha256,
 		});
 	};
 	for (const sourceRef of evidence.refs) {

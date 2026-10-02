@@ -1,10 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ResearchJob } from "../src/research.ts";
 import { DEFAULT_STAGES } from "../src/stages.ts";
 import { MemoryAstraStore } from "../src/store.ts";
 import { ResearchSupervisor } from "../src/supervisor.ts";
 import type { MainAgentDecisionManifest, StagePlanManifest } from "../src/types.ts";
 import { reviewFixture } from "./review-fixture.ts";
+
+let workspaceRoot: string;
+beforeEach(async () => {
+	workspaceRoot = await mkdtemp(join(tmpdir(), "astra-repair-acceptance-"));
+});
+afterEach(async () => {
+	await rm(workspaceRoot, { recursive: true, force: true });
+});
 
 function decision(job: ResearchJob, fields: Partial<MainAgentDecisionManifest>): MainAgentDecisionManifest {
 	return {
@@ -59,7 +70,7 @@ async function candidate(
 		responsibilityBindings,
 		failureSignals: ["unverified result"],
 		dependencies: [],
-		scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+		scope: { workspaceRoot, allowedPaths: ["."] },
 		allowedTools: ["read"],
 		writeAuthority: "none",
 		budget: { maxTurns: 4, maxToolCalls: 8, maxRuntimeMs: 30000 },
@@ -83,7 +94,7 @@ describe("repair acceptance", () => {
 		const store = new MemoryAstraStore();
 		const job = await ResearchJob.create(store, {
 			objective: "resume accepted repair adoption",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 		});
 		const failed = await candidate(job, "before-repair");
@@ -158,7 +169,7 @@ describe("repair acceptance", () => {
 			const store = new MemoryAstraStore();
 			const job = await ResearchJob.create(store, {
 				objective: "repair current stage",
-				workspaceRoot: "/workspace",
+				workspaceRoot,
 				automation: "full",
 			});
 			const failed = await candidate(job, "failed");
@@ -238,7 +249,7 @@ describe("repair acceptance", () => {
 	it("normalizes findings inherited through multiple historical obligation bindings", async () => {
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			objective: "Recover repeated repair failures",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		const original = await candidate(job, "original");
 		const finding = "The raw data is inaccessible";
@@ -284,7 +295,7 @@ describe("repair acceptance", () => {
 			const store = new MemoryAstraStore();
 			const job = await ResearchJob.create(store, {
 				objective: "Keep open issues blocking",
-				workspaceRoot: "/workspace",
+				workspaceRoot,
 				automation: "full",
 			});
 			const evidence = await candidate(job, "failed");
@@ -327,7 +338,7 @@ describe("repair acceptance", () => {
 		const store = new MemoryAstraStore();
 		const job = await ResearchJob.create(store, {
 			objective: "Repair upstream without losing obligations",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 		});
 		const original = await candidate(job, "upstream");
@@ -472,7 +483,7 @@ describe("repair acceptance", () => {
 	it.each([false, true])("rejects a repair without faithful issue checks (renamed: %s)", async (renamed) => {
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			objective: "Do not close unverified issues",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		const original = await candidate(job, "broken");
 		await job.recordReview(
@@ -511,7 +522,7 @@ describe("repair acceptance", () => {
 		const store = new MemoryAstraStore();
 		const job = await ResearchJob.create(store, {
 			objective: "Review the actual evidence chain",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 		});
 		const original = await candidate(job, "raw-result");
@@ -577,7 +588,7 @@ describe("repair acceptance", () => {
 		const store = new MemoryAstraStore();
 		const job = await ResearchJob.create(store, {
 			objective: "Require both repair reviews",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			definitions: [
 				{
 					...DEFAULT_STAGES[0],
@@ -603,7 +614,7 @@ describe("repair acceptance", () => {
 	it("does not accept conflicting reviews or close their obligations with later passing votes", async () => {
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			objective: "Preserve a failed review on unchanged evidence",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		const original = await candidate(job, "conflicted");
 		await job.recordReview(
@@ -620,7 +631,7 @@ describe("repair acceptance", () => {
 			const store = new MemoryAstraStore();
 			const job = await ResearchJob.create(store, {
 				objective: "Finish a governed backtrack",
-				workspaceRoot: "/workspace",
+				workspaceRoot,
 				automation: "full",
 			});
 			await job.reopenStage("literature", "backtrack_sources", "repair missing source receipts");

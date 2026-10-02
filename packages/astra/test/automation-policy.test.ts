@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { costUsdFromJsonEvents } from "../src/pi-child-session.ts";
 import { ResearchJob } from "../src/research.ts";
 import type { AstraStore } from "../src/store.ts";
@@ -15,6 +15,14 @@ import {
 } from "../src/supervisor.ts";
 import type { MainAgentDecisionManifest, StageDefinition } from "../src/types.ts";
 import { reviewFixture } from "./review-fixture.ts";
+
+let workspaceRoot: string;
+beforeEach(async () => {
+	workspaceRoot = await mkdtemp(join(tmpdir(), "astra-flow-fixture-"));
+});
+afterEach(async () => {
+	await rm(workspaceRoot, { recursive: true, force: true });
+});
 
 const validationStage: StageDefinition = {
 	id: "validation",
@@ -202,7 +210,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_bounded_search",
 			objective: "select a reviewed candidate",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [searchStage],
 		});
@@ -307,7 +315,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_collaborative",
 			objective: "collaborative fixture",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "collaborative",
 			definitions: [validationStage],
 		});
@@ -391,7 +399,7 @@ describe("research automation policy", () => {
 			const job = await ResearchJob.create(store, {
 				jobId: `job_${automation}`,
 				objective: `${automation} fixture`,
-				workspaceRoot: "/workspace",
+				workspaceRoot,
 				automation,
 				definitions,
 			});
@@ -423,7 +431,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_turn_budget",
 			objective: "turn budget fixture",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 			maxTurns: 2,
@@ -451,7 +459,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_task_budget",
 			objective: "task budget fixture",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 			maxTasks: 1,
@@ -478,7 +486,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_review_commit_retry",
 			objective: "retry a review that the durable ledger rejects",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 		});
@@ -494,7 +502,7 @@ describe("research automation policy", () => {
 			acceptanceChecks: ["structured"],
 			failureSignals: ["missing content"],
 			dependencies: [],
-			scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+			scope: { workspaceRoot, allowedPaths: ["."] },
 			allowedTools: ["read"],
 			writeAuthority: "none",
 			budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
@@ -525,7 +533,7 @@ describe("research automation policy", () => {
 					acceptanceChecks: ["review manifest written"],
 					failureSignals: ["missing review manifest"],
 					dependencies: [],
-					scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+					scope: { workspaceRoot, allowedPaths: ["."] },
 					allowedTools: ["read"],
 					writeAuthority: "none",
 					budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
@@ -579,7 +587,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_ready_recovery",
 			objective: "ready task recovery",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 		});
@@ -596,7 +604,7 @@ describe("research automation policy", () => {
 			acceptanceChecks: ["structured"],
 			failureSignals: ["missing output manifest"],
 			dependencies: [],
-			scope: { workspaceRoot: "/workspace", allowedPaths: [".astra/jobs/job_ready_recovery/tasks"] },
+			scope: { workspaceRoot, allowedPaths: [".astra/jobs/job_ready_recovery/tasks"] },
 			allowedTools: ["read"],
 			writeAuthority: "workspace-write",
 			budget: { maxTurns: 8, maxToolCalls: 16, maxRuntimeMs: 300_000 },
@@ -619,7 +627,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_repair_evidence_set",
 			objective: "repair a failed review",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 		});
@@ -681,7 +689,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_cost_budget",
 			objective: "cost budget fixture",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 			maxCostUsd: 0.1,
@@ -708,7 +716,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_provider_auth_failure",
 			objective: "surface provider authentication failure",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 		});
@@ -793,7 +801,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_legacy_capacity",
 			objective: "recover old provider failure semantics",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [validationStage],
 		});
@@ -812,7 +820,7 @@ describe("research automation policy", () => {
 			acceptanceChecks: ["structured"],
 			failureSignals: ["missing content"],
 			dependencies: [],
-			scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+			scope: { workspaceRoot, allowedPaths: ["."] },
 			allowedTools: ["read"],
 			writeAuthority: "none",
 			budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
@@ -835,7 +843,7 @@ describe("research automation policy", () => {
 			acceptanceChecks: ["structured"],
 			failureSignals: ["missing content"],
 			dependencies: [],
-			scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+			scope: { workspaceRoot, allowedPaths: ["."] },
 			allowedTools: ["read"],
 			writeAuthority: "none",
 			budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
@@ -880,7 +888,7 @@ describe("research automation policy", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_guided_replan",
 			objective: "replan implementation after user correction",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 			definitions: [searchStage],
 		});
@@ -922,7 +930,7 @@ describe("research automation policy", () => {
 				acceptanceChecks: ["structured"],
 				failureSignals: ["missing content"],
 				dependencies: [],
-				scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+				scope: { workspaceRoot, allowedPaths: ["."] },
 				allowedTools: ["read"],
 				writeAuthority: "none",
 				budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },

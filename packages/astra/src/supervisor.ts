@@ -144,13 +144,13 @@ export class ResearchSupervisor {
 
 	private async tickLeased(): Promise<TickResult> {
 		await this.checkPauseRequests();
-		const initialStageId = this.job.state.frame.activeStageId;
 		try {
 			await this.job.recoverPendingOperations();
 		} catch (error) {
 			this.recovered = true;
 			throw error;
 		}
+		const initialStageId = this.job.state.frame.activeStageId;
 		if (this.job.state.frame.status === "completed") return this.result(initialStageId, [], false);
 		const stage = this.job.state.stages[initialStageId];
 		if (stage.status !== "running") throw new Error(`active research capability ${initialStageId} is not running`);
@@ -865,31 +865,27 @@ export class ResearchSupervisor {
 
 	private async runWorker(task: TaskPacket): Promise<void> {
 		await this.job.setTaskStatus(task.id, "running");
+		let outputReturned = false;
 		try {
-			const output = await this.callAdapter(() => this.worker.run(task, this.job));
-			await this.job.setTaskStatus(task.id, "succeeded");
-			const stagePlan = Object.values(this.job.state.stagePlans).find((plan) =>
-				plan.tasks.some((planned) => task.replayKey === `stage-plan:${plan.id}:${planned.key}`),
-			);
-			const obligation = stagePlan?.obligationId ? this.job.state.obligations[stagePlan.obligationId] : undefined;
-			const failedReview = obligation ? this.job.state.reviews[obligation.sourceReviewId] : undefined;
-			const failedEvidence = failedReview ? this.job.state.evidence[failedReview.evidenceId] : undefined;
-			const incrementalBase = output.incrementalRevision
-				? this.job.state.evidence[output.incrementalRevision.baseEvidenceId]
-				: undefined;
-			await this.job.recordEvidence({
-				taskId: task.id,
-				stageId: task.stageId,
-				type: output.artifactType,
-				content: output.content,
-				refs: [...new Set([...(incrementalBase?.refs ?? []), ...output.refs])],
-				...(output.incrementalRevision ? { incrementalRevision: output.incrementalRevision } : {}),
-				currentEvidenceSetId: failedEvidence?.currentEvidenceSetId,
+			await this.callAdapter(async () => {
+				const output = await this.worker.run(task, this.job);
+				outputReturned = true;
+				await this.job.completeWorkerTask(task.id, output);
 			});
 		} catch (error) {
-			if (this.job.state.tasks[task.id].status === "succeeded")
+			let completed = outputReturned || this.job.state.tasks[task.id].status === "succeeded";
+			if (!completed) {
+				try {
+					completed = Boolean(await this.job.recoverWorkerTaskCompletion(task.id));
+				} catch (recoveryError) {
+					throw new NonRetryableResearchError(
+						`worker failed: ${error instanceof Error ? error.message : String(error)}; output recovery failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+					);
+				}
+			}
+			if (completed)
 				throw new NonRetryableResearchError(
-					`evidence registration failed: ${error instanceof Error ? error.message : String(error)}`,
+					`worker output completion could not be saved: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			await this.job.setTaskStatus(
 				task.id,

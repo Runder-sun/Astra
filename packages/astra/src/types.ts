@@ -539,6 +539,8 @@ export interface CandidateEvaluation {
 }
 
 export interface StageRouteDecision {
+	consequencesCompleted?: boolean;
+	consequencesSupersededBy?: string;
 	id: string;
 	stageId: string;
 	action: ResearchRouteAction;
@@ -617,6 +619,34 @@ export interface ReviewConsequences {
 	obligation?: Obligation;
 }
 
+export interface EvidenceCompletion {
+	taskSucceeded: boolean;
+	node?: ResearchNode;
+	edge?: ResearchEdge;
+}
+
+export interface EvidenceAcceptanceConsequences {
+	repairItems: Array<{ obligationId: string; itemId: string; reviewId: string; evidenceId: string }>;
+	resolvedObligations: Array<{ obligationId: string; satisfiedBy: string }>;
+	resolvedNodeIds: string[];
+}
+
+export interface StageReopening {
+	targetStageId: string;
+	affectedStageIds: string[];
+	decisionRef: string;
+	reason: string;
+	objection: ResearchNode;
+	cleanups?: CleanupIntent[];
+}
+
+export interface RouteConsequences {
+	nodes: ResearchNode[];
+	edges: ResearchEdge[];
+	reopening?: StageReopening;
+	gate?: UserGate;
+}
+
 export interface AdoptionCompletion {
 	nodes: ResearchNode[];
 	edges: ResearchEdge[];
@@ -675,8 +705,16 @@ export type AstraEvent =
 	| { type: "task_dispatched"; task: TaskPacket }
 	| { type: "task_status"; taskId: string; status: TaskStatus }
 	| { type: "child_session_recorded"; session: ChildSessionRecord }
-	| { type: "evidence_recorded"; evidence: Evidence }
-	| { type: "evidence_decided"; evidenceId: string; accepted: boolean; decisionRef: string }
+	| { type: "evidence_recorded"; evidence: Evidence; completion?: EvidenceCompletion }
+	| { type: "evidence_completion_recovered"; evidenceId: string; completion: EvidenceCompletion }
+	| {
+			type: "evidence_decided";
+			evidenceId: string;
+			accepted: boolean;
+			decisionRef: string;
+			consequences?: EvidenceAcceptanceConsequences;
+	  }
+	| { type: "evidence_acceptance_recovered"; evidenceId: string; consequences: EvidenceAcceptanceConsequences }
 	| { type: "review_recorded"; review: Review; consequences?: ReviewConsequences }
 	| { type: "obligation_created"; obligation: Obligation }
 	| { type: "obligation_resolved"; obligationId: string; satisfiedBy: string }
@@ -721,16 +759,10 @@ export type AstraEvent =
 	| { type: "search_batch_decided"; batchId: string; candidateId: string; decisionRef: string }
 	| { type: "search_candidate_pruned"; receipt: DiscardedCandidateReceipt }
 	| { type: "evidence_pruned"; receipt: DiscardedEvidenceReceipt }
-	| { type: "route_decided"; decision: StageRouteDecision }
-	| {
-			type: "stage_reopened";
-			targetStageId: string;
-			affectedStageIds: string[];
-			decisionRef: string;
-			reason: string;
-			objection: ResearchNode;
-			cleanups?: CleanupIntent[];
-	  };
+	| { type: "route_decided"; decision: StageRouteDecision; consequences?: RouteConsequences }
+	| { type: "route_consequences_recovered"; decisionRef: string; consequences: RouteConsequences }
+	| { type: "route_consequences_superseded"; decisionRef: string; supersededBy: string }
+	| ({ type: "stage_reopened" } & StageReopening);
 
 export interface StoredEvent {
 	seq: number;

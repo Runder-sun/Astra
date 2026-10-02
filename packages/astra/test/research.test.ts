@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHarness } from "../../coding-agent/test/suite/harness.ts";
 import { mainDecisionManifestPath, readJson, writeMainDecisionManifest } from "../src/contracts.ts";
 import { createAstraExtension } from "../src/extension.ts";
@@ -21,6 +21,14 @@ import {
 	type WorkerRunResult,
 } from "../src/supervisor.ts";
 import { reviewFixture } from "./review-fixture.ts";
+
+let workspaceRoot: string;
+beforeEach(async () => {
+	workspaceRoot = await mkdtemp(join(tmpdir(), "astra-flow-fixture-"));
+});
+afterEach(async () => {
+	await rm(workspaceRoot, { recursive: true, force: true });
+});
 
 async function workerTask(job: ResearchJob, objective: string, id = `task-${objective}`) {
 	const repairChecks = Object.values(job.state.obligations)
@@ -281,7 +289,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_e2e",
 			objective: "fixture auto research",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		let reviewCount = 0;
 		const supervisor = new ResearchSupervisor(job, store, {
@@ -325,7 +333,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_full",
 			objective: "fixture complete research",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			automation: "full",
 		});
 		let reviewCount = 0;
@@ -373,7 +381,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_gate",
 			objective: "fixture research",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		const task = await workerTask(job, "initial validation");
 		const evidence = await job.recordEvidence({
@@ -404,7 +412,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_repair_review_priority",
 			objective: "fixture repair review priority",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		const firstTask = await workerTask(job, "first repair candidate", "task-repair-priority-first");
 		const first = await job.recordEvidence({
@@ -464,7 +472,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_partial_review",
 			objective: "fixture partial review",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		const task = await workerTask(job, "partial candidate", "task-partial-review");
 		const evidence = await job.recordEvidence({
@@ -490,7 +498,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_crash",
 			objective: "fixture recovery",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		let runs = 0;
 		const supervisor = new ResearchSupervisor(job, store, {
@@ -526,7 +534,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_search_retry_limit",
 			objective: "fixture search retry limit",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			definitions: [
 				{
 					...DEFAULT_STAGES[0],
@@ -729,7 +737,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_lease",
 			objective: "fixture lease",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 		});
 		await job.acquireLease("owner-a");
 		await expect(job.acquireLease("owner-b")).rejects.toThrow("lease held");
@@ -750,7 +758,7 @@ describe("Pi-native Astra research state", () => {
 			requiredCanonicalArtifacts: [],
 			requiredOutputFields: ["content", "outputRefs"],
 			failureSignals: ["missing output manifest"],
-			scope: { workspaceRoot: "/workspace", allowedPaths: [`.astra/jobs/${job.state.frame.jobId}/tasks`] },
+			scope: { workspaceRoot, allowedPaths: [`.astra/jobs/${job.state.frame.jobId}/tasks`] },
 			reviewGateRequired: true,
 			resumePolicy: "restart-attempt",
 			successCriteria: ["structured"],
@@ -764,7 +772,7 @@ describe("Pi-native Astra research state", () => {
 		const job = await ResearchJob.create(store, {
 			jobId: "job_role",
 			objective: "fixture policy",
-			workspaceRoot: "/workspace",
+			workspaceRoot,
 			allowDestructive: false,
 		});
 		const task = await workerTask(job, "policy candidate");

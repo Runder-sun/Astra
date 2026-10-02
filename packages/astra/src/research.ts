@@ -1,8 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { access, lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import { archiveAndPruneTasks, cleanupTaskFiles } from "./cleanup-files.ts";
-import { assertAstraId, atomicWriteJson, canonicalArtifactPath, canonicalReceiptPath, sha256 } from "./contracts.ts";
+import {
+	assertAstraId,
+	atomicWriteJson,
+	canonicalArtifactPath,
+	canonicalReceiptPath,
+	readWorkerOutputManifest,
+	sha256,
+	taskDir,
+	taskStageContract,
+} from "./contracts.ts";
 import {
 	backtrackChecksFromSnapshot,
 	buildEffectiveTaskContract,
@@ -33,7 +42,7 @@ import {
 import { validateReviewAssessment } from "./review-validation.ts";
 import { DEFAULT_STAGES, stageMap } from "./stages.ts";
 import type { AstraStore } from "./store.ts";
-import { freezeEvidenceFiles } from "./task-workspace.ts";
+import { freezeEvidenceFiles, readVersionedFile, taskWorkspacePath } from "./task-workspace.ts";
 import type {
 	AdoptionCompletion,
 	AstraEvent,
@@ -41,11 +50,14 @@ import type {
 	BudgetLimit,
 	CandidateEvaluation,
 	CanonicalArtifact,
+	ChildSessionRecord,
 	ClaimAssessment,
 	CleanupIntent,
 	DiscardedCandidateReceipt,
 	DiscardedEvidenceReceipt,
 	Evidence,
+	EvidenceAcceptanceConsequences,
+	EvidenceCompletion,
 	JobSnapshot,
 	Lease,
 	MainAgentDecisionManifest,
@@ -57,17 +69,31 @@ import type {
 	RetiredArtifactReceipt,
 	Review,
 	ReviewConsequences,
+	RouteConsequences,
 	ScientificOutcome,
 	SearchBatch,
 	StageDefinition,
 	StagePlanManifest,
+	StageReopening,
 	StageRouteDecision,
 	StageState,
+	StoredEvent,
 	TaskPacket,
 	TaskStatus,
 	TaskVersion,
 	UserGateRequest,
+	WorkerOutputManifest,
 } from "./types.ts";
+
+import { validateWorkerSubmission } from "./worker-submission.ts";
+
+interface PreparedEvidenceCompletion {
+	schemaVersion: "astra.evidence_completion.v1";
+	task: Omit<TaskPacket, "status">;
+	evidence: Evidence;
+	completion: EvidenceCompletion;
+	preparationHash: string;
+}
 
 const DEFAULT_SEARCH_MAX_ROUNDS = 2;
 export const MAX_TASK_ATTEMPTS = 3;
@@ -851,36 +877,39 @@ export class ResearchJob {
 				await this.finishCleanupsInternal();
 				return;
 			}
-			const invalidRefs = dependentEvidenceRefs(
-				this.snapshot,
-				Object.values(this.snapshot.evidence)
-					.filter((evidence) => evidence.stageId === targetStageId)
-					.map((evidence) => evidence.id),
-			);
-			const invalidArtifactIds = Object.values(this.snapshot.canonical)
-				.filter((artifact) => artifact.status === "active" && invalidRefs.has(artifact.id))
-				.map((artifact) => artifact.id);
-			const affectedStageIds = [...new Set([targetStageId, ...this.dependentStageIds(invalidRefs)])];
-			const cleanups = await Promise.all(invalidArtifactIds.map((id) => this.retirementIntent(id)));
-			const objection = createResearchNode({
-				kind: "objection",
-				statement: reason,
-				status: "open",
-				stageId: targetStageId,
-				domainRef: decisionRef,
-				sourceRefs: [decisionRef],
-			});
 			await this.appendEvent({
 				type: "stage_reopened",
-				targetStageId,
-				affectedStageIds,
-				decisionRef,
-				reason,
-				objection,
-				cleanups,
+				...(await this.prepareStageReopening(targetStageId, decisionRef, reason)),
 			});
 			await this.finishCleanupsInternal();
 		});
+	}
+
+	private async prepareStageReopening(
+		targetStageId: string,
+		decisionRef: string,
+		reason: string,
+	): Promise<StageReopening> {
+		const invalidRefs = dependentEvidenceRefs(
+			this.snapshot,
+			Object.values(this.snapshot.evidence)
+				.filter((evidence) => evidence.stageId === targetStageId)
+				.map((evidence) => evidence.id),
+		);
+		const invalidArtifactIds = Object.values(this.snapshot.canonical)
+			.filter((artifact) => artifact.status === "active" && invalidRefs.has(artifact.id))
+			.map((artifact) => artifact.id);
+		const affectedStageIds = [...new Set([targetStageId, ...this.dependentStageIds(invalidRefs)])];
+		const cleanups = await Promise.all(invalidArtifactIds.map((id) => this.retirementIntent(id)));
+		const objection = createResearchNode({
+			kind: "objection",
+			statement: reason,
+			status: "open",
+			stageId: targetStageId,
+			domainRef: decisionRef,
+			sourceRefs: [decisionRef],
+		});
+		return { targetStageId, affectedStageIds, decisionRef, reason, objection, cleanups };
 	}
 
 	private async retirementIntent(artifactId: string, replacementId?: string): Promise<CleanupIntent> {
@@ -1191,6 +1220,31 @@ export class ResearchJob {
 		}
 	}
 
+	private taskVersionContractHash(task: TaskPacket, stage = this.definitions[task.stageId]): string {
+		return checksum({
+			planId: task.planId,
+			repairChecks: task.repairChecks,
+			deliveryKind: task.deliveryKind,
+			stageRevision: task.stageRevision,
+			repairOfEvidenceId: task.repairOfEvidenceId,
+			stage,
+			objective: task.objective,
+			requiredOutputFields: task.requiredOutputFields,
+			acceptanceChecks: task.acceptanceChecks,
+			failureSignals: task.failureSignals,
+			successCriteria: task.successCriteria,
+		});
+	}
+
+	private taskVersionContractMatches(task: TaskPacket): boolean {
+		const original = this.definitions[task.stageId];
+		const normalized = JSON.parse(JSON.stringify(original)) as StageDefinition;
+		const stages = [original, normalized];
+		// Default stage definitions historically hashed this explicit undefined key before JSON storage removed it.
+		if (!Object.hasOwn(normalized, "searchPolicy")) stages.push({ ...normalized, searchPolicy: undefined });
+		return stages.some((stage) => this.taskVersionContractHash(task, stage) === task.version?.contractHash);
+	}
+
 	async captureTaskVersion(taskId: string): Promise<TaskVersion> {
 		const task = this.snapshot.tasks[taskId];
 		if (!task) throw new Error(`unknown task ${taskId}`);
@@ -1199,19 +1253,14 @@ export class ResearchJob {
 			task.scope.workspaceRoot,
 			join(task.scope.workspaceRoot, ".astra", "jobs", task.jobId, "versions", "git"),
 		);
-		const contractHash = checksum({
-			planId: task.planId,
-			repairChecks: task.repairChecks,
-			deliveryKind: task.deliveryKind,
-			stageRevision: task.stageRevision,
-			repairOfEvidenceId: task.repairOfEvidenceId,
-			stage: this.definitions[task.stageId],
-			objective: task.objective,
-			requiredOutputFields: task.requiredOutputFields,
-			acceptanceChecks: task.acceptanceChecks,
-			failureSignals: task.failureSignals,
-			successCriteria: task.successCriteria,
-		});
+		if (task.version && !this.taskVersionContractMatches(task))
+			throw new Error(`task version changed; create a new attempt: ${taskId}`);
+		const contractHash =
+			task.version?.contractHash ??
+			this.taskVersionContractHash(
+				task,
+				JSON.parse(JSON.stringify(this.definitions[task.stageId])) as StageDefinition,
+			);
 		const inputs = task.inputArtifactRefs.map((ref) => {
 			const artifact = this.snapshot.canonical[ref];
 			const evidence = this.snapshot.evidence[artifact?.evidenceId ?? ref];
@@ -1292,16 +1341,17 @@ export class ResearchJob {
 		});
 	}
 
-	async recordChildSession(session: import("./types.ts").ChildSessionRecord): Promise<void> {
+	async recordChildSession(session: ChildSessionRecord): Promise<void> {
 		await this.commit({ type: "child_session_recorded", session });
 	}
 
-	async recordEvidence(
+	private async prepareEvidence(
 		input: Omit<Evidence, "id" | "checksum" | "createdAt" | "status"> & { id?: string },
+		completeWorker = false,
 	): Promise<Evidence> {
 		const task = this.snapshot.tasks[input.taskId];
 		if (!task) throw new Error(`unknown evidence task ${input.taskId}`);
-		if (task.status !== "succeeded") throw new Error("evidence requires a succeeded task");
+		if (!completeWorker && task.status !== "succeeded") throw new Error("evidence requires a succeeded task");
 		if (task.deliveryKind && (input.type !== task.requiredOutputType || input.stageId !== task.stageId))
 			throw new Error("evidence does not match task delivery contract");
 		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
@@ -1341,9 +1391,13 @@ export class ResearchJob {
 			status: "candidate",
 			currentEvidenceSetId: input.currentEvidenceSetId ?? `${input.stageId}::${input.taskId}`,
 		};
-		await this.commit({ type: "evidence_recorded", evidence });
-		if (evidence.type === "stage-plan") return evidence;
-		const taskCandidate = task.searchBatchId
+		return evidence;
+	}
+
+	private evidenceCompletion(evidence: Evidence, taskSucceeded: boolean): EvidenceCompletion {
+		if (evidence.type === "stage-plan") return { taskSucceeded };
+		const task = this.snapshot.tasks[evidence.taskId];
+		const candidate = task.searchBatchId
 			? this.snapshot.searchBatches[task.searchBatchId]?.candidates[task.searchCandidateId ?? ""]
 			: undefined;
 		const node = createResearchNode({
@@ -1355,17 +1409,381 @@ export class ResearchJob {
 			domainRef: evidence.id,
 			sourceRefs: evidence.refs,
 		});
-		await this.commit({
-			type: "research_node_recorded",
-			node,
-			edge: createResearchEdge({
-				fromNodeId: node.id,
-				toNodeId: taskCandidate?.graphNodeId ?? this.snapshot.graph.rootQuestionId,
-				kind: "tests",
-				sourceRefs: [evidence.id],
-			}),
+		node.createdAt = evidence.createdAt;
+		node.updatedAt = evidence.createdAt;
+		const edge = createResearchEdge({
+			fromNodeId: node.id,
+			toNodeId: candidate?.graphNodeId ?? this.snapshot.graph.rootQuestionId,
+			kind: "tests",
+			sourceRefs: [evidence.id],
 		});
-		return evidence;
+		edge.createdAt = evidence.createdAt;
+		return { taskSucceeded, node, edge };
+	}
+
+	async recordEvidence(
+		input: Omit<Evidence, "id" | "checksum" | "createdAt" | "status"> & { id?: string },
+	): Promise<Evidence> {
+		return this.exclusive(async () => {
+			const evidence = await this.prepareEvidence(input);
+			await this.appendEvent({
+				type: "evidence_recorded",
+				evidence,
+				completion: this.evidenceCompletion(evidence, false),
+			});
+			return evidence;
+		});
+	}
+
+	private completionTaskBinding(task: TaskPacket): Omit<TaskPacket, "status"> {
+		const { status: _status, ...binding } = task;
+		return JSON.parse(JSON.stringify(binding)) as Omit<TaskPacket, "status">;
+	}
+
+	/** Only these fixed current-task paths are valid result recovery inputs. */
+	private async readTaskCompletionFile(
+		task: TaskPacket,
+		filename: "evidence-completion.json" | "output-manifest.json" | "task-packet.json",
+	): Promise<string | undefined> {
+		const project = resolve(task.scope.workspaceRoot);
+		if (project !== resolve(this.snapshot.frame.permissions.workspaceRoot))
+			throw new Error("completion task workspace identity does not match job");
+		const root = taskDir(project, task.jobId, task.id);
+		try {
+			if (
+				(await lstat(root)).isSymbolicLink() ||
+				(await realpath(root)) !== join(await realpath(project), relative(project, root))
+			)
+				throw new Error("completion path may not escape through symbolic links");
+			const path = join(root, filename);
+			const metadata = await lstat(path);
+			if (
+				!metadata.isFile() ||
+				metadata.isSymbolicLink() ||
+				(await realpath(path)) !== join(await realpath(root), filename)
+			)
+				throw new Error("completion result may not use symbolic links or non-files");
+			return await readFile(path, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+	}
+
+	private assertCompletionTask(task: TaskPacket, evidence: Evidence): void {
+		if (
+			task.jobId !== this.snapshot.frame.jobId ||
+			evidence.taskId !== task.id ||
+			evidence.stageId !== task.stageId ||
+			evidence.type !== task.requiredOutputType ||
+			checksum({ version: evidence.taskVersion }) !== checksum({ version: task.version }) ||
+			task.role !== "worker" ||
+			task.status === "blocked" ||
+			Object.values(this.snapshot.tasks).some(
+				(next) =>
+					next.supersedesTaskId === task.id || (next.replayKey === task.replayKey && next.attempt > task.attempt),
+			) ||
+			Object.values(this.snapshot.retiredArtifacts).some((receipt) => receipt.taskId === task.id) ||
+			Object.values(this.snapshot.discardedEvidence).some((receipt) => receipt.taskId === task.id) ||
+			Object.values(this.snapshot.discardedCandidates).some((receipt) => receipt.taskId === task.id) ||
+			(task.stageRevision ?? 1) !== (this.snapshot.stages[task.stageId]?.revision ?? 1)
+		)
+			throw new StaleResearchInputError(`completion task identity, attempt or stage is stale: ${task.id}`);
+		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+		if (
+			task.planId &&
+			!evidenceHasCurrentPlanApprovalFromSnapshot(
+				{ ...this.snapshot, evidence: { ...this.snapshot.evidence, [evidence.id]: evidence } },
+				evidence,
+			)
+		)
+			throw new StaleResearchInputError(`completion requires its frozen approved plan: ${task.id}`);
+		if (task.version) {
+			const { hash, ...version } = task.version;
+			if (
+				checksum(version) !== hash ||
+				!this.taskVersionContractMatches(task) ||
+				checksum(task.version.inputs) !==
+					checksum(
+						task.inputArtifactRefs.map((ref) => {
+							const artifact = this.snapshot.canonical[ref];
+							const input = this.snapshot.evidence[artifact?.evidenceId ?? ref];
+							return {
+								ref,
+								checksum: input?.versionHash ?? artifact?.checksum ?? input?.checksum ?? "unresolved",
+							};
+						}),
+					)
+			)
+				throw new StaleResearchInputError(`completion task version or inputs are stale: ${task.id}`);
+		}
+	}
+
+	private async validatePreparedCompletion(task: TaskPacket, prepared: PreparedEvidenceCompletion): Promise<void> {
+		const { preparationHash, ...value } = prepared;
+		if (
+			prepared.schemaVersion !== "astra.evidence_completion.v1" ||
+			checksum(value) !== preparationHash ||
+			checksum(prepared.task) !== checksum(this.completionTaskBinding(task))
+		)
+			throw new Error("prepared completion identity or integrity failure");
+		const evidence = prepared.evidence;
+		assertAstraId(evidence.id, "prepared evidence id");
+		if (
+			evidence.taskId !== task.id ||
+			evidence.stageId !== task.stageId ||
+			evidence.type !== task.requiredOutputType ||
+			evidence.status !== "candidate" ||
+			evidence.checksum !==
+				checksum(
+					evidence.incrementalRevision
+						? { content: evidence.content, incrementalRevision: evidence.incrementalRevision }
+						: evidence.content,
+				) ||
+			evidence.versionHash !==
+				checksum({
+					content: evidence.content,
+					refs: evidence.refs,
+					files: evidence.files,
+					taskVersion: evidence.taskVersion,
+					...(evidence.incrementalRevision ? { incrementalRevision: evidence.incrementalRevision } : {}),
+				}) ||
+			checksum(prepared.completion) !== checksum(this.evidenceCompletion(evidence, true))
+		)
+			throw new Error("prepared completion evidence or graph integrity failure");
+		this.assertCompletionTask(task, evidence);
+		for (const file of evidence.files ?? []) {
+			if (!evidence.refs.includes(file.sourceRef)) throw new Error("prepared file is not declared by evidence");
+			await readVersionedFile(task, evidence, file.sourceRef, "", "");
+		}
+	}
+
+	private async completeWorkerTaskInternal(
+		taskId: string,
+		output?: {
+			artifactType: string;
+			content: unknown;
+			refs: string[];
+			incrementalRevision?: Evidence["incrementalRevision"];
+		},
+		recordedEvidence?: Evidence | null,
+	): Promise<Evidence | undefined> {
+		const task = this.snapshot.tasks[taskId];
+		if (!task) throw new Error(`unknown completion task ${taskId}`);
+		const existing =
+			recordedEvidence === undefined
+				? Object.values(this.snapshot.evidence).find((evidence) => evidence.taskId === taskId)
+				: recordedEvidence;
+		if (existing) {
+			if (!this.snapshot.evidence[existing.id])
+				throw new StaleResearchInputError(`completion evidence identity is stale: ${existing.id}`);
+			if (
+				existing.status === "rejected" ||
+				(task.stageRevision ?? 1) !== (this.snapshot.stages[task.stageId]?.revision ?? 1)
+			)
+				return structuredClone(existing);
+			const completion = this.evidenceCompletion(existing, true);
+			if (
+				task.status !== "succeeded" ||
+				(completion.node && !this.snapshot.graph.nodes[completion.node.id]) ||
+				(completion.edge && !this.snapshot.graph.edges[completion.edge.id])
+			) {
+				this.assertCompletionTask(task, existing);
+				await this.appendEvent({ type: "evidence_completion_recovered", evidenceId: existing.id, completion });
+			}
+			return structuredClone(existing);
+		}
+		const saved = await this.readTaskCompletionFile(task, "evidence-completion.json");
+		let prepared: PreparedEvidenceCompletion;
+		if (saved !== undefined) {
+			prepared = JSON.parse(saved) as PreparedEvidenceCompletion;
+			await this.validatePreparedCompletion(task, prepared);
+		} else {
+			if (!output) output = await this.recoverWorkerManifest(task);
+			if (!output) {
+				if (task.status === "succeeded")
+					throw new StaleResearchInputError(
+						`succeeded worker ${taskId} has a stale completion gap: no recoverable evidence completion or output manifest`,
+					);
+				return undefined;
+			}
+			const base = task.repairOfEvidenceId ? this.snapshot.evidence[task.repairOfEvidenceId] : undefined;
+			const incrementalBase = output.incrementalRevision
+				? this.snapshot.evidence[output.incrementalRevision.baseEvidenceId]
+				: undefined;
+			const evidence = await this.prepareEvidence(
+				{
+					taskId,
+					stageId: task.stageId,
+					type: output.artifactType,
+					content: output.content,
+					refs: [...new Set([...(incrementalBase?.refs ?? []), ...output.refs])],
+					...(output.incrementalRevision ? { incrementalRevision: output.incrementalRevision } : {}),
+					currentEvidenceSetId: base?.currentEvidenceSetId,
+				},
+				true,
+			);
+			this.assertCompletionTask(task, evidence);
+			const value = JSON.parse(
+				JSON.stringify({
+					schemaVersion: "astra.evidence_completion.v1",
+					task: this.completionTaskBinding(task),
+					evidence,
+					completion: this.evidenceCompletion(evidence, true),
+				}),
+			) as Omit<PreparedEvidenceCompletion, "preparationHash">;
+			prepared = { ...value, preparationHash: checksum(value) };
+			await mkdir(taskDir(task.scope.workspaceRoot, task.jobId, task.id), { recursive: true });
+			// Validate the parent before atomicWriteJson can follow an unexpected ancestor link.
+			await this.readTaskCompletionFile(task, "evidence-completion.json");
+			await atomicWriteJson(
+				join(taskDir(task.scope.workspaceRoot, task.jobId, task.id), "evidence-completion.json"),
+				prepared,
+			);
+		}
+		await this.appendEvent({
+			type: "evidence_recorded",
+			evidence: prepared.evidence,
+			completion: prepared.completion,
+		});
+		return structuredClone(prepared.evidence);
+	}
+
+	async completeWorkerTask(
+		taskId: string,
+		output: {
+			artifactType: string;
+			content: unknown;
+			refs: string[];
+			incrementalRevision?: Evidence["incrementalRevision"];
+		},
+	): Promise<Evidence> {
+		return this.exclusive(async () => (await this.completeWorkerTaskInternal(taskId, output))!);
+	}
+
+	async recoverWorkerTaskCompletion(taskId: string): Promise<Evidence | undefined> {
+		return this.exclusive(() => this.completeWorkerTaskInternal(taskId));
+	}
+
+	private async recoverWorkerManifest(task: TaskPacket): Promise<
+		| {
+				artifactType: string;
+				content: unknown;
+				refs: string[];
+				incrementalRevision?: Evidence["incrementalRevision"];
+		  }
+		| undefined
+	> {
+		const bytes = await this.readTaskCompletionFile(task, "output-manifest.json");
+		if (bytes === undefined) return undefined;
+		const packetBytes = await this.readTaskCompletionFile(task, "task-packet.json");
+		if (!packetBytes || !task.version)
+			throw new Error("worker completion manifest has no persisted task version binding");
+		const packet = JSON.parse(packetBytes) as TaskPacket;
+		if (checksum(this.completionTaskBinding(packet)) !== checksum(this.completionTaskBinding(task)))
+			throw new Error("worker completion packet identity, attempt, version or contract mismatch");
+		const manifest: WorkerOutputManifest = await readWorkerOutputManifest(
+			join(taskDir(task.scope.workspaceRoot, task.jobId, task.id), "output-manifest.json"),
+		);
+		if (
+			manifest.jobId !== task.jobId ||
+			manifest.taskId !== task.id ||
+			manifest.agentId !== task.agentId ||
+			manifest.artifactType !== task.requiredOutputType ||
+			manifest.validationErrors.length
+		)
+			throw new Error("worker completion manifest identity or validation mismatch");
+		const prefix = `.astra/jobs/${task.jobId}/workspaces/${task.id}/`;
+		const refs = manifest.outputRefs.map((ref) => {
+			if (ref.kind !== "artifact" && ref.kind !== "log") return ref;
+			if (!ref.ref.startsWith(prefix) || !ref.sha256 || !/^[a-f0-9]{64}$/.test(ref.sha256))
+				throw new Error("worker completion file path or digest does not match this task");
+			return { ...ref, ref: ref.ref.slice(prefix.length) };
+		});
+		const { resultHash: declaredResultHash, ...revision } = manifest.incrementalRevision ?? { resultHash: undefined };
+		const validated = await validateWorkerSubmission(
+			task,
+			{
+				artifactType: manifest.artifactType,
+				content: manifest.incrementalRevision ? {} : manifest.content,
+				refs,
+				...(manifest.incrementalRevision
+					? { incrementalRevision: revision as Omit<NonNullable<Evidence["incrementalRevision"]>, "resultHash"> }
+					: {}),
+			},
+			{
+				executionRoot: taskWorkspacePath(task.scope.workspaceRoot, task.jobId, task.id),
+				sessionRef: manifest.sessionRef,
+				minSourceRefs: taskStageContract(this.definitions[task.stageId], task).minSourceRefs,
+				job: this,
+			},
+		);
+		if (
+			checksum(validated.content) !== checksum(manifest.content) ||
+			(manifest.incrementalRevision &&
+				(validated.incrementalRevision?.resultHash !== declaredResultHash ||
+					checksum(validated.incrementalRevision) !== checksum(manifest.incrementalRevision)))
+		)
+			throw new Error("worker completion merged content or incremental result hash mismatch");
+		for (const ref of refs) {
+			if (
+				(ref.kind === "artifact" || ref.kind === "log") &&
+				validated.outputRefs.find((entry) => entry.kind === ref.kind && entry.ref === ref.ref)?.sha256 !==
+					ref.sha256
+			)
+				throw new Error("worker completion file changed after validation");
+		}
+		return {
+			artifactType: manifest.artifactType,
+			content: validated.content,
+			refs: manifest.outputRefs.map((ref) => ref.ref),
+			...(validated.incrementalRevision ? { incrementalRevision: validated.incrementalRevision } : {}),
+		};
+	}
+
+	private async recoverWorkerCompletionsInternal(): Promise<void> {
+		const evidenceByTask = new Map(
+			Object.values(this.snapshot.evidence).map((evidence) => [evidence.taskId, evidence]),
+		);
+		const candidates = Object.values(this.snapshot.tasks).filter((task) => {
+			if (task.role !== "worker" || task.status === "blocked") return false;
+			const evidence = evidenceByTask.get(task.id);
+			if (!evidence) return true;
+			if (!this.snapshot.evidence[evidence.id])
+				throw new StaleResearchInputError(`completion evidence identity is stale: ${evidence.id}`);
+			if (
+				evidence.status === "rejected" ||
+				(task.stageRevision ?? 1) !== (this.snapshot.stages[task.stageId]?.revision ?? 1)
+			)
+				return false;
+			const completion = this.evidenceCompletion(evidence, true);
+			return (
+				task.status !== "succeeded" ||
+				Boolean(
+					(completion.node && !this.snapshot.graph.nodes[completion.node.id]) ||
+						(completion.edge && !this.snapshot.graph.edges[completion.edge.id]),
+				)
+			);
+		});
+		if (!candidates.length) return;
+		const superseded = new Set<string>();
+		const latestAttempts = new Map<string, number>();
+		for (const task of Object.values(this.snapshot.tasks)) {
+			if (task.supersedesTaskId) superseded.add(task.supersedesTaskId);
+			latestAttempts.set(task.replayKey, Math.max(latestAttempts.get(task.replayKey) ?? 0, task.attempt));
+		}
+		const archived = new Set(
+			[
+				...Object.values(this.snapshot.retiredArtifacts),
+				...Object.values(this.snapshot.discardedEvidence),
+				...Object.values(this.snapshot.discardedCandidates),
+			].map((receipt) => receipt.taskId),
+		);
+		for (const task of candidates) {
+			if (superseded.has(task.id) || task.attempt < latestAttempts.get(task.replayKey)! || archived.has(task.id))
+				continue;
+			await this.completeWorkerTaskInternal(task.id, undefined, evidenceByTask.get(task.id) ?? null);
+		}
 	}
 
 	historicalRepairArchives(stageId: string): Array<{
@@ -1528,6 +1946,9 @@ export class ResearchJob {
 		return this.exclusive(async () => {
 			await this.finishCleanupsInternal();
 			await this.recoverReviewsInternal();
+			const recoveryHistory = await this.recoverAcceptancesInternal();
+			await this.recoverRoutesInternal(recoveryHistory);
+			await this.recoverWorkerCompletionsInternal();
 			if (this.snapshot.paused) return;
 			for (const artifact of Object.values(this.snapshot.canonical)) {
 				if (["stale", "retired"].includes(artifact.status) || artifact.adoptionCompletedAt) continue;
@@ -2103,117 +2524,194 @@ export class ResearchJob {
 		}
 	}
 
+	private passingAcceptanceReviews(evidence: Evidence): Review[] {
+		const policy = this.definitions[evidence.stageId]?.qualityPolicy;
+		const reviews = Object.values(this.snapshot.reviews).filter((review) => review.evidenceId === evidence.id);
+		if (reviews.some((review) => review.verdict !== "pass"))
+			throw new Error("evidence with a non-passing review requires a repaired candidate before acceptance");
+		const passing = reviews.filter(
+			(review) =>
+				review.verdict === "pass" &&
+				(review.score ?? 0) >= (policy?.minScore ?? 0.8) &&
+				review.targetVersionHash === evidence.versionHash,
+		);
+		if (passing.length < (policy?.minPassingReviews ?? 1))
+			throw new Error("evidence requires the configured passing reviews before acceptance");
+		return passing;
+	}
+
+	/** Acceptance and its historical tail use the same item-bound closure rules. */
+	private acceptanceConsequences(evidence: Evidence, decisionRef: string): EvidenceAcceptanceConsequences {
+		const passing = this.passingAcceptanceReviews(evidence);
+		const task = this.snapshot.tasks[evidence.taskId];
+		const consequences: EvidenceAcceptanceConsequences = {
+			repairItems: [],
+			resolvedObligations: [],
+			resolvedNodeIds: [],
+		};
+		for (const obligation of Object.values(this.snapshot.obligations)) {
+			const failed = this.snapshot.evidence[this.snapshot.reviews[obligation.sourceReviewId]?.evidenceId];
+			if (
+				!failed ||
+				failed.id === evidence.id ||
+				failed.stageId !== evidence.stageId ||
+				(failed.currentEvidenceSetId ?? failed.taskId) !== (evidence.currentEvidenceSetId ?? evidence.taskId)
+			)
+				continue;
+			for (const item of obligation.items ?? []) {
+				if (item.status !== "open") continue;
+				if (
+					task.deliveryKind === "local" &&
+					task.responsibilityTransfers?.some((transfer) => transfer.issueId === item.id)
+				)
+					continue;
+				const binding = task.repairChecks?.find((check) => check.issueId === item.id);
+				if (
+					!binding ||
+					this.normalizedRepairCriterion(binding.criterion) !== this.normalizedRepairCriterion(item.criterion) ||
+					!passing.every((review) =>
+						review.criteria?.some((criterion) => criterion.criterion === binding.criterion && criterion.passed),
+					)
+				)
+					throw new Error(`repair item requires explicit verified closure: ${item.id}`);
+				consequences.repairItems.push({
+					obligationId: obligation.id,
+					itemId: item.id,
+					reviewId: passing[0].id,
+					evidenceId: evidence.id,
+				});
+			}
+			if (
+				(obligation.items ?? []).every(
+					(item) => item.status !== "open" || consequences.repairItems.some((closed) => closed.itemId === item.id),
+				)
+			) {
+				if (obligation.status === "open")
+					consequences.resolvedObligations.push({ obligationId: obligation.id, satisfiedBy: decisionRef });
+				if (
+					obligation.graphObjectionId &&
+					this.snapshot.graph.nodes[obligation.graphObjectionId]?.status === "open"
+				)
+					consequences.resolvedNodeIds.push(obligation.graphObjectionId);
+			}
+		}
+		return consequences;
+	}
+
 	async decideEvidence(
 		evidenceId: string,
 		accepted: boolean,
 		decisionRef = `main_agent_worker_artifact_decision::${randomUUID()}`,
 	): Promise<void> {
-		const evidence = this.snapshot.evidence[evidenceId];
-		if (!evidence) throw new Error(`unknown evidence ${evidenceId}`);
-		if (accepted) {
-			this.assertCurrentInputs(
-				this.snapshot.tasks[evidence.taskId].inputArtifactRefs,
-				this.snapshot.tasks[evidence.taskId].repairOfEvidenceId,
-			);
-			const policy = this.definitions[evidence.stageId]?.qualityPolicy;
+		return this.exclusive(async () => {
+			const evidence = this.snapshot.evidence[evidenceId];
+			if (!evidence) throw new Error(`unknown evidence ${evidenceId}`);
+			if (accepted)
+				this.assertCurrentInputs(
+					this.snapshot.tasks[evidence.taskId].inputArtifactRefs,
+					this.snapshot.tasks[evidence.taskId].repairOfEvidenceId,
+				);
+			const consequences = accepted ? this.acceptanceConsequences(evidence, decisionRef) : undefined;
+			await this.appendEvent({ type: "evidence_decided", evidenceId, accepted, decisionRef, consequences });
+		});
+	}
+
+	private async recoverAcceptancesInternal(): Promise<StoredEvent[] | undefined> {
+		const pendingByLineage = new Map<string, Obligation[]>();
+		for (const obligation of Object.values(this.snapshot.obligations)) {
 			if (
-				Object.values(this.snapshot.reviews).some(
-					(review) => review.evidenceId === evidenceId && review.verdict !== "pass",
-				)
-			) {
-				throw new Error("evidence with a non-passing review requires a repaired candidate before acceptance");
-			}
-			const passingReviews = Object.values(this.snapshot.reviews).filter(
-				(review) =>
-					review.evidenceId === evidenceId &&
-					review.verdict === "pass" &&
-					(review.score ?? 0) >= (policy?.minScore ?? 0.8) &&
-					review.targetVersionHash === evidence.versionHash,
+				obligation.status !== "open" &&
+				!obligation.items?.some((item) => item.status === "open") &&
+				this.snapshot.graph.nodes[obligation.graphObjectionId ?? ""]?.status !== "open"
+			)
+				continue;
+			const failed = this.snapshot.evidence[this.snapshot.reviews[obligation.sourceReviewId]?.evidenceId];
+			if (!failed) continue;
+			const key = JSON.stringify([failed.stageId, failed.currentEvidenceSetId ?? failed.taskId]);
+			const pending = pendingByLineage.get(key) ?? [];
+			pending.push(obligation);
+			pendingByLineage.set(key, pending);
+		}
+		if (!pendingByLineage.size) return undefined;
+		const candidates = Object.values(this.snapshot.evidence).filter((evidence) => {
+			if (
+				evidence.status !== "accepted" ||
+				evidence.acceptanceAuthority !== "main_agent" ||
+				!evidence.mainAgentDecisionRef
+			)
+				return false;
+			const task = this.snapshot.tasks[evidence.taskId];
+			const pending = pendingByLineage.get(
+				JSON.stringify([evidence.stageId, evidence.currentEvidenceSetId ?? evidence.taskId]),
 			);
-			if (passingReviews.length < (policy?.minPassingReviews ?? 1)) {
-				throw new Error("evidence requires the configured passing reviews before acceptance");
-			}
-			for (const issue of Object.values(this.snapshot.obligations)) {
-				const failed = this.snapshot.evidence[this.snapshot.reviews[issue.sourceReviewId]?.evidenceId];
-				if (issue.status !== "open" || !failed || failed.currentEvidenceSetId !== evidence.currentEvidenceSetId)
-					continue;
-				for (const item of issue.items ?? []) {
-					if (
-						this.snapshot.tasks[evidence.taskId].deliveryKind === "local" &&
-						this.snapshot.tasks[evidence.taskId].responsibilityTransfers?.some(
-							(transfer) => transfer.issueId === item.id,
+			return (
+				pending?.some((obligation) => {
+					if (this.snapshot.reviews[obligation.sourceReviewId]?.evidenceId === evidence.id) return false;
+					const openItems = (obligation.items ?? []).filter((item) => item.status === "open");
+					return (
+						!openItems.length ||
+						openItems.some(
+							(item) =>
+								task?.deliveryKind !== "local" ||
+								!task.responsibilityTransfers?.some((transfer) => transfer.issueId === item.id),
 						)
-					)
-						continue;
-					const binding = this.snapshot.tasks[evidence.taskId].repairChecks?.find(
-						(check) => check.issueId === item.id,
 					);
-					if (
-						!binding ||
-						this.normalizedRepairCriterion(binding.criterion) !==
-							this.normalizedRepairCriterion(item.criterion) ||
-						!passingReviews.every((review) =>
-							review.criteria?.some(
-								(criterion) => criterion.criterion === binding.criterion && criterion.passed,
-							),
-						)
-					)
-						throw new Error(`repair item requires explicit verified closure: ${item.id}`);
-				}
-			}
-		}
-		await this.commit({ type: "evidence_decided", evidenceId, accepted, decisionRef });
-		if (accepted) {
-			for (const obligation of Object.values(this.snapshot.obligations)) {
-				if (obligation.status !== "open") continue;
-				const failedReview = this.snapshot.reviews[obligation.sourceReviewId];
-				const failedEvidence = failedReview ? this.snapshot.evidence[failedReview.evidenceId] : undefined;
+				}) ?? false
+			);
+		});
+		if (!candidates.length) return undefined;
+		const history = await this.store.readEvents(this.snapshot.frame.jobId);
+		for (const evidence of candidates) {
+			let recordedIndex = -1;
+			let acceptedIndex = -1;
+			for (const [index, saved] of history.entries()) {
+				if (saved.event.type === "evidence_recorded" && saved.event.evidence.id === evidence.id)
+					recordedIndex = index;
 				if (
-					failedEvidence &&
-					failedEvidence.id !== evidence.id &&
-					failedEvidence.stageId === evidence.stageId &&
-					failedEvidence.currentEvidenceSetId === evidence.currentEvidenceSetId
-				) {
-					for (const item of obligation.items ?? []) {
-						const binding = this.snapshot.tasks[evidence.taskId].repairChecks?.find(
-							(check) => check.issueId === item.id,
-						);
-						const review = binding
-							? Object.values(this.snapshot.reviews).find(
-									(review) =>
-										review.evidenceId === evidence.id &&
-										review.verdict === "pass" &&
-										review.targetVersionHash === evidence.versionHash &&
-										review.criteria?.some(
-											(criterion) => criterion.criterion === binding.criterion && criterion.passed,
-										),
-								)
-							: undefined;
-						if (review)
-							await this.commit({
-								type: "repair_item_resolved",
-								obligationId: obligation.id,
-								itemId: item.id,
-								reviewId: review.id,
-								evidenceId: evidence.id,
-							});
-					}
-					if (this.snapshot.obligations[obligation.id].items?.some((item) => item.status === "open")) continue;
-					await this.commit({
-						type: "obligation_resolved",
-						obligationId: obligation.id,
-						satisfiedBy: decisionRef,
-					});
-					if (obligation.graphObjectionId) {
-						await this.commit({
-							type: "research_node_status",
-							nodeId: obligation.graphObjectionId,
-							status: "resolved",
-						});
-					}
-				}
+					saved.event.type === "evidence_decided" &&
+					saved.event.evidenceId === evidence.id &&
+					saved.event.accepted &&
+					saved.event.decisionRef === evidence.mainAgentDecisionRef
+				)
+					acceptedIndex = index;
 			}
+			const recorded = history[recordedIndex]?.event;
+			if (
+				recorded?.type !== "evidence_recorded" ||
+				recordedIndex >= acceptedIndex ||
+				checksum({
+					...recorded.evidence,
+					status: undefined,
+					acceptanceAuthority: undefined,
+					mainAgentDecisionRef: undefined,
+					supersededByTaskId: undefined,
+				}) !==
+					checksum({
+						...evidence,
+						status: undefined,
+						acceptanceAuthority: undefined,
+						mainAgentDecisionRef: undefined,
+						supersededByTaskId: undefined,
+					})
+			)
+				throw new StaleResearchInputError(`historical acceptance identity or version is stale: ${evidence.id}`);
+			const task = this.snapshot.tasks[evidence.taskId];
+			if (
+				!task ||
+				task.status !== "succeeded" ||
+				!evidenceHasCurrentPlanApprovalFromSnapshot(this.snapshot, evidence)
+			)
+				throw new StaleResearchInputError(`historical acceptance task or plan is stale: ${evidence.id}`);
+			this.assertCompletionTask(task, evidence);
+			const consequences = this.acceptanceConsequences(evidence, evidence.mainAgentDecisionRef!);
+			if (
+				consequences.repairItems.length ||
+				consequences.resolvedObligations.length ||
+				consequences.resolvedNodeIds.length
+			)
+				await this.appendEvent({ type: "evidence_acceptance_recovered", evidenceId: evidence.id, consequences });
 		}
+		return history;
 	}
 
 	async recordCandidateEvaluation(
@@ -2488,96 +2986,245 @@ export class ResearchJob {
 	}
 
 	async applyRouteDecision(manifest: MainAgentDecisionManifest): Promise<void> {
-		if (manifest.decisionType !== "route" || !manifest.routeAction) {
-			throw new Error("route decision manifest is incomplete");
-		}
-		const unknownEvidenceRefs = (manifest.evidenceRefs ?? []).filter(
-			(ref) => !this.snapshot.canonical[ref] && !this.snapshot.evidence[ref] && !this.snapshot.graph.nodes[ref],
-		);
-		if (unknownEvidenceRefs.length > 0) {
-			throw new Error(`route decision references unknown evidence: ${unknownEvidenceRefs.join(", ")}`);
-		}
-		const stageId = this.snapshot.frame.activeStageId;
-		if (manifest.stageId !== stageId) throw new Error(`route decision must target active stage ${stageId}`);
-		if (["advance", "complete"].includes(manifest.routeAction) && this.unsynthesizedLocalEvidence(stageId).length)
-			throw new Error("route requires synthesis of accepted local evidence");
-		const currentArtifactId = this.snapshot.canonicalRoute.stageArtifactIds[stageId];
-		if (["advance", "complete"].includes(manifest.routeAction) && this.backtrackChecks(stageId).length)
-			throw new Error("route cannot advance while bound responsibility nodes remain open");
-		if (
-			["advance", "complete"].includes(manifest.routeAction) &&
-			this.snapshot.frame.openObligationIds.some((id) => this.snapshot.obligations[id]?.stageId === stageId)
-		)
-			throw new Error("route cannot advance while repair obligations remain open");
-		if (["advance", "complete"].includes(manifest.routeAction) && !currentArtifactId) {
-			throw new Error(`route decision ${manifest.routeAction} requires a canonical artifact for ${stageId}`);
-		}
-		if (manifest.routeAction === "advance") {
-			if (
-				!manifest.targetStageId ||
-				manifest.targetStageId === stageId ||
-				!this.definitions[manifest.targetStageId]
-			) {
-				throw new Error("advance route decision requires a different valid target stage");
+		return this.exclusive(async () => {
+			if (manifest.jobId !== this.snapshot.frame.jobId) throw new Error("route decision job id does not match");
+			if (manifest.decisionType !== "route" || !manifest.routeAction) {
+				throw new Error("route decision manifest is incomplete");
 			}
-		}
-		if (
-			manifest.routeAction === "backtrack" &&
-			(!manifest.targetStageId || !this.definitions[manifest.targetStageId])
-		) {
-			throw new Error("backtrack route decision requires a valid target stage");
-		}
-		if (manifest.routeAction === "ask-user" && !manifest.question?.trim()) {
-			throw new Error("ask-user route decision requires a concrete question");
-		}
-		if (manifest.routeAction === "complete") {
-			const blockers = this.completionBlockers();
-			if (blockers.length > 0) throw new Error(`research completion blocked: ${blockers.join("; ")}`);
-		}
-		const decision: StageRouteDecision = {
-			id: manifest.decisionRef,
-			stageId,
-			action: manifest.routeAction,
-			...(manifest.targetStageId ? { targetStageId: manifest.targetStageId } : {}),
-			evidenceRefs: manifest.evidenceRefs ?? (currentArtifactId ? [currentArtifactId] : []),
-			...(manifest.question ? { question: manifest.question } : {}),
-			newQuestions: manifest.newQuestions ?? [],
-			rationale: manifest.rationale,
-			sessionRef: manifest.sessionRef,
-			createdAt: manifest.createdAt,
-		};
-		await this.commit({ type: "route_decided", decision });
-		for (const question of decision.newQuestions) {
-			const node = createResearchNode({
-				kind: "question",
-				statement: question,
-				status: "open",
+			const existing = this.snapshot.routeDecisions[manifest.decisionRef];
+			if (existing) {
+				const proposed = {
+					id: manifest.decisionRef,
+					stageId: manifest.stageId,
+					action: manifest.routeAction,
+					targetStageId: manifest.targetStageId,
+					evidenceRefs: manifest.evidenceRefs ?? existing.evidenceRefs,
+					question: manifest.question,
+					newQuestions: manifest.newQuestions ?? [],
+					rationale: manifest.rationale,
+					sessionRef: manifest.sessionRef,
+					createdAt: manifest.createdAt,
+				};
+				if (
+					checksum(JSON.parse(JSON.stringify(proposed))) !==
+					checksum(
+						JSON.parse(
+							JSON.stringify({
+								...existing,
+								consequencesCompleted: undefined,
+								consequencesSupersededBy: undefined,
+							}),
+						),
+					)
+				)
+					throw new Error("route decision id already has different content");
+				await this.recoverRoutesInternal();
+				await this.finishCleanupsInternal();
+				return;
+			}
+			const unknownEvidenceRefs = (manifest.evidenceRefs ?? []).filter(
+				(ref) => !this.snapshot.canonical[ref] && !this.snapshot.evidence[ref] && !this.snapshot.graph.nodes[ref],
+			);
+			if (unknownEvidenceRefs.length > 0) {
+				throw new Error(`route decision references unknown evidence: ${unknownEvidenceRefs.join(", ")}`);
+			}
+			const stageId = this.snapshot.frame.activeStageId;
+			if (manifest.stageId !== stageId) throw new Error(`route decision must target active stage ${stageId}`);
+			if (["advance", "complete"].includes(manifest.routeAction) && this.unsynthesizedLocalEvidence(stageId).length)
+				throw new Error("route requires synthesis of accepted local evidence");
+			const currentArtifactId = this.snapshot.canonicalRoute.stageArtifactIds[stageId];
+			if (["advance", "complete"].includes(manifest.routeAction) && this.backtrackChecks(stageId).length)
+				throw new Error("route cannot advance while bound responsibility nodes remain open");
+			if (
+				["advance", "complete"].includes(manifest.routeAction) &&
+				this.snapshot.frame.openObligationIds.some((id) => this.snapshot.obligations[id]?.stageId === stageId)
+			)
+				throw new Error("route cannot advance while repair obligations remain open");
+			if (["advance", "complete"].includes(manifest.routeAction) && !currentArtifactId) {
+				throw new Error(`route decision ${manifest.routeAction} requires a canonical artifact for ${stageId}`);
+			}
+			if (manifest.routeAction === "advance") {
+				if (
+					!manifest.targetStageId ||
+					manifest.targetStageId === stageId ||
+					!this.definitions[manifest.targetStageId]
+				) {
+					throw new Error("advance route decision requires a different valid target stage");
+				}
+			}
+			if (
+				manifest.routeAction === "backtrack" &&
+				(!manifest.targetStageId || !this.definitions[manifest.targetStageId])
+			) {
+				throw new Error("backtrack route decision requires a valid target stage");
+			}
+			if (manifest.routeAction === "ask-user" && !manifest.question?.trim()) {
+				throw new Error("ask-user route decision requires a concrete question");
+			}
+			if (manifest.routeAction === "complete") {
+				const blockers = this.completionBlockers();
+				if (blockers.length > 0) throw new Error(`research completion blocked: ${blockers.join("; ")}`);
+			}
+			const decision: StageRouteDecision = {
+				id: manifest.decisionRef,
 				stageId,
-				domainRef: decision.id,
+				action: manifest.routeAction,
+				...(manifest.targetStageId ? { targetStageId: manifest.targetStageId } : {}),
+				evidenceRefs: manifest.evidenceRefs ?? (currentArtifactId ? [currentArtifactId] : []),
+				...(manifest.question ? { question: manifest.question } : {}),
+				newQuestions: manifest.newQuestions ?? [],
+				rationale: manifest.rationale,
+				sessionRef: manifest.sessionRef,
+				createdAt: manifest.createdAt,
+			};
+			const consequences = await this.routeConsequences(decision);
+			await this.appendEvent({ type: "route_decided", decision, consequences });
+			await this.finishCleanupsInternal();
+		});
+	}
+
+	private async routeConsequences(decision: StageRouteDecision): Promise<RouteConsequences> {
+		const consequences: RouteConsequences = { nodes: [], edges: [] };
+		const matched = new Set<string>();
+		for (const [index, question] of decision.newQuestions.entries()) {
+			const existing = Object.values(this.snapshot.graph.nodes).find(
+				(node) =>
+					node.kind === "question" &&
+					node.stageId === decision.stageId &&
+					node.domainRef === decision.id &&
+					node.statement === question &&
+					!matched.has(node.id),
+			);
+			const node =
+				existing ??
+				createResearchNode({
+					id: `research_question_${checksum({ decisionRef: decision.id, stageId: decision.stageId, index, question }).slice(0, 24)}`,
+					kind: "question",
+					statement: question,
+					status: "open",
+					stageId: decision.stageId,
+					domainRef: decision.id,
+					sourceRefs: [decision.id],
+				});
+			matched.add(node.id);
+			if (!existing) consequences.nodes.push(node);
+			const edge = createResearchEdge({
+				fromNodeId: this.snapshot.graph.rootQuestionId,
+				toNodeId: node.id,
+				kind: "refines",
 				sourceRefs: [decision.id],
 			});
-			await this.commit({
-				type: "research_node_recorded",
-				node,
-				edge: createResearchEdge({
-					fromNodeId: this.snapshot.graph.rootQuestionId,
-					toNodeId: node.id,
-					kind: "refines",
-					sourceRefs: [decision.id],
-				}),
-			});
+			if (!this.snapshot.graph.edges[edge.id]) consequences.edges.push(edge);
 		}
-		if (decision.action === "backtrack" && decision.targetStageId) {
-			await this.reopenStage(decision.targetStageId, decision.id, decision.rationale);
-		}
-		if (decision.action === "ask-user" && decision.question) {
-			await this.requireUserGate({
+		if (
+			decision.action === "backtrack" &&
+			decision.targetStageId &&
+			!Object.values(this.snapshot.graph.nodes).some(
+				(node) =>
+					node.kind === "objection" && node.stageId === decision.targetStageId && node.domainRef === decision.id,
+			)
+		)
+			consequences.reopening = await this.prepareStageReopening(
+				decision.targetStageId,
+				decision.id,
+				decision.rationale,
+			);
+		if (
+			decision.action === "ask-user" &&
+			decision.question &&
+			!(
+				this.snapshot.frame.userGate?.kind === "research" &&
+				this.snapshot.frame.userGate.question === decision.question &&
+				this.snapshot.frame.userGate.stageId === decision.stageId
+			)
+		)
+			consequences.gate = {
 				kind: "research",
-				stageId,
+				stageId: decision.stageId,
 				question: decision.question,
 				reason: decision.rationale,
+				requiredAt: decision.createdAt,
+			};
+		return consequences;
+	}
+
+	private async recoverRoutesInternal(recoveryHistory?: StoredEvent[]): Promise<void> {
+		const pending = Object.values(this.snapshot.routeDecisions).filter(
+			(decision) => !decision.consequencesCompleted && !decision.consequencesSupersededBy,
+		);
+		if (!pending.length) return;
+		const history = recoveryHistory ?? (await this.store.readEvents(this.snapshot.frame.jobId));
+		let lastIndex = -1;
+		for (const [index, saved] of history.entries()) if (saved.event.type === "route_decided") lastIndex = index;
+		const event = history[lastIndex]?.event;
+		if (event?.type !== "route_decided") return;
+		const pendingIds = new Set(pending.map((decision) => decision.id));
+		for (const saved of history.slice(0, lastIndex)) {
+			if (
+				saved.event.type !== "route_decided" ||
+				saved.event.decision.id === event.decision.id ||
+				!pendingIds.delete(saved.event.decision.id)
+			)
+				continue;
+			await this.appendEvent({
+				type: "route_consequences_superseded",
+				decisionRef: saved.event.decision.id,
+				supersededBy: `route:${event.decision.id}`,
 			});
 		}
+		const decision = this.snapshot.routeDecisions[event.decision.id];
+		if (!decision || decision.consequencesCompleted || decision.consequencesSupersededBy) return;
+		const later = history.slice(lastIndex + 1);
+		// Journal ordering excludes structural changes, not harmless leases, pauses or budget accounting.
+		const replacement = later.find(
+			({ event: change }) =>
+				[
+					"user_guidance_recorded",
+					"active_stage_work_superseded",
+					"stage_plan_recorded",
+					"task_dispatched",
+					"evidence_decided",
+					"evidence_adopted",
+					"artifact_retired",
+					"search_batch_recorded",
+					"search_batch_decided",
+				].includes(change.type) ||
+				(change.type === "canonical_artifact_status" && change.status === "active") ||
+				(change.type === "stage_reopened" && change.decisionRef !== decision.id),
+		);
+		if (replacement) {
+			await this.appendEvent({
+				type: "route_consequences_superseded",
+				decisionRef: decision.id,
+				supersededBy: `event:${replacement.seq}:${replacement.event.type}`,
+			});
+			return;
+		}
+		const stage = this.snapshot.stages[decision.stageId];
+		const reopened = Object.values(this.snapshot.graph.nodes).some(
+			(node) =>
+				node.kind === "objection" && node.domainRef === decision.id && node.stageId === decision.targetStageId,
+		);
+		if (
+			stage.lastRouteDecisionRef !== decision.id ||
+			(["backtrack", "ask-user", "continue", "search"].includes(decision.action) &&
+				this.snapshot.frame.activeStageId !== (reopened ? decision.targetStageId : decision.stageId)) ||
+			(!reopened && stage.lastRoutedArtifactId !== this.snapshot.canonicalRoute.stageArtifactIds[decision.stageId])
+		)
+			throw new StaleResearchInputError(`pending route consequences cannot safely recover: ${decision.id}`);
+		if (
+			this.snapshot.paused &&
+			((decision.action === "backtrack" && !reopened) ||
+				(decision.action === "ask-user" &&
+					!(
+						this.snapshot.frame.userGate?.kind === "research" &&
+						this.snapshot.frame.userGate.stageId === decision.stageId &&
+						this.snapshot.frame.userGate.question === decision.question
+					)))
+		)
+			return;
+		const consequences = await this.routeConsequences(decision);
+		await this.appendEvent({ type: "route_consequences_recovered", decisionRef: decision.id, consequences });
 	}
 
 	async pause(reason: string): Promise<void> {
@@ -2586,26 +3233,30 @@ export class ResearchJob {
 
 	async resume(): Promise<void> {
 		await this.recoverLegacyProviderCapacityFailure();
-		const gate = this.snapshot.frame.userGate;
-		if (!gate) {
-			await this.commit({ type: "job_resumed" });
-			return;
-		}
-		if (gate.kind === "budget") {
-			const usage = this.snapshot.budgetUsage ?? { turnsUsed: 0, costUsdUsed: 0 };
-			const stillBlocked =
-				(gate.limit === "maxTasks" &&
-					Object.keys(this.snapshot.tasks).length >= this.snapshot.frame.budget.maxTasks) ||
-				(gate.limit === "maxTurns" && usage.turnsUsed >= this.snapshot.frame.budget.maxTurns) ||
-				(gate.limit === "maxCostUsd" &&
-					this.snapshot.frame.budget.maxCostUsd !== undefined &&
-					usage.costUsdUsed >= this.snapshot.frame.budget.maxCostUsd);
-			if (stillBlocked) throw new Error(`budget gate remains: increase ${gate.limit} before resume`);
-		}
-		if (gate.kind === "research") {
-			throw new Error("research question gate requires user guidance before resume");
-		}
-		await this.commit({ type: "user_gate_approved", gate, approvedAt: new Date().toISOString() });
+		return this.exclusive(async () => {
+			const gate = this.snapshot.frame.userGate;
+			if (!gate) {
+				await this.appendEvent({ type: "job_resumed" });
+				await this.recoverRoutesInternal();
+				return;
+			}
+			if (gate.kind === "budget") {
+				const usage = this.snapshot.budgetUsage ?? { turnsUsed: 0, costUsdUsed: 0 };
+				const stillBlocked =
+					(gate.limit === "maxTasks" &&
+						Object.keys(this.snapshot.tasks).length >= this.snapshot.frame.budget.maxTasks) ||
+					(gate.limit === "maxTurns" && usage.turnsUsed >= this.snapshot.frame.budget.maxTurns) ||
+					(gate.limit === "maxCostUsd" &&
+						this.snapshot.frame.budget.maxCostUsd !== undefined &&
+						usage.costUsdUsed >= this.snapshot.frame.budget.maxCostUsd);
+				if (stillBlocked) throw new Error(`budget gate remains: increase ${gate.limit} before resume`);
+			}
+			if (gate.kind === "research") {
+				throw new Error("research question gate requires user guidance before resume");
+			}
+			await this.appendEvent({ type: "user_gate_approved", gate, approvedAt: new Date().toISOString() });
+			await this.recoverRoutesInternal();
+		});
 	}
 
 	async resumeWithGuidance(guidance: string): Promise<void> {
@@ -2730,6 +3381,36 @@ export class ResearchJob {
 		else this.apply({ type: "search_candidate_pruned", receipt: intent.receipt }, timestamp);
 	}
 
+	private applyEvidenceCompletion(evidenceId: string, completion: EvidenceCompletion): void {
+		if (completion.taskSucceeded) this.snapshot.tasks[this.snapshot.evidence[evidenceId].taskId].status = "succeeded";
+		if (completion.node && !this.snapshot.graph.nodes[completion.node.id])
+			addNodeToGraph(this.snapshot.graph, completion.node);
+		if (completion.edge && !this.snapshot.graph.edges[completion.edge.id])
+			addEdgeToGraph(this.snapshot.graph, completion.edge);
+	}
+
+	private applyAcceptanceConsequences(consequences: EvidenceAcceptanceConsequences, timestamp: string): void {
+		for (const closed of consequences.repairItems) this.apply({ type: "repair_item_resolved", ...closed }, timestamp);
+		for (const closed of consequences.resolvedObligations)
+			this.apply({ type: "obligation_resolved", ...closed }, timestamp);
+		for (const nodeId of consequences.resolvedNodeIds)
+			if (this.snapshot.graph.nodes[nodeId]?.status !== "resolved")
+				updateNodeStatus(this.snapshot.graph, nodeId, "resolved", timestamp);
+	}
+
+	private applyRouteConsequences(decisionRef: string, consequences: RouteConsequences, timestamp: string): void {
+		for (const node of consequences.nodes)
+			if (!this.snapshot.graph.nodes[node.id]) addNodeToGraph(this.snapshot.graph, node);
+		for (const edge of consequences.edges)
+			if (!this.snapshot.graph.edges[edge.id]) addEdgeToGraph(this.snapshot.graph, edge);
+		if (consequences.reopening) this.apply({ type: "stage_reopened", ...consequences.reopening }, timestamp);
+		if (consequences.gate) {
+			if (this.snapshot.paused) return;
+			this.apply({ type: "user_gate_required", gate: consequences.gate }, timestamp);
+		}
+		this.snapshot.routeDecisions[decisionRef].consequencesCompleted = true;
+	}
+
 	private apply(event: AstraEvent, timestamp: string): void {
 		switch (event.type) {
 			case "job_created":
@@ -2769,6 +3450,7 @@ export class ResearchJob {
 				return;
 			case "evidence_recorded":
 				this.snapshot.evidence[event.evidence.id] = structuredClone(event.evidence);
+				if (event.completion) this.applyEvidenceCompletion(event.evidence.id, event.completion);
 				{
 					const task = this.snapshot.tasks[event.evidence.taskId];
 					if (task?.searchBatchId && task.searchCandidateId) {
@@ -2780,6 +3462,12 @@ export class ResearchJob {
 						}
 					}
 				}
+				return;
+			case "evidence_completion_recovered":
+				this.applyEvidenceCompletion(event.evidenceId, event.completion);
+				return;
+			case "evidence_acceptance_recovered":
+				this.applyAcceptanceConsequences(event.consequences, timestamp);
 				return;
 			case "evidence_decided":
 				if (event.accepted) {
@@ -2798,6 +3486,7 @@ export class ResearchJob {
 				this.snapshot.evidence[event.evidenceId].status = event.accepted ? "accepted" : "rejected";
 				this.snapshot.evidence[event.evidenceId].acceptanceAuthority = "main_agent";
 				this.snapshot.evidence[event.evidenceId].mainAgentDecisionRef = event.decisionRef;
+				if (event.consequences) this.applyAcceptanceConsequences(event.consequences, timestamp);
 				return;
 			case "review_recorded":
 				this.snapshot.reviews[event.review.id] = structuredClone(event.review);
@@ -3201,7 +3890,14 @@ export class ResearchJob {
 				}
 				return;
 			}
+			case "route_consequences_recovered":
+				this.applyRouteConsequences(event.decisionRef, event.consequences, timestamp);
+				return;
+			case "route_consequences_superseded":
+				this.snapshot.routeDecisions[event.decisionRef].consequencesSupersededBy = event.supersededBy;
+				return;
 			case "route_decided": {
+				const pausedFrame = this.snapshot.paused ? structuredClone(this.snapshot.frame) : undefined;
 				const decision = structuredClone(event.decision);
 				this.snapshot.routeDecisions[decision.id] = decision;
 				const stage = this.snapshot.stages[decision.stageId];
@@ -3246,6 +3942,12 @@ export class ResearchJob {
 					this.snapshot.frame.nextAction = "research complete";
 					updateNodeStatus(this.snapshot.graph, this.snapshot.graph.rootQuestionId, "resolved", timestamp);
 				}
+				if (event.consequences) this.applyRouteConsequences(decision.id, event.consequences, timestamp);
+				if (pausedFrame) {
+					this.snapshot.frame.nextAction = pausedFrame.nextAction;
+					this.snapshot.frame.userGate = pausedFrame.userGate;
+					this.snapshot.frame.status = pausedFrame.status;
+				}
 				return;
 			}
 			case "stage_reopened":
@@ -3268,8 +3970,10 @@ export class ResearchJob {
 				this.snapshot.canonicalRoute.revision += 1;
 				this.snapshot.canonicalRoute.updatedAt = timestamp;
 				this.snapshot.frame.activeStageId = event.targetStageId;
-				this.snapshot.frame.nextAction = `revisit ${event.targetStageId}: ${event.reason}`;
-				this.snapshot.frame.userGate = undefined;
+				if (!this.snapshot.paused) {
+					this.snapshot.frame.nextAction = `revisit ${event.targetStageId}: ${event.reason}`;
+					this.snapshot.frame.userGate = undefined;
+				}
 				return;
 		}
 	}
