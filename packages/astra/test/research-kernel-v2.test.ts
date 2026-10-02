@@ -81,10 +81,12 @@ describe("Research Kernel v2", () => {
 	});
 
 	it("records typed claim outcomes without accepting unsupported claims", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-typed-claims-"));
+		tempRoots.push(root);
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			jobId: "job_typed_claims",
 			objective: "determine whether the primary hypothesis holds",
-			workspaceRoot: "/workspace",
+			workspaceRoot: root,
 		});
 		await recordPassingArtifact(
 			job,
@@ -123,10 +125,12 @@ describe("Research Kernel v2", () => {
 	});
 
 	it("separates completed research from an inconclusive scientific outcome", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-inconclusive-outcome-"));
+		tempRoots.push(root);
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			jobId: "job_inconclusive_outcome",
 			objective: "test a hypothesis without forcing a positive result",
-			workspaceRoot: "/workspace",
+			workspaceRoot: root,
 		});
 		await recordPassingArtifact(
 			job,
@@ -511,12 +515,14 @@ describe("Research Kernel v2", () => {
 	});
 
 	it("keeps stages as capabilities and changes stage only through an explicit route decision", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-dynamic-route-"));
+		tempRoots.push(root);
 		expect(DEFAULT_STAGES.every((stage) => !("dependsOn" in stage))).toBe(true);
 		expect(DEFAULT_STAGES.every((stage) => !("inputArtifactTypes" in stage))).toBe(true);
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			jobId: "job_dynamic_route",
 			objective: "choose a route from evidence",
-			workspaceRoot: "/workspace",
+			workspaceRoot: root,
 		});
 		const artifactId = await recordPassingArtifact(job, "validation", {
 			researchQuestion: "Which method is reliable?",
@@ -699,10 +705,12 @@ describe("Research Kernel v2", () => {
 	});
 
 	it("accepts a final review that passes with nonblocking caveats and has no required repairs", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-completion-caveats-"));
+		tempRoots.push(root);
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
 			jobId: "job_completion_caveats",
 			objective: "complete only after a bounded whole-research review",
-			workspaceRoot: "/workspace",
+			workspaceRoot: root,
 		});
 		await recordPassingArtifact(
 			job,

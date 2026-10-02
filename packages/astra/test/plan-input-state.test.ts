@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { type EffectiveTaskContract, semanticContractHash } from "../src/effective-contract.ts";
 import { planReviewStatus, planReviewStatusFromSnapshot, preparePlanEvidence } from "../src/plan-review.ts";
 import { researchMilestones } from "../src/progress.ts";
@@ -7,6 +10,11 @@ import { MemoryAstraStore } from "../src/store.ts";
 import { ResearchSupervisor } from "../src/supervisor.ts";
 import type { StageDefinition, StagePlanManifest } from "../src/types.ts";
 import { reviewFixture } from "./review-fixture.ts";
+
+const roots: string[] = [];
+afterEach(async () => {
+	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 describe("plan input governance snapshot", () => {
 	it("keeps semantic contract hashes stable across JSON persistence", () => {
@@ -307,8 +315,10 @@ describe("plan input governance snapshot", () => {
 	});
 
 	it("freezes adoption separately from immutable pre-adoption delivery text", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-plan-adoption-"));
+		roots.push(root);
 		const job = await ResearchJob.create(new MemoryAstraStore(), {
-			workspaceRoot: "/workspace",
+			workspaceRoot: root,
 			objective: "Use reviewed results without rewriting historical delivery text",
 		});
 		const task = await job.dispatchTask({
@@ -323,7 +333,7 @@ describe("plan input governance snapshot", () => {
 			acceptanceChecks: ["verified"],
 			failureSignals: ["incorrect"],
 			dependencies: [],
-			scope: { workspaceRoot: "/workspace", allowedPaths: ["."] },
+			scope: { workspaceRoot: root, allowedPaths: ["."] },
 			allowedTools: ["read"],
 			writeAuthority: "none",
 			budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 1000 },

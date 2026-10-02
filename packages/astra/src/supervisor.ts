@@ -478,30 +478,17 @@ export class ResearchSupervisor {
 			if (await this.gateOnBudget(plan.stageId, { tasks: planEvidence(this.job, plan.id) ? 0 : 2, turns: 1 }))
 				return;
 			let reviewerTaskId: string | undefined;
-			let reviewCommitted = false;
+			let evidence: Evidence | undefined;
 			try {
-				const evidence = await preparePlanEvidence(this.job, plan);
+				evidence = await preparePlanEvidence(this.job, plan);
 				await this.job.consumeTurns(1);
-				const result = await this.callAdapter(() => this.reviewer.review(evidence, this.job));
+				const target = evidence;
+				const result = await this.callAdapter(() => this.reviewer.review(target, this.job));
 				reviewerTaskId = result.reviewerTaskId;
 				await this.job.recordReview({ ...result, evidenceId: evidence.id, blocking: false });
-				reviewCommitted = true;
 				if (result.reviewerTaskId) await this.job.setTaskStatus(result.reviewerTaskId, "succeeded");
 			} catch (error) {
-				if (
-					!reviewCommitted &&
-					reviewerTaskId &&
-					Object.values(this.job.state.reviews).some((review) => review.reviewerTaskId === reviewerTaskId)
-				)
-					throw error;
-				if (
-					reviewerTaskId &&
-					!reviewCommitted &&
-					!Object.values(this.job.state.reviews).some((review) => review.reviewerTaskId === reviewerTaskId)
-				)
-					await this.job.failUncommittedReviewerTask(reviewerTaskId);
-				await this.handleAdapterError(error);
-				return;
+				if (!(await this.recoverReviewBeforeError(error, evidence?.id, reviewerTaskId))) return;
 			}
 			if (planReviewStatus(this.job, plan.id) !== "passed") return;
 		}
@@ -556,7 +543,6 @@ export class ResearchSupervisor {
 			if (await this.gateOnBudget(stageId, { turns: 1 })) return;
 			await this.job.consumeTurns(1);
 			let reviewerTaskId: string | undefined;
-			let reviewCommitted = false;
 			try {
 				const verdict = await this.callAdapter(() => this.reviewer.review(evidence, this.job));
 				reviewerTaskId = verdict.reviewerTaskId;
@@ -572,30 +558,36 @@ export class ResearchSupervisor {
 					verifiedRefs: verdict.verifiedRefs,
 					blocking: sourceTask?.searchBatchId === undefined,
 				});
-				reviewCommitted = true;
 				if (reviewerTaskId) await this.job.setTaskStatus(reviewerTaskId, "succeeded");
 				if (sourceTask?.searchBatchId && sourceTask.searchCandidateId) {
 					await this.job.recordCandidateEvaluationFromReview(review.id);
 				}
 			} catch (error) {
-				if (
-					!reviewCommitted &&
-					reviewerTaskId &&
-					Object.values(this.job.state.reviews).some((review) => review.reviewerTaskId === reviewerTaskId)
-				)
-					throw error;
-				if (
-					reviewerTaskId &&
-					!reviewCommitted &&
-					!Object.values(this.job.state.reviews).some((review) => review.reviewerTaskId === reviewerTaskId)
-				) {
-					await this.job.failUncommittedReviewerTask(reviewerTaskId);
-				}
-				await this.handleAdapterError(error);
+				await this.recoverReviewBeforeError(error, evidence.id, reviewerTaskId);
 				if (this.shouldYield()) return;
 			}
 			if (await this.gateOnBudget(stageId)) return;
 		}
+	}
+
+	private async recoverReviewBeforeError(
+		error: unknown,
+		evidenceId?: string,
+		reviewerTaskId?: string,
+	): Promise<boolean> {
+		if (evidenceId) {
+			const reviews = await this.job.recoverReviewerTaskCompletions(evidenceId, reviewerTaskId);
+			if (reviews.length) {
+				this.recovered = true;
+				const task = this.job.state.tasks[this.job.state.evidence[evidenceId].taskId];
+				if (task.searchBatchId && task.searchCandidateId)
+					for (const review of reviews) await this.job.recordCandidateEvaluationFromReview(review.id);
+				return true;
+			}
+		}
+		if (reviewerTaskId) await this.job.failUncommittedReviewerTask(reviewerTaskId);
+		await this.handleAdapterError(error);
+		return false;
 	}
 
 	private async decideSearch(batch: SearchBatch, stageId: string): Promise<void> {
@@ -671,6 +663,7 @@ export class ResearchSupervisor {
 			if (Object.values(this.job.state.canonical).some((artifact) => artifact.evidenceId === evidence.id)) continue;
 			if (await this.gateOnBudget(stageId, { turns: 1 })) return;
 			await this.job.consumeTurns(1);
+			let replacementOf: string | undefined;
 			try {
 				const decision = await this.callAdapter(() => this.mainAgent.decideAdoption(evidence, this.job));
 				if (!decision.adopt) {
@@ -679,11 +672,13 @@ export class ResearchSupervisor {
 					);
 					return;
 				}
-				await this.job.adoptEvidence(evidence.id, decision.replacementOf);
+				replacementOf = decision.replacementOf;
 			} catch (error) {
 				await this.handleAdapterError(error);
 				if (this.shouldYield()) return;
+				continue;
 			}
+			await this.job.adoptEvidence(evidence.id, replacementOf);
 		}
 	}
 

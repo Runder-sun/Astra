@@ -776,9 +776,13 @@ describe("Codex research backend", () => {
 		const before = Object.keys(job.state.tasks).length;
 		await supervisor.tick();
 		expect(job.state.paused).toBe(true);
-		expect(Object.keys(job.state.tasks)).toHaveLength(before + 1);
+		expect(Object.keys(job.state.tasks)).toHaveLength(before);
+		expect(Object.values(job.state.reviews)).toEqual([
+			expect.objectContaining({ reviewerTaskId: review.reviewerTaskId, evidenceId: evidence.id }),
+		]);
+		expect(job.state.tasks[review.reviewerTaskId!].status).toBe("succeeded");
 		await supervisor.tick();
-		expect(Object.keys(job.state.tasks)).toHaveLength(before + 1);
+		expect(Object.keys(job.state.tasks)).toHaveLength(before);
 	});
 	it("audits every Codex decision log and rejects missing, incomplete or misbound records", async () => {
 		const root = await workspace();

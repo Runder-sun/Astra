@@ -859,9 +859,11 @@ it("T9 preserves a committed reviewer when its review snapshot fails", async () 
 			decideRoute: adapters.forbidden,
 		},
 	});
-	await expect(supervisor.tick()).rejects.toThrow(/snapshot/);
+	await supervisor.tick();
 	expect(job.state.tasks[reviewer.id].status).toBe("succeeded");
 	expect(Object.values(job.state.reviews).some((r) => r.reviewerTaskId === reviewer.id)).toBe(true);
+	expect(Object.values(job.state.reviews).filter((r) => r.reviewerTaskId === reviewer.id)).toHaveLength(1);
+	await expect(job.failUncommittedReviewerTask(reviewer.id)).rejects.toThrow("committed");
 	await supervisor.tick();
 	expect(review).toHaveBeenCalledOnce();
 });

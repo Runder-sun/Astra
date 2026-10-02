@@ -481,106 +481,123 @@ describe("research automation policy", () => {
 		expect(job.state.stages.validation.lastRouteAction).toBe("continue");
 	});
 
-	it("fails an uncommitted reviewer task and creates a fresh task on retry", async () => {
-		const store = new MemoryAstraStore();
-		const job = await ResearchJob.create(store, {
-			jobId: "job_review_commit_retry",
-			objective: "retry a review that the durable ledger rejects",
-			workspaceRoot,
-			automation: "full",
-			definitions: [validationStage],
-		});
-		const workerTask = await job.dispatchTask({
-			stageId: "validation",
-			stageExecutionId: "stage_exec_validation",
-			role: "worker",
-			objective: "produce validation evidence",
-			inputArtifactRefs: [],
-			requiredCanonicalArtifacts: [],
-			requiredOutputType: "validation",
-			requiredOutputFields: ["content"],
-			acceptanceChecks: ["structured"],
-			failureSignals: ["missing content"],
-			dependencies: [],
-			scope: { workspaceRoot, allowedPaths: ["."] },
-			allowedTools: ["read"],
-			writeAuthority: "none",
-			budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
-			reviewGateRequired: true,
-			resumePolicy: "resume-session",
-			successCriteria: ["structured"],
-		});
-		await job.setTaskStatus(workerTask.id, "succeeded");
-		const evidence = await job.recordEvidence({
-			taskId: workerTask.id,
-			stageId: "validation",
-			type: "validation",
-			content: { content: "complete" },
-			refs: [],
-		});
-		const reviewerTaskIds: string[] = [];
-		const reviewer = {
-			review: vi.fn(async () => {
-				const reviewerTask = await job.dispatchTask({
-					stageId: "validation",
-					stageExecutionId: "stage_exec_validation",
-					role: "reviewer",
-					objective: `review ${evidence.id}`,
-					inputArtifactRefs: [evidence.id],
-					requiredCanonicalArtifacts: [],
-					requiredOutputType: "review",
-					requiredOutputFields: ["verdict", "findings"],
-					acceptanceChecks: ["review manifest written"],
-					failureSignals: ["missing review manifest"],
-					dependencies: [],
-					scope: { workspaceRoot, allowedPaths: ["."] },
-					allowedTools: ["read"],
-					writeAuthority: "none",
-					budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
-					reviewGateRequired: false,
-					resumePolicy: "resume-session",
-					successCriteria: ["review manifest written"],
-				});
-				await job.setTaskStatus(reviewerTask.id, "succeeded");
-				reviewerTaskIds.push(reviewerTask.id);
-				const exact = reviewerTaskIds.length > 1;
-				return {
-					verdict: "pass" as const,
-					findings: [],
-					reviewerTaskId: reviewerTask.id,
-					score: 1,
-					criteria: [
-						{
-							criterion: exact ? "structured" : "Structured",
-							passed: true,
-							score: 1,
-							evidenceRefs: [`evidence:${evidence.id}`],
-							rationale: "verified",
-						},
-					],
-					verifiedRefs: [`evidence:${evidence.id}`],
-				};
-			}),
-		};
-		const supervisor = new ResearchSupervisor(job, store, {
-			owner: "supervisor-review-commit-retry",
-			maxParallel: 1,
-			worker: { run: vi.fn() },
-			reviewer,
-			mainAgent: mainAgent(),
-		});
+	it.each([false, true])(
+		"retries only an incomplete reviewer without a manifest (completed=%s)",
+		async (completed) => {
+			const store = new MemoryAstraStore();
+			const job = await ResearchJob.create(store, {
+				jobId: "job_review_commit_retry",
+				objective: "retry a review that the durable ledger rejects",
+				workspaceRoot,
+				automation: "full",
+				definitions: [validationStage],
+			});
+			const workerTask = await job.dispatchTask({
+				stageId: "validation",
+				stageExecutionId: "stage_exec_validation",
+				role: "worker",
+				objective: "produce validation evidence",
+				inputArtifactRefs: [],
+				requiredCanonicalArtifacts: [],
+				requiredOutputType: "validation",
+				requiredOutputFields: ["content"],
+				acceptanceChecks: ["structured"],
+				failureSignals: ["missing content"],
+				dependencies: [],
+				scope: { workspaceRoot, allowedPaths: ["."] },
+				allowedTools: ["read"],
+				writeAuthority: "none",
+				budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
+				reviewGateRequired: true,
+				resumePolicy: "resume-session",
+				successCriteria: ["structured"],
+			});
+			await job.setTaskStatus(workerTask.id, "succeeded");
+			const evidence = await job.recordEvidence({
+				taskId: workerTask.id,
+				stageId: "validation",
+				type: "validation",
+				content: { content: "complete" },
+				refs: [],
+			});
+			const reviewerTaskIds: string[] = [];
+			const reviewer = {
+				review: vi.fn(async () => {
+					const reviewerTask = await job.dispatchTask({
+						stageId: "validation",
+						stageExecutionId: "stage_exec_validation",
+						role: "reviewer",
+						objective: `review ${evidence.id}`,
+						inputArtifactRefs: [evidence.id],
+						requiredCanonicalArtifacts: [],
+						requiredOutputType: "review",
+						requiredOutputFields: ["verdict", "findings"],
+						acceptanceChecks: ["review manifest written"],
+						failureSignals: ["missing review manifest"],
+						dependencies: [],
+						scope: { workspaceRoot, allowedPaths: ["."] },
+						allowedTools: ["read"],
+						writeAuthority: "none",
+						budget: { maxTurns: 2, maxToolCalls: 2, maxRuntimeMs: 30_000 },
+						reviewGateRequired: false,
+						resumePolicy: "resume-session",
+						successCriteria: ["review manifest written"],
+					});
+					await job.setTaskStatus(
+						reviewerTask.id,
+						completed || reviewerTaskIds.length > 0 ? "succeeded" : "running",
+					);
+					reviewerTaskIds.push(reviewerTask.id);
+					const exact = reviewerTaskIds.length > 1;
+					return {
+						verdict: "pass" as const,
+						findings: [],
+						reviewerTaskId: reviewerTask.id,
+						score: 1,
+						criteria: [
+							{
+								criterion: exact ? "structured" : "Structured",
+								passed: true,
+								score: 1,
+								evidenceRefs: [`evidence:${evidence.id}`],
+								rationale: "verified",
+							},
+						],
+						verifiedRefs: [`evidence:${evidence.id}`],
+					};
+				}),
+			};
+			const supervisor = new ResearchSupervisor(job, store, {
+				owner: "supervisor-review-commit-retry",
+				maxParallel: 1,
+				worker: { run: vi.fn() },
+				reviewer,
+				mainAgent: mainAgent(),
+			});
 
-		await supervisor.tick();
-		expect(job.state.tasks[reviewerTaskIds[0]]?.status).toBe("failed");
-		expect(Object.keys(job.state.reviews)).toHaveLength(0);
-
-		await supervisor.tick();
-		expect(reviewerTaskIds[1]).not.toBe(reviewerTaskIds[0]);
-		expect(job.state.tasks[reviewerTaskIds[1]]?.status).toBe("succeeded");
-		expect(Object.values(job.state.reviews)).toHaveLength(1);
-		await expect(job.failUncommittedReviewerTask(reviewerTaskIds[1])).rejects.toThrow("committed");
-		await expect(job.failUncommittedReviewerTask(workerTask.id)).rejects.toThrow("only reviewer tasks");
-	});
+			if (completed) {
+				await expect(supervisor.tick()).rejects.toThrow("completion gap: no review manifest");
+				expect(job.state.tasks[reviewerTaskIds[0]]?.status).toBe("succeeded");
+				expect(Object.keys(job.state.reviews)).toHaveLength(0);
+				const turns = job.status().budget.turnsUsed;
+				await expect(supervisor.tick()).rejects.toThrow("completion gap: no review manifest");
+				expect(reviewer.review).toHaveBeenCalledOnce();
+				expect(reviewerTaskIds).toHaveLength(1);
+				expect(job.status().budget.turnsUsed).toBe(turns);
+				expect(job.state.paused).toBe(false);
+			} else {
+				await supervisor.tick();
+				expect(job.state.tasks[reviewerTaskIds[0]]?.status).toBe("failed");
+				expect(Object.keys(job.state.reviews)).toHaveLength(0);
+				await supervisor.tick();
+				expect(reviewerTaskIds[1]).not.toBe(reviewerTaskIds[0]);
+				expect(job.state.tasks[reviewerTaskIds[1]]?.status).toBe("succeeded");
+				expect(Object.values(job.state.reviews)).toHaveLength(1);
+				await expect(job.failUncommittedReviewerTask(reviewerTaskIds[1])).rejects.toThrow("committed");
+			}
+			await expect(job.failUncommittedReviewerTask(workerTask.id)).rejects.toThrow("only reviewer tasks");
+		},
+	);
 
 	it("resumes an already-dispatched worker TaskPacket before creating another wave", async () => {
 		const store = new MemoryAstraStore();
