@@ -1,12 +1,27 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const auditScript = fileURLToPath(new URL("./audit-astra-run.mjs", import.meta.url));
+
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+function stableJson(value) {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(",")}}`;
+}
+const checksum = (value) => sha256(stableJson(value));
+function sourceReceipt(sourceRef, fields = {}) {
+	const receipt = { sourceRef, provider: "openalex", query: "fixture", retrievedAt: "2026-10-03T00:00:00.000Z",
+		record: { sourceRef, title: "Fixture source", authors: [], ...fields } };
+	return { ...receipt, sha256: sha256(JSON.stringify(receipt)) };
+}
 
 test("counts Pi assistant terminal errors as failed child sessions", async () => {
 	const workspace = await mkdtemp(join(tmpdir(), "astra-audit-"));
@@ -156,6 +171,7 @@ test("audits stage plans, task context, upstream artifacts, and source receipts"
 		const task = {
 			id: taskId,
 			role: "worker",
+			status: "succeeded",
 			stageId: "literature",
 			objective: "Survey the selected literature",
 			replayKey: "stage-plan:plan_literature:primary",
@@ -192,7 +208,7 @@ test("audits stage plans, task context, upstream artifacts, and source receipts"
 			JSON.stringify({ outputRefs: sourceRefs.map((ref) => ({ kind: "source", ref })) }),
 		);
 		for (const [index, sourceRef] of sourceRefs.entries()) {
-			await writeFile(join(jobRoot, "sources", `openalex-W${index + 1}.json`), JSON.stringify({ sourceRef }));
+			await writeFile(join(jobRoot, "sources", `openalex-W${index + 1}.json`), JSON.stringify(sourceReceipt(sourceRef)));
 		}
 
 		const result = spawnSync(process.execPath, [auditScript, workspace, jobId], {
@@ -307,10 +323,7 @@ test("audits the accepted chain without treating recovered attempts as active fa
 		);
 		await writeFile(
 			join(jobRoot, "sources", "openalex-W1.json"),
-			JSON.stringify({
-				sourceRef: "openalex:W1",
-				record: { doi: "10.1000/astra", landingPageUrl: "https://doi.org/10.1000/astra" },
-			}),
+			JSON.stringify(sourceReceipt("openalex:W1", { doi: "10.1000/astra", landingPageUrl: "https://doi.org/10.1000/astra" })),
 		);
 		await writeFile(
 			failedSessionPath,
@@ -466,6 +479,9 @@ test("does not require a pruned workspace for a worker recorded in a retired art
 	const artifactId = "artifact_retired_review";
 	const jobRoot = join(workspace, ".astra", "jobs", jobId);
 	const receiptPath = join(jobRoot, "canonical", `${artifactId}.json.receipt.json`);
+	const retired = { artifactId, type: "research-review", evidenceId: "evidence_retired", taskId,
+		reviewIds: ["review_retired"], checksum: sha256("retired content"), materializationReceiptRef: receiptPath,
+		retiredAt: "2026-10-03T00:00:00.000Z", cleanupStatus: "completed", archiveRefs: [] };
 	try {
 		await mkdir(join(jobRoot, "canonical"), { recursive: true });
 		const plan = {
@@ -497,17 +513,13 @@ test("does not require a pruned workspace for a worker recorded in a retired art
 				obligations: {},
 				canonical: {},
 				retiredArtifacts: {
-					[artifactId]: {
-						artifactId,
-						taskId,
-						materializationReceiptRef: receiptPath,
-					},
+					[artifactId]: retired,
 				},
 				graph: { acceptedClaimIds: [], unresolvedObjectionIds: [], openQuestionIds: [] },
 			}),
 		);
 		await writeFile(join(jobRoot, "events.jsonl"), "");
-		await writeFile(receiptPath, JSON.stringify({ schemaVersion: "astra.retired_artifact_receipt.v1", artifactId }));
+		await writeFile(receiptPath, JSON.stringify({ schemaVersion: "astra.retired_artifact_receipt.v1", ...retired }));
 
 		const result = spawnSync(process.execPath, [auditScript, workspace, jobId], {
 			cwd: workspace,
@@ -519,7 +531,208 @@ test("does not require a pruned workspace for a worker recorded in a retired art
 		assert.deepEqual(report.workspaces.missingUpstreamTaskIds, []);
 		assert.equal(report.contractChecks.workerContextsValid, true);
 		assert.equal(report.contractChecks.upstreamArtifactsBound, true);
+		assert.equal(report.contractChecks.retiredArtifactsPruned, true);
 	} finally {
 		await rm(workspace, { recursive: true, force: true });
 	}
 });
+
+async function auditFixture() {
+	const workspace = await mkdtemp(join(tmpdir(), "astra-audit-integrity-"));
+	const jobId = "job_integrity";
+	const jobRoot = join(workspace, ".astra", "jobs", jobId);
+	await mkdir(join(jobRoot, "canonical"), { recursive: true });
+	const content = { content: "accepted result" };
+	const evidence = { id: "evidence_current", taskId: "task_current", stageId: "validation", type: "validation",
+		content, refs: [], files: [], checksum: checksum(content), status: "accepted" };
+	evidence.versionHash = checksum({ content, refs: [], files: [], taskVersion: undefined });
+	const path = join(jobRoot, "canonical", "artifact_current.json");
+	const bytes = `${JSON.stringify(content, null, 2)}\n`;
+	const artifact = { id: "artifact_current", type: "validation", status: "active", evidenceId: evidence.id,
+		content, checksum: evidence.checksum, sourceSha256: evidence.checksum, targetSha256: sha256(bytes),
+		materializationRef: path, adoptedAt: "2026-10-03T00:00:00.000Z",
+		evidenceSnapshotHash: checksum({ stageId: "validation", acceptedRevisionRefs: [evidence.id] }) };
+	const receipt = { schemaVersion: "astra.materialization_receipt.v1", artifactId: artifact.id,
+		sourceSha256: artifact.sourceSha256, targetSha256: artifact.targetSha256, targetPath: path, createdAt: artifact.adoptedAt };
+	const snapshot = { frame: { jobId, activeStageId: "validation" }, stages: {}, stagePlans: {}, eventSeq: 0,
+		tasks: {}, evidence: { [evidence.id]: evidence }, reviews: { review_current: { id: "review_current",
+			evidenceId: evidence.id, verdict: "pass", score: 1, targetVersionHash: evidence.versionHash } },
+		obligations: {}, canonical: { [artifact.id]: artifact }, canonicalRoute: { stageArtifactIds: { validation: artifact.id } } };
+	const save = () => writeFile(join(jobRoot, "job.json"), JSON.stringify(snapshot));
+	await save();
+	await writeFile(join(jobRoot, "events.jsonl"), "");
+	await writeFile(path, bytes);
+	await writeFile(`${path}.receipt.json`, JSON.stringify(receipt));
+	const audit = () => {
+		const result = spawnSync(process.execPath, [auditScript, workspace, jobId], { encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr);
+		return JSON.parse(result.stdout);
+	};
+	return { workspace, jobRoot, snapshot, path, receipt, save, audit };
+}
+
+test("canonical receipts bind actual bytes, schema, identity, path, and content", async () => {
+	const fixture = await auditFixture();
+	try {
+		assert.equal(fixture.audit().runtimeIntegrity.canonicalReceiptsMatch, true);
+		await writeFile(fixture.path, "changed bytes");
+		assert.equal(fixture.audit().runtimeIntegrity.canonicalReceiptsMatch, false);
+		await rm(fixture.path);
+		assert.equal(fixture.audit().runtimeIntegrity.canonicalReceiptsMatch, false);
+		await writeFile(fixture.path, `${JSON.stringify(fixture.snapshot.canonical.artifact_current.content, null, 2)}\n`);
+		for (const changed of [{ schemaVersion: "wrong" }, { artifactId: "wrong" }, { targetPath: "wrong" }, { createdAt: "wrong" }]) {
+			await writeFile(`${fixture.path}.receipt.json`, JSON.stringify({ ...fixture.receipt, ...changed }));
+			assert.equal(fixture.audit().runtimeIntegrity.canonicalReceiptsMatch, false, JSON.stringify(changed));
+		}
+	} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+});
+
+test("canonical history stays reviewed while current evidence or review versions fail", async () => {
+	const fixture = await auditFixture();
+	try {
+		const healthy = fixture.audit();
+		assert.equal(healthy.runtimeIntegrity.canonicalEvidenceVersionsMatch, true);
+		assert.equal(healthy.researchQuality.canonicalReviewVersionsMatch, true);
+		fixture.snapshot.evidence.evidence_current.content = { content: "overwritten current evidence" };
+		fixture.snapshot.evidence.evidence_current.versionHash = sha256("different current version");
+		await fixture.save();
+		const changed = fixture.audit();
+		assert.equal(changed.researchQuality.canonicalArtifactsReviewed, true);
+		assert.equal(changed.runtimeIntegrity.canonicalEvidenceVersionsMatch, false);
+		assert.equal(changed.researchQuality.canonicalReviewVersionsMatch, false);
+		assert.ok(changed.canonical.versionParity[0].failures.length > 0);
+	} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+});
+
+test("audit reports missing, null, or array required snapshot collections without crashing", async () => {
+	const fixture = await auditFixture();
+	try {
+		for (const key of ["evidence", "reviews", "obligations", "tasks", "canonical", "stages"]) {
+			for (const value of [undefined, null, []]) {
+				await writeFile(join(fixture.jobRoot, "job.json"), JSON.stringify({ ...fixture.snapshot, [key]: value }));
+				const before = await readFile(join(fixture.jobRoot, "job.json"));
+				const report = fixture.audit();
+				assert.equal(report.passed, false);
+				assert.equal(report.contractChecks.inputFilesValid, false);
+				assert.ok(report.inputFailures.some((failure) => failure.reason.includes(key)));
+				assert.deepEqual(await readFile(join(fixture.jobRoot, "job.json")), before);
+			}
+		}
+	} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+});
+
+test("retired receipt corruption is reported without modifying any input", async () => {
+	const fixture = await auditFixture();
+	const path = join(fixture.jobRoot, "canonical", "artifact_retired.json.receipt.json");
+	const retired = { artifactId: "artifact_retired", type: "validation", evidenceId: "evidence_retired", taskId: "task_retired",
+		reviewIds: ["review_retired"], checksum: sha256("retired"), materializationReceiptRef: path,
+		retiredAt: "2026-10-03T00:00:00.000Z", cleanupStatus: "completed", archiveRefs: [] };
+	try {
+		fixture.snapshot.retiredArtifacts = { [retired.artifactId]: retired };
+		await fixture.save();
+		const receipt = { schemaVersion: "astra.retired_artifact_receipt.v1", ...retired };
+		await writeFile(path, JSON.stringify(receipt));
+		assert.equal(fixture.audit().runtimeIntegrity.retiredArtifactsPruned, true);
+		for (const value of ["{bad json", JSON.stringify({ ...receipt, artifactId: "wrong" }),
+			JSON.stringify({ ...receipt, evidenceId: "wrong" }), JSON.stringify({ ...receipt, checksum: sha256("wrong") })]) {
+			await writeFile(path, value);
+			const before = await readFile(path);
+			const snapshotBefore = await readFile(join(fixture.jobRoot, "job.json"));
+			const report = fixture.audit();
+			assert.equal(report.runtimeIntegrity.retiredArtifactsPruned, false);
+			assert.ok(report.canonical.retiredReceiptParity[0].failures.length > 0);
+			assert.deepEqual(await readFile(path), before);
+			assert.deepEqual(await readFile(join(fixture.jobRoot, "job.json")), snapshotBefore);
+		}
+	} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+});
+
+test("source minimums count valid distinct canonical sources and respect frozen receipts", async () => {
+	const fixture = await auditFixture();
+	const taskId = "task_sources";
+	const sourceRoot = join(fixture.jobRoot, "sources");
+	const manifestPath = join(fixture.jobRoot, "tasks", taskId, "output-manifest.json");
+	try {
+		await mkdir(sourceRoot);
+		await mkdir(join(fixture.jobRoot, "tasks", taskId), { recursive: true });
+		await mkdir(join(fixture.jobRoot, "workspaces", taskId), { recursive: true });
+		fixture.snapshot.tasks[taskId] = { id: taskId, role: "worker", status: "succeeded", stageId: "literature",
+			objective: "Sources", inputArtifactRefs: [] };
+		await fixture.save();
+		await writeFile(join(fixture.jobRoot, "workspaces", taskId, "ASTRA_TASK_CONTEXT.json"), JSON.stringify({
+			schemaVersion: "astra.task_context.v1", mission: { jobId: "job_integrity" }, task: { id: taskId },
+			stage: { minSourceRefs: 3 }, inputs: {} }));
+		const receipt = sourceReceipt("openalex:W1", { doi: "10.1000/astra", landingPageUrl: "https://example.invalid/paper", pdfUrl: "https://example.invalid/paper.pdf" });
+		const sourcePath = join(sourceRoot, "openalex-W1.json");
+		await writeFile(sourcePath, JSON.stringify(receipt));
+		const saveRefs = (refs) => writeFile(manifestPath, JSON.stringify({ outputRefs: refs.map((ref) => typeof ref === "string" ? { kind: "source", ref } : ref) }));
+		await saveRefs(["doi:10.1000/astra", "https://example.invalid/paper", "https://example.invalid/paper.pdf"]);
+		assert.equal(fixture.audit().runtimeIntegrity.sourceMinimumsSatisfied, false);
+		assert.equal(fixture.audit().runtimeIntegrity.sourceReceiptsPresent, true);
+		await saveRefs(["openalex:W1", "openalex:W1", "openalex:W1"]);
+		assert.equal(fixture.audit().runtimeIntegrity.sourceMinimumsSatisfied, false);
+		await saveRefs(["openalex:W1", "openalex:W2", "openalex:W3"]);
+		for (const ref of ["W2", "W3"]) await writeFile(join(sourceRoot, `openalex-${ref}.json`), JSON.stringify(sourceReceipt(`openalex:${ref}`)));
+		assert.equal(fixture.audit().runtimeIntegrity.sourceMinimumsSatisfied, true);
+		for (const corrupt of [{ ...receipt, sha256: sha256("wrong") }, sourceReceipt("openalex:W1", { sourceRef: "openalex:W9" }), sourceReceipt("openalex:W9"), null]) {
+			await writeFile(sourcePath, JSON.stringify(corrupt));
+			const report = fixture.audit();
+			assert.equal(report.runtimeIntegrity.sourceReceiptsPresent, false);
+			assert.equal(report.runtimeIntegrity.sourceMinimumsSatisfied, false);
+		}
+		await writeFile(sourcePath, "malformed");
+		assert.equal(fixture.audit().runtimeIntegrity.sourceReceiptsPresent, false);
+		await mkdir(join(fixture.jobRoot, "versions", "files"), { recursive: true });
+		const frozen = JSON.stringify(receipt);
+		const digest = sha256(frozen);
+		await writeFile(join(fixture.jobRoot, "versions", "files", digest), frozen);
+		await saveRefs([{ kind: "source", ref: "openalex:W1", sha256: digest }, "openalex:W2", "openalex:W3"]);
+		assert.equal(fixture.audit().runtimeIntegrity.sourceReceiptsPresent, true);
+		assert.equal(fixture.audit().runtimeIntegrity.sourceMinimumsSatisfied, true);
+		await writeFile(join(fixture.jobRoot, "versions", "files", digest), "changed frozen receipt");
+		const brokenFrozen = fixture.audit();
+		assert.equal(brokenFrozen.runtimeIntegrity.sourceReceiptsPresent, false);
+		assert.ok(brokenFrozen.sources.receiptFailures.some((entry) => entry.failures.includes("Frozen source digest mismatch")));
+		assert.deepEqual((await readdir(sourceRoot)).sort(), ["openalex-W1.json", "openalex-W2.json", "openalex-W3.json"]);
+	} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+});
+
+for (const [name, outputRefs, invalid] of [
+	["object outputRefs", {}, true],
+	["null outputRefs entry", [null], true],
+	["null outputRefs collection", null, true],
+	["missing outputRefs collection", undefined, true],
+	["array outputRefs entry", [[]], true],
+	["scalar outputRefs entries", [false, 3, "source"], true],
+	["non-string source ref", [{ kind: "source", ref: {} }], true],
+	["null source ref", [{ kind: "source", ref: null }], true],
+	["missing source ref", [{ kind: "source" }], true],
+	["empty source ref", [{ kind: "source", ref: "" }], true],
+	["valid empty outputRefs", [], false],
+]) {
+	test(`audit returns a read-only negative report for ${name}`, async () => {
+		const fixture = await auditFixture();
+		const taskId = "task_sources";
+		const manifestPath = join(fixture.jobRoot, "tasks", taskId, "output-manifest.json");
+		try {
+			await mkdir(join(fixture.jobRoot, "tasks", taskId), { recursive: true });
+			await mkdir(join(fixture.jobRoot, "workspaces", taskId), { recursive: true });
+			fixture.snapshot.tasks[taskId] = { id: taskId, role: "worker", status: "succeeded", stageId: "literature",
+				objective: "Sources", inputArtifactRefs: [] };
+			await fixture.save();
+			await writeFile(join(fixture.jobRoot, "workspaces", taskId, "ASTRA_TASK_CONTEXT.json"), JSON.stringify({
+				schemaVersion: "astra.task_context.v1", mission: { jobId: "job_integrity" }, task: { id: taskId },
+				stage: { minSourceRefs: 1 }, inputs: {} }));
+			await writeFile(manifestPath, JSON.stringify({ outputRefs }));
+			const beforeManifest = await readFile(manifestPath);
+			const beforeSnapshot = await readFile(join(fixture.jobRoot, "job.json"));
+			const report = fixture.audit();
+			assert.equal(report.passed, false);
+			assert.equal(report.runtimeIntegrity.sourceMinimumsSatisfied, false);
+			assert.equal(report.contractChecks.inputFilesValid, !invalid);
+			assert.equal(report.inputFailures.some((failure) => failure.path === manifestPath && failure.reason.includes("outputRefs")), invalid);
+			assert.deepEqual(await readFile(manifestPath), beforeManifest);
+			assert.deepEqual(await readFile(join(fixture.jobRoot, "job.json")), beforeSnapshot);
+		} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+	});
+}

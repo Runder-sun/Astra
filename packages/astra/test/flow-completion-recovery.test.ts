@@ -1312,7 +1312,13 @@ it.each(["route", "guidance"] as const)(
 
 it("R2 budget approval restores the pending research gate before scheduling", async () => {
 	const { job } = await setup();
-	await job.requireUserGate({ kind: "budget", stageId: "validation", limit: "maxTurns", reason: "budget permission" });
+	await job.requireUserGate({
+		kind: "budget",
+		stageId: "validation",
+		limit: "maxTurns",
+		requiredMinimum: 1,
+		reason: "budget permission",
+	});
 	const gate = job.state.frame.userGate;
 	await job.applyRouteDecision(route(job, "ask-user", { question: "Which evidence should we use?" }));
 	await job.recoverPendingOperations();

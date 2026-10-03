@@ -10,6 +10,7 @@ let current;
 let creating = false;
 let fetching = false;
 let renderedVersion = "";
+let renderedJobId = "";
 function node(tag, text, className) { const item = document.createElement(tag); if (text !== undefined) item.textContent = text; if (className) item.className = className; return item; }
 function error(message) { el("error").textContent = message; el("error").hidden = !message; }
 async function api(path, input) {
@@ -91,7 +92,7 @@ function renderDetails() {
 function renderJob() {
 	const state = current.snapshot;
 	el("research").hidden = creating;
-	if (!state) { el("title").textContent = current.error ? "研究未能启动" : "正在创建研究任务…"; for (const id of ["stage-detail", "stages", "full-objective", "next-action", "usage", "directory"]) el(id).replaceChildren(); for (const id of ["execution", "outcome", "coverage"]) el(id).textContent = "等待初始化"; el("continue").hidden = true; el("pause").hidden = true; el("output").textContent = current.output || ""; if (current.error) error(current.error); return; }
+	if (!state) { el("title").textContent = current.error ? "研究未能启动" : "正在创建研究任务…"; for (const id of ["stage-detail", "stages", "full-objective", "next-action", "usage", "directory"]) el(id).replaceChildren(); for (const id of ["execution", "outcome", "coverage"]) el(id).textContent = "等待初始化"; el("continue").hidden = true; el("pause").hidden = current.readonly || !current.running; el("output").textContent = current.output || ""; if (current.error) error(current.error); return; }
 	el("title").textContent = state.frame.objective.length > 120 ? `${state.frame.objective.slice(0,120)}…` : state.frame.objective;
 	el("full-objective").textContent = state.frame.objective;
 	el("job-label").textContent = current.readonly ? "已有研究 · 只读查看" : "本机研究";
@@ -129,7 +130,7 @@ async function refresh() {
 			button.onclick = () => { selected = job.id; stageId = ""; creating = false; el("create").hidden = true; void refresh(); }; el("jobs").append(button);
 		}
 		if (!data.jobs.length) { el("jobs").append(node("p", "还没有研究任务", "muted")); creating = true; el("create").hidden = false; }
-		if (selected && !creating) { current = await api(`/api/job?id=${selected}`); const version = `${selected}:${current.snapshot?.eventSeq}:${current.running}:${current.error}`; if (version !== renderedVersion || el("research").hidden) { renderJob(); renderedVersion = version; } }
+		if (selected && !creating) { current = await api(`/api/job?id=${selected}`); const jobId = current.snapshot?.frame.jobId || ""; if (jobId !== renderedJobId) { stageId = ""; evidenceId = ""; renderedJobId = jobId; } const version = `${selected}:${jobId}:${current.snapshot?.eventSeq}:${current.running}:${current.error}`; if (version !== renderedVersion || el("research").hidden) { renderJob(); renderedVersion = version; } }
 		el("connection").textContent = `已同步 ${new Date().toLocaleTimeString("zh-CN")}`;
 	} catch (err) { error(err.message); el("connection").textContent = "连接中断 · 保留上次数据"; }
 	finally { fetching = false; }
@@ -137,8 +138,8 @@ async function refresh() {
 el("new").onclick = () => { creating = true; el("create").hidden = false; el("research").hidden = true; el("objective").focus(); };
 el("example").onclick = () => { el("objective").value = "做一个固定范围的小规模复现实验：比较样本均值、中位数与两端各截去 10 个值的截尾均值估计真实位置 0 的误差。样本量 101，标准正态数据，污染比例 0、0.1、0.2，将前 floor(101×污染比例) 个值加 10，每种条件重复 100 次。使用固定种子并记录精确协议，仅用 Python 标准库和本机 CPU。保留可执行代码、行为测试、逐次数据、MAE 与蒙特卡洛标准误、命令和失败日志，并独立核对结果。检索至少三条可追溯文献。只作固定协议下的描述性结论，不声称创新或普遍优越；最后给出经过审阅的研究报告。"; };
 el("create-form").onsubmit = async event => { event.preventDefault(); error(""); el("start").disabled = true; try { const data = await api("/api/run", { objective: el("objective").value, maxTasks: Number(el("budget").value), requirePaper: el("paper").checked }); selected = data.id; stageId = ""; creating = false; el("create").hidden = true; await refresh(); } catch (err) { error(err.message); } finally { el("start").disabled = false; } };
-el("resume").onclick = async () => { error(""); el("resume").disabled = true; try { await api(`/api/resume?id=${selected}`, { guidance: el("guidance").value, ...(el("resume-budget").value ? { maxTasks: Number(el("resume-budget").value) } : {}) }); el("guidance").value = ""; await refresh(); } catch (err) { error(err.message); } finally { el("resume").disabled = false; } };
-el("pause").onclick = async () => { el("pause").disabled = true; try { await api(`/api/pause?id=${selected}`, {}); el("next-action").textContent = "已请求暂停，正在保存任务状态…"; } catch (err) { error(err.message); } finally { el("pause").disabled = false; } };
+el("resume").onclick = async () => { error(""); el("resume").disabled = true; try { await api(`/api/resume?id=${selected}`, { jobId: current?.snapshot?.frame.jobId, guidance: el("guidance").value, ...(el("resume-budget").value ? { maxTasks: Number(el("resume-budget").value) } : {}) }); el("guidance").value = ""; await refresh(); } catch (err) { error(err.message); } finally { el("resume").disabled = false; } };
+el("pause").onclick = async () => { el("pause").disabled = true; try { await api(`/api/pause?id=${selected}`, { jobId: current?.snapshot?.frame.jobId }); el("next-action").textContent = "已请求暂停，正在保存任务状态…"; } catch (err) { error(err.message); } finally { el("pause").disabled = false; } };
 el("refresh").onclick = refresh;
 el("theme").onclick = () => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; };
 void refresh();

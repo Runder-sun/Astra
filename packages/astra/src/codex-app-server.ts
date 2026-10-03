@@ -269,6 +269,8 @@ export class CodexAppServerRunner {
 		]);
 		let threadId = options.threadId ?? "";
 		let turnId = "";
+		let startingTurn = false;
+		const startupMessages: Record<string, unknown>[] = [];
 		let finalText = "";
 		let toolCalls = 0;
 		let failure: Error | undefined;
@@ -319,10 +321,28 @@ export class CodexAppServerRunner {
 		};
 		try {
 			await mkdir(dirname(options.logPath), { recursive: true });
-			connection.onMessage = (message) => {
+			const handleMessage = (message: Record<string, unknown>) => {
 				const method = String(message.method ?? "");
 				const params = record(message.params);
-				if (params.threadId && params.threadId !== threadId) return;
+				const messageTurnId = method.startsWith("turn/")
+					? (record(params.turn).id ?? params.turnId)
+					: params.turnId;
+				const scoped = method.startsWith("item/") || method.startsWith("turn/") || messageTurnId != null;
+				if (scoped && startingTurn && params.threadId === threadId) {
+					startupMessages.push(message);
+					return;
+				}
+				if (
+					(params.threadId && params.threadId !== threadId) ||
+					(scoped && (!turnId || messageTurnId !== turnId))
+				) {
+					if (message.id !== undefined)
+						connection.send({
+							id: message.id,
+							error: { code: -32600, message: "Astra request does not belong to the current turn" },
+						});
+					return;
+				}
 				if (
 					method.startsWith("item/") ||
 					method.startsWith("turn/") ||
@@ -332,7 +352,6 @@ export class CodexAppServerRunner {
 					log = log.then(() => appendFile(options.logPath, `${JSON.stringify(message)}\n`, { mode: 0o600 }));
 					void log.catch(terminate);
 				}
-				if (method === "turn/started") turnId = String(record(params.turn).id ?? "");
 				if (method === "item/started") {
 					const kind = record(params.item).type;
 					if (
@@ -442,6 +461,7 @@ export class CodexAppServerRunner {
 					);
 				}
 			};
+			connection.onMessage = handleMessage;
 			checkFailure();
 			await connection.initialize();
 			checkFailure();
@@ -518,6 +538,8 @@ export class CodexAppServerRunner {
 			let prompt = options.prompt;
 			for (let attempt = 0; ; attempt++) {
 				checkFailure();
+				turnId = "";
+				startingTurn = true;
 				const turn = record(
 					await connection.request("turn/start", {
 						threadId,
@@ -525,7 +547,10 @@ export class CodexAppServerRunner {
 						outputSchema: options.schema,
 					}),
 				);
-				turnId = String(record(turn.turn).id ?? turnId);
+				turnId = String(record(turn.turn).id ?? "");
+				if (!turnId) throw codexError("Codex turn/start did not return a turn identity");
+				startingTurn = false;
+				for (const message of startupMessages.splice(0)) handleMessage(message);
 				await completed;
 				accepting = false;
 				await drainHostWork();

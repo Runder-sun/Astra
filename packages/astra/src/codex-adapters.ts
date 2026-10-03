@@ -58,8 +58,8 @@ import {
 	prepareReviewEvidenceBundle,
 	prepareTaskWorkspace,
 	taskInputResources,
+	taskRecoveryMaterials,
 	taskResourcePath,
-	taskWorkspacePath,
 } from "./task-workspace.ts";
 import type {
 	CandidateEvaluation,
@@ -185,22 +185,10 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 			).map((group) => group.criterion),
 		);
 		const resources = await taskInputResources(task, job);
-		const previousWorkspace = task.supersedesTaskId
-			? taskWorkspacePath(task.scope.workspaceRoot, task.jobId, task.supersedesTaskId)
-			: undefined;
-		const previousSession = task.supersedesTaskId
-			? Object.values(job.state.sessions).find(
-					(session) => session.taskId === task.supersedesTaskId && session.status === "failed",
-				)
-			: undefined;
-		const previousLog =
-			previousSession?.sessionFile && existsSync(previousSession.sessionFile)
-				? previousSession.sessionFile
-				: undefined;
-		const recoveryInstructions =
-			previousWorkspace && existsSync(previousWorkspace)
-				? ` This retries ${task.supersedesTaskId}. Inspect the previous workspace at ${previousWorkspace} and reuse completed outputs in your own workspace. Previous failure: ${previousSession?.error ?? "inspect retained logs"}. Retained execution log: ${previousLog ?? "unavailable"}; use targeted reads of completed tool results to recover inspected inputs and partial work, not a full log dump. These are unreviewed recovery materials, not accepted evidence. If only submission or serialization failed, repair and revalidate the submission; do not regenerate completed scientific data. Preserve the original files and failure records.`
-				: "";
+		const recovery = await taskRecoveryMaterials(task, job);
+		const recoveryInstructions = recovery
+			? ` This retries ${recovery.previousTaskId}. Inspect the previous workspace at ${recovery.workspaceRoot ?? "unavailable"} and reuse completed outputs in your own workspace. Previous failure: ${recovery.error ?? "inspect retained logs"}. Retained execution log: ${recovery.sessionFile ?? "unavailable"}; use targeted reads of completed tool results to recover inspected inputs and partial work, not a full log dump. These are unreviewed recovery materials, not accepted evidence. If only submission or serialization failed, repair and revalidate the submission; do not regenerate completed scientific data. Preserve the original files and failure records.`
+			: "";
 		const root =
 			task.writeAuthority === "workspace-write"
 				? taskResourcePath(task.scope.workspaceRoot, task.jobId, task.id)
@@ -380,8 +368,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 						? [join(task.scope.workspaceRoot, ".astra", "jobs", task.jobId, "sources")]
 						: []),
 					...resources.map((resource) => resource.root),
-					...(previousWorkspace && existsSync(previousWorkspace) ? [previousWorkspace] : []),
-					...(previousLog ? [previousLog] : []),
+					...(recovery?.readRoots ?? []),
 					...(process.platform === "linux" && task.stageId === "paper-compile"
 						? ["/etc/texmf", "/var/lib/texmf"].filter(existsSync)
 						: []),

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { cp, lstat, mkdir, readdir, readFile, readlink, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { taskHasRetainedOwner } from "./plan-review.ts";
 import type { CleanupTaskFiles, JobSnapshot } from "./types.ts";
 
 async function exists(path: string): Promise<boolean> {
@@ -14,42 +15,50 @@ async function exists(path: string): Promise<boolean> {
 }
 
 /** Captured before the intent: absence after a restart must not mean archive success. */
-export async function cleanupTaskFiles(snapshot: JobSnapshot, taskIds: string[]): Promise<CleanupTaskFiles[]> {
+export async function cleanupTaskFiles(
+	snapshot: JobSnapshot,
+	taskIds: string[],
+	excludedEvidenceIds = new Set<string>(),
+): Promise<CleanupTaskFiles[]> {
 	const root = join(snapshot.frame.permissions.workspaceRoot, ".astra", "jobs", snapshot.frame.jobId);
 	return Promise.all(
-		[...new Set(taskIds)].map(async (taskId) => ({
-			taskId,
-			workspace: await exists(join(root, "workspaces", taskId)),
-			task: await exists(join(root, "tasks", taskId)),
-			resources: await exists(join(root, "resources", taskId)),
-			workspaceHash: (await exists(join(root, "workspaces", taskId)))
-				? await treeHash(join(root, "workspaces", taskId))
-				: undefined,
-			taskHash: (await exists(join(root, "tasks", taskId)))
-				? await treeHash(join(root, "tasks", taskId))
-				: undefined,
-			resourcesHash: (await exists(join(root, "resources", taskId)))
-				? await treeHash(join(root, "resources", taskId))
-				: undefined,
-			sessions: await Promise.all(
-				Object.values(snapshot.sessions)
-					.filter((session) => session.taskId === taskId && session.sessionFile)
-					.map(async (session) => ({
-						sessionId: session.sessionId,
-						source: session.sessionFile!,
-						target: join(
-							root,
-							"archive",
-							"tasks",
-							taskId,
-							"sessions",
-							`${createHash("sha256").update(session.sessionId).digest("hex")}.jsonl`,
-						),
-						present: await exists(session.sessionFile!),
-						expectedHash: (await exists(session.sessionFile!)) ? await treeHash(session.sessionFile!) : undefined,
-					})),
-			),
-		})),
+		[...new Set(taskIds)]
+			.filter((id) => !taskHasRetainedOwner(snapshot, id, excludedEvidenceIds))
+			.map(async (taskId) => ({
+				taskId,
+				workspace: await exists(join(root, "workspaces", taskId)),
+				task: await exists(join(root, "tasks", taskId)),
+				resources: await exists(join(root, "resources", taskId)),
+				workspaceHash: (await exists(join(root, "workspaces", taskId)))
+					? await treeHash(join(root, "workspaces", taskId))
+					: undefined,
+				taskHash: (await exists(join(root, "tasks", taskId)))
+					? await treeHash(join(root, "tasks", taskId))
+					: undefined,
+				resourcesHash: (await exists(join(root, "resources", taskId)))
+					? await treeHash(join(root, "resources", taskId))
+					: undefined,
+				sessions: await Promise.all(
+					Object.values(snapshot.sessions)
+						.filter((session) => session.taskId === taskId && session.sessionFile)
+						.map(async (session) => ({
+							sessionId: session.sessionId,
+							source: session.sessionFile!,
+							target: join(
+								root,
+								"archive",
+								"tasks",
+								taskId,
+								"sessions",
+								`${createHash("sha256").update(session.sessionId).digest("hex")}.jsonl`,
+							),
+							present: await exists(session.sessionFile!),
+							expectedHash: (await exists(session.sessionFile!))
+								? await treeHash(session.sessionFile!)
+								: undefined,
+						})),
+				),
+			})),
 	);
 }
 
@@ -115,8 +124,24 @@ async function archiveCopy(source: string, target: string, present: boolean, exp
 export async function archiveAndPruneTasks(snapshot: JobSnapshot, tasks: CleanupTaskFiles[]): Promise<string[]> {
 	const root = join(snapshot.frame.permissions.workspaceRoot, ".astra", "jobs", snapshot.frame.jobId);
 	const archiveRefs: string[] = [];
-	// Validate every legacy intent before any source is removed.
+	const unowned: CleanupTaskFiles[] = [];
 	for (const task of tasks) {
+		if (!taskHasRetainedOwner(snapshot, task.taskId)) {
+			unowned.push(task);
+			continue;
+		}
+		for (const [present, source] of [
+			[task.workspace, join(root, "workspaces", task.taskId)],
+			[task.task, join(root, "tasks", task.taskId)],
+			[task.resources, join(root, "resources", task.taskId)],
+			...task.sessions.map((session) => [session.present, session.source] as const),
+		] as const) {
+			if (present && !(await exists(source)))
+				throw new Error(`retained task files are missing; verified restoration is required: ${source}`);
+		}
+	}
+	// Validate every legacy intent before any source is removed.
+	for (const task of unowned) {
 		for (const [present, hash, path] of [
 			[task.workspace, task.workspaceHash, "workspace"],
 			[task.task, task.taskHash, "task"],
@@ -126,7 +151,7 @@ export async function archiveAndPruneTasks(snapshot: JobSnapshot, tasks: Cleanup
 			if (present && !hash)
 				throw new Error(`cleanup expected hash missing; destructive recovery blocked: ${task.taskId}/${path}`);
 	}
-	for (const task of tasks) {
+	for (const task of unowned) {
 		const archive = join(root, "archive", "tasks", task.taskId);
 		let archived = false;
 		for (const [folder, target, present, expectedHash] of [

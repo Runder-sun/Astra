@@ -2,7 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { costUsdFromJsonEvents } from "../src/pi-child-session.ts";
+import { writeReviewerOutputManifest } from "../src/contracts.ts";
+import { costUsdFromJsonEvents, PiChildSessionRunner, PiReviewerAdapter } from "../src/pi-child-session.ts";
 import { ResearchJob } from "../src/research.ts";
 import type { AstraStore } from "../src/store.ts";
 import { JsonlAstraStore, MemoryAstraStore } from "../src/store.ts";
@@ -521,8 +522,44 @@ describe("research automation policy", () => {
 				refs: [],
 			});
 			const reviewerTaskIds: string[] = [];
+			const retryRunner = new PiChildSessionRunner();
+			vi.spyOn(retryRunner, "run").mockImplementation(
+				async (_cwd, jobId, taskId, _attempt, _role, _prompt, env = {}) => {
+					const refs = [`evidence:${evidence.id}`];
+					await writeReviewerOutputManifest(
+						{
+							schemaVersion: "astra.reviewer_output_manifest.v1",
+							manifestId: `manifest-${taskId}`,
+							jobId,
+							taskId,
+							evidenceId: evidence.id,
+							verdict: "pass",
+							score: 1,
+							findings: [],
+							verifiedRefs: refs,
+							criteria: (JSON.parse(env.ASTRA_REVIEW_CRITERIA!) as string[]).map((criterion) => ({
+								criterion,
+								passed: true,
+								score: 1,
+								evidenceRefs: refs,
+								rationale: "explicit offline assessment",
+							})),
+							sessionRef: "offline",
+							createdAt: new Date().toISOString(),
+						},
+						workspaceRoot,
+					);
+					return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
+				},
+			);
+			const retryAdapter = new PiReviewerAdapter(retryRunner);
 			const reviewer = {
 				review: vi.fn(async () => {
+					if (reviewerTaskIds.length > 0) {
+						const result = await retryAdapter.review(evidence, job);
+						reviewerTaskIds.push(result.reviewerTaskId!);
+						return result;
+					}
 					const reviewerTask = await job.dispatchTask({
 						stageId: "validation",
 						stageExecutionId: "stage_exec_validation",

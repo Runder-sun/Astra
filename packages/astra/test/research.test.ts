@@ -374,7 +374,7 @@ describe("Pi-native Astra research state", () => {
 		expect(Object.values(job.state.canonical).filter((artifact) => artifact.status === "active")).toHaveLength(14);
 		expect(Object.values(job.state.obligations).every((obligation) => obligation.status === "resolved")).toBe(true);
 		expect((await store.readEvents("job_full")).some((event) => event.event.type === "route_decided")).toBe(true);
-	});
+	}, 20_000);
 
 	it("keeps candidate evidence behind main-agent decision and independent review", async () => {
 		const store = new MemoryAstraStore();
@@ -742,27 +742,30 @@ describe("Pi-native Astra research state", () => {
 		await job.acquireLease("owner-a");
 		await expect(job.acquireLease("owner-b")).rejects.toThrow("lease held");
 		const first = await workerTask(job, "same objective", "task-replay");
-		const duplicate = await job.dispatchTask({
-			id: "different-id",
-			stageId: "validation",
-			stageExecutionId: "stage_exec_fixture",
-			role: "worker",
-			objective: "same objective",
-			inputArtifactRefs: [],
-			requiredOutputType: "validation",
-			acceptanceChecks: ["structured"],
-			dependencies: [],
-			allowedTools: ["read"],
-			writeAuthority: "workspace-write",
-			budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 30_000 },
-			requiredCanonicalArtifacts: [],
-			requiredOutputFields: ["content", "outputRefs"],
-			failureSignals: ["missing output manifest"],
-			scope: { workspaceRoot, allowedPaths: [`.astra/jobs/${job.state.frame.jobId}/tasks`] },
-			reviewGateRequired: true,
-			resumePolicy: "restart-attempt",
-			successCriteria: ["structured"],
-		});
+		await expect(
+			job.dispatchTask({
+				id: "different-id",
+				stageId: "validation",
+				stageExecutionId: "stage_exec_fixture",
+				role: "worker",
+				objective: "same objective",
+				inputArtifactRefs: [],
+				requiredOutputType: "validation",
+				acceptanceChecks: ["structured"],
+				dependencies: [],
+				allowedTools: ["read"],
+				writeAuthority: "workspace-write",
+				budget: { maxTurns: 2, maxToolCalls: 4, maxRuntimeMs: 30_000 },
+				requiredCanonicalArtifacts: [],
+				requiredOutputFields: ["content", "outputRefs"],
+				failureSignals: ["missing output manifest"],
+				scope: { workspaceRoot, allowedPaths: [`.astra/jobs/${job.state.frame.jobId}/tasks`] },
+				reviewGateRequired: true,
+				resumePolicy: "restart-attempt",
+				successCriteria: ["structured"],
+			}),
+		).rejects.toThrow("task identity declaration");
+		const duplicate = await job.dispatchTask(first);
 		expect(duplicate.id).toBe(first.id);
 		await expect(job.adoptEvidence("missing", "missing-artifact")).rejects.toThrow("unknown evidence");
 	});

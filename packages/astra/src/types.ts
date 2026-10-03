@@ -37,6 +37,7 @@ export type UserGate =
 			kind: "budget";
 			stageId: string;
 			limit: BudgetLimit;
+			requiredMinimum?: number;
 			reason: string;
 			requiredAt: string;
 	  }

@@ -3,7 +3,9 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, expect, it } from "vitest";
+import { createContext, runInContext } from "node:vm";
+import { afterEach, expect, it, vi } from "vitest";
+import { atomicWriteJson } from "../src/contracts.ts";
 import { ResearchJob } from "../src/research.ts";
 import { JsonlAstraStore } from "../src/store.ts";
 import { taskWorkspacePath } from "../src/task-workspace.ts";
@@ -22,7 +24,117 @@ function forwardedStatus(url: string, headers: Record<string, string>, method = 
 	});
 }
 afterEach(async () => {
+	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 	for (const close of cleanup.splice(0).reverse()) await close();
+});
+
+it.each([false, true])(
+	"C4 resume carries displayed identity and delayed pause owns the same child (rebound=%s)",
+	async (rebound) => {
+		const root = await mkdtemp(join(tmpdir(), "astra-workbench-identity-"));
+		cleanup.push(() => rm(root, { recursive: true, force: true }));
+		const project = join(root, "run-owned");
+		await mkdir(project);
+		const store = new JsonlAstraStore(project);
+		const a = await ResearchJob.create(store, { workspaceRoot: project, objective: "original bound research" });
+		const b = await ResearchJob.create(store, { workspaceRoot: project, objective: "displayed research" });
+		await a.pause("initial");
+		await b.pause("initial");
+		await atomicWriteJson(join(project, ".astra/active-job.json"), { jobId: b.state.frame.jobId });
+		vi.stubEnv("ASTRA_JOB_ID", a.state.frame.jobId);
+		const app = await startWorkbench({
+			root,
+			port: 0,
+			runnerPath: fileURLToPath(new URL("./fixtures/workbench-runner.mjs", import.meta.url)),
+		});
+		cleanup.push(async () => {
+			for (const state of app.running.values()) state.child?.kill("SIGINT");
+			await new Promise<void>((resolve) => app.server.close(() => resolve()));
+		});
+		const listing = (await (await fetch(`${app.url}/api/jobs`)).json()) as {
+			token: string;
+			jobs: Array<{ id: string }>;
+		};
+		const id = listing.jobs[0].id;
+		const post = (action: string, jobId: string) =>
+			fetch(`${app.url}/api/${action}?id=${id}`, {
+				method: "POST",
+				headers: { Origin: app.url, "X-Astra-Token": listing.token, "Content-Type": "application/json" },
+				body: JSON.stringify({ jobId }),
+			});
+		expect((await post("resume", a.state.frame.jobId)).status).toBe(400);
+		expect((await post("resume", b.state.frame.jobId)).status).toBe(202);
+		await expect
+			.poll(async () => JSON.parse(await readFile(join(project, "fixture-request.json"), "utf8")).request.jobId)
+			.toBe(b.state.frame.jobId);
+		await expect.poll(async () => (await ResearchJob.open(store, b.state.frame.jobId))!.state.paused).toBe(false);
+		if (rebound) await atomicWriteJson(join(project, ".astra/active-job.json"), { jobId: a.state.frame.jobId });
+		expect((await post("pause", b.state.frame.jobId)).status).toBe(202);
+		await expect.poll(() => Boolean(app.running.get(id)?.child)).toBe(false);
+		expect((await ResearchJob.open(store, b.state.frame.jobId))!.state.paused).toBe(true);
+		expect((await ResearchJob.open(store, a.state.frame.jobId))!.state.paused).toBe(true);
+		expect(JSON.parse(await readFile(join(project, "fixture-request.json"), "utf8")).request).toMatchObject({
+			action: "pause",
+			jobId: b.state.frame.jobId,
+		});
+	},
+);
+
+it.each([true, false])("C4 page resets job selections on rebound (same sequence=%s)", async (sameSequence) => {
+	const root = await mkdtemp(join(tmpdir(), "astra-workbench-page-"));
+	cleanup.push(() => rm(root, { recursive: true, force: true }));
+	const project = join(root, "run-page");
+	await mkdir(project);
+	const store = new JsonlAstraStore(project);
+	const a = await ResearchJob.create(store, { workspaceRoot: project, objective: "first objective" });
+	const b = await ResearchJob.create(store, { workspaceRoot: project, objective: "new objective" });
+	await a.pause("initial");
+	await b.pause("initial");
+	if (!sameSequence) await b.recordUserGuidance("different sequence");
+	await atomicWriteJson(join(project, ".astra/active-job.json"), { jobId: a.state.frame.jobId });
+	const app = await startWorkbench({ root, port: 0 });
+	cleanup.push(() => new Promise<void>((resolve) => app.server.close(() => resolve())));
+	class Element {
+		textContent = "";
+		hidden = false;
+		children: unknown[] = [];
+		value = "";
+		dataset = {};
+		append(...children: unknown[]) {
+			this.children.push(...children);
+		}
+		replaceChildren(...children: unknown[]) {
+			this.children = children;
+			this.textContent = "";
+		}
+		focus() {}
+	}
+	const elements = new Map<string, Element>();
+	const get = (id: string) => {
+		if (!elements.has(id)) elements.set(id, new Element());
+		return elements.get(id)!;
+	};
+	get("research").hidden = true;
+	const context = createContext({
+		document: { getElementById: get, createElement: () => new Element(), documentElement: new Element() },
+		fetch: (path: string, options: RequestInit) => fetch(app.url + path, options),
+		setInterval: () => 1,
+		URLSearchParams,
+		Date,
+		console,
+	});
+	runInContext(await readFile(fileURLToPath(new URL("../web/app.js", import.meta.url)), "utf8"), context);
+	await expect.poll(() => runInContext("fetching", context)).toBe(false);
+	expect(get("title").textContent).toBe("first objective");
+	runInContext('stageId = "paper-write"; evidenceId = "old-evidence"', context);
+	await atomicWriteJson(join(project, ".astra/active-job.json"), { jobId: b.state.frame.jobId });
+	await runInContext("refresh()", context);
+	expect(get("title").textContent).toBe("new objective");
+	expect(runInContext("stageId", context)).toBe(b.state.frame.activeStageId);
+	expect(runInContext("evidenceId", context)).toBe("");
+	runInContext("current = { readonly: false, running: true, snapshot: undefined }; renderJob()", context);
+	expect(get("pause").hidden).toBe(false);
 });
 
 it("downloads frozen evidence after original files change or disappear and rejects corrupt snapshots", async () => {
@@ -138,7 +250,7 @@ it("serves real state, isolates new runs, preserves read-only imports and pauses
 		(await (await fetch(`${app.url}/api/job?id=${id}`)).json()) as {
 			root: string;
 			running: boolean;
-			snapshot: { paused: boolean };
+			snapshot: { paused: boolean; frame: { jobId: string } };
 		};
 	await expect.poll(async () => (await getJob()).running).toBe(false);
 	const created = await getJob();
@@ -154,13 +266,152 @@ it("serves real state, isolates new runs, preserves read-only imports and pauses
 			await fetch(`${app.url}/api/resume?id=${id}`, {
 				method: "POST",
 				headers,
-				body: JSON.stringify({ guidance: "Keep the scope fixed" }),
+				body: JSON.stringify({ jobId: created.snapshot.frame.jobId, guidance: "Keep the scope fixed" }),
 			})
 		).status,
 	).toBe(202);
 	await expect.poll(async () => (await getJob()).snapshot.paused).toBe(false);
 	expect((await fetch(`${app.url}/api/resume?id=${id}`, { method: "POST", headers, body: "{}" })).status).toBe(400);
-	expect((await fetch(`${app.url}/api/pause?id=${id}`, { method: "POST", headers, body: "{}" })).status).toBe(202);
+	expect(
+		(
+			await fetch(`${app.url}/api/pause?id=${id}`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ jobId: created.snapshot.frame.jobId }),
+			})
+		).status,
+	).toBe(202);
 	await expect.poll(async () => (await getJob()).running).toBe(false);
 	expect((await getJob()).snapshot.paused).toBe(true);
+});
+
+it.each(["delayed-publication", "failed-after-publication", "missing-publication"])(
+	"C4 keeps exact published identity across %s and close",
+	async (mode) => {
+		const root = await mkdtemp(join(tmpdir(), "astra-workbench-publication-"));
+		cleanup.push(() => rm(root, { recursive: true, force: true }));
+		vi.stubEnv("ASTRA_FAKE_WORKBENCH_MODE", mode);
+		const app = await startWorkbench({
+			root,
+			port: 0,
+			runnerPath: fileURLToPath(new URL("./fixtures/workbench-runner.mjs", import.meta.url)),
+		});
+		cleanup.push(async () => {
+			for (const state of app.running.values()) state.child?.kill("SIGINT");
+			await new Promise<void>((resolve) => app.server.close(() => resolve()));
+		});
+		const listing = (await (await fetch(`${app.url}/api/jobs`)).json()) as { token: string };
+		const headers = { Origin: app.url, "X-Astra-Token": listing.token, "Content-Type": "application/json" };
+		const response = await fetch(`${app.url}/api/run`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				objective: "publication identity without real models",
+				maxTasks: 4,
+				requirePaper: false,
+			}),
+		});
+		expect(response.status).toBe(202);
+		const { id } = (await response.json()) as { id: string };
+		const getJob = async () =>
+			(await (await fetch(`${app.url}/api/job?id=${id}`)).json()) as {
+				root: string;
+				snapshot?: { paused: boolean; frame: { jobId: string } };
+			};
+		if (mode === "delayed-publication") {
+			const data = await getJob();
+			await expect
+				.poll(async () => readFile(join(data.root, "fixture-request.json"), "utf8"))
+				.toContain('"action":"run"');
+			expect(app.running.get(id)?.jobId).toBeUndefined();
+			const kill = vi.spyOn(app.running.get(id)!.child!, "kill");
+			expect((await fetch(`${app.url}/api/pause?id=${id}`, { method: "POST", headers, body: "{}" })).status).toBe(
+				202,
+			);
+			expect(kill).not.toHaveBeenCalled();
+		}
+		await expect.poll(() => Boolean(app.running.get(id)?.child)).toBe(false);
+		const final = await getJob();
+		if (mode === "missing-publication") expect(app.running.get(id)?.error).toContain("没有发布研究身份");
+		else {
+			expect(app.running.get(id)?.jobId).toBe(final.snapshot!.frame.jobId);
+			if (mode === "delayed-publication") {
+				expect(final.snapshot!.paused).toBe(true);
+				expect(JSON.parse(await readFile(join(final.root, "fixture-request.json"), "utf8")).request).toMatchObject({
+					action: "pause",
+					jobId: final.snapshot!.frame.jobId,
+				});
+			}
+		}
+	},
+);
+
+it("C4 actual control runner flushes the publication before a zero-tick drive failure exits", async () => {
+	const root = await mkdtemp(join(tmpdir(), "astra-workbench-real-publication-"));
+	cleanup.push(() => rm(root, { recursive: true, force: true }));
+	vi.stubEnv("ASTRA_MAX_TICKS", "0");
+	const app = await startWorkbench({ root, port: 0 });
+	cleanup.push(() => new Promise<void>((resolve) => app.server.close(() => resolve())));
+	const listing = (await (await fetch(`${app.url}/api/jobs`)).json()) as { token: string };
+	const response = await fetch(`${app.url}/api/run`, {
+		method: "POST",
+		headers: { Origin: app.url, "X-Astra-Token": listing.token, "Content-Type": "application/json" },
+		body: JSON.stringify({ objective: "zero model publication boundary", maxTasks: 4, requirePaper: false }),
+	});
+	expect(response.status).toBe(202);
+	const { id } = (await response.json()) as { id: string };
+	await expect.poll(() => Boolean(app.running.get(id)?.child)).toBe(false);
+	const current = (await (await fetch(`${app.url}/api/job?id=${id}`)).json()) as {
+		snapshot: { frame: { jobId: string } };
+		output: string;
+	};
+	expect(app.running.get(id)?.jobId).toBe(current.snapshot.frame.jobId);
+	expect(current.output).toContain("research run exceeded 0 ticks");
+});
+
+it("C4 closed child output and error belong only to the published job and remain when selected again", async () => {
+	const root = await mkdtemp(join(tmpdir(), "astra-workbench-output-"));
+	cleanup.push(() => rm(root, { recursive: true, force: true }));
+	vi.stubEnv("ASTRA_FAKE_WORKBENCH_MODE", "failed-after-publication");
+	const app = await startWorkbench({
+		root,
+		port: 0,
+		runnerPath: fileURLToPath(new URL("./fixtures/workbench-runner.mjs", import.meta.url)),
+	});
+	cleanup.push(() => new Promise<void>((resolve) => app.server.close(() => resolve())));
+	const listing = (await (await fetch(`${app.url}/api/jobs`)).json()) as { token: string };
+	const response = await fetch(`${app.url}/api/run`, {
+		method: "POST",
+		headers: { Origin: app.url, "X-Astra-Token": listing.token, "Content-Type": "application/json" },
+		body: JSON.stringify({
+			objective: "keep output bound to its published research",
+			maxTasks: 4,
+			requirePaper: false,
+		}),
+	});
+	const { id } = (await response.json()) as { id: string };
+	await expect.poll(() => Boolean(app.running.get(id)?.child)).toBe(false);
+	const get = async () =>
+		(await (await fetch(`${app.url}/api/job?id=${id}`)).json()) as {
+			root: string;
+			snapshot: { frame: { jobId: string } };
+			output: string;
+			error?: string;
+		};
+	const a = await get();
+	expect(a.output).toContain(`fixture-job-error:${a.snapshot.frame.jobId}`);
+	expect(a.error).toBeDefined();
+	const b = await ResearchJob.create(new JsonlAstraStore(a.root), {
+		workspaceRoot: a.root,
+		objective: "different displayed research",
+	});
+	await atomicWriteJson(join(a.root, ".astra/active-job.json"), { jobId: b.state.frame.jobId });
+	const displayed = await get();
+	expect(displayed.snapshot.frame.jobId).toBe(b.state.frame.jobId);
+	expect(displayed.output).toBe("");
+	expect(displayed.error).toBeUndefined();
+	const rows = (await (await fetch(`${app.url}/api/jobs`)).json()) as { jobs: Array<{ id: string; error?: string }> };
+	expect(rows.jobs.find((row) => row.id === id)?.error).toBeUndefined();
+	await atomicWriteJson(join(a.root, ".astra/active-job.json"), { jobId: a.snapshot.frame.jobId });
+	expect(await get()).toMatchObject({ output: a.output, error: a.error });
 });

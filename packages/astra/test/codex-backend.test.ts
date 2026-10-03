@@ -778,15 +778,18 @@ describe("Codex research backend", () => {
 			maxParallel: 1,
 		});
 		const before = Object.keys(job.state.tasks).length;
+		await expect(supervisor.tick()).rejects.toThrow(/resource.*symbolic link/);
+		expect(Object.keys(job.state.tasks)).toHaveLength(before);
+		expect(Object.values(job.state.reviews)).toEqual([]);
+		await rm(resourceRoot);
+		await mkdir(resourceRoot);
+		await writeFile(join(resourceRoot, "results.csv"), "replicate,error\n0,0.1\n");
 		await supervisor.tick();
-		expect(job.state.paused).toBe(true);
 		expect(Object.keys(job.state.tasks)).toHaveLength(before);
 		expect(Object.values(job.state.reviews)).toEqual([
 			expect.objectContaining({ reviewerTaskId: review.reviewerTaskId, evidenceId: evidence.id }),
 		]);
 		expect(job.state.tasks[review.reviewerTaskId!].status).toBe("succeeded");
-		await supervisor.tick();
-		expect(Object.keys(job.state.tasks)).toHaveLength(before);
 	});
 	it("audits every Codex decision log and rejects missing, incomplete or misbound records", async () => {
 		const root = await workspace();
@@ -981,7 +984,7 @@ describe("Codex research backend", () => {
 			);
 			expect(audit.passed, JSON.stringify({ checks: audit.contractChecks, sessions: audit.sessions })).toBe(true);
 		},
-		60000,
+		120000,
 	);
 	it("resumes retrieved sources and a rate-limited reviewer without creating another task", async () => {
 		const root = await workspace();

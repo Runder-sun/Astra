@@ -7,7 +7,11 @@ let threadId;
 let output;
 let turnId;
 let validatedReviewOutput;
-const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
+const send = message => {
+	if (message.method?.startsWith("item/") && message.params && !message.params.turnId) message.params.turnId = turnId;
+	process.stdout.write(`${JSON.stringify(message)}\n`);
+};
+let turnSequence = 0;
 const lateCloseKeepAlive = process.env.ASTRA_FAKE_CODEX_LATE_CLOSE ? setInterval(() => {}, 1000) : undefined;
 if (process.env.ASTRA_FAKE_CODEX_PID) writeFileSync(process.env.ASTRA_FAKE_CODEX_PID, String(process.pid));
 process.on("SIGTERM", () => {
@@ -134,7 +138,54 @@ createInterface({ input: process.stdin }).on("line", line => {
 		send({ id: message.id, result: { thread: { id: threadId }, model: mode === "wrong-model" ? "different-model" : message.params.model ?? "test-model", modelProvider: "openai", activePermissionProfile: { id: mode === "wrong-permissions" ? ":danger-full-access" : "astra" } } });
 	}
 	if (message.method === "turn/start") {
-		turnId = `turn-${Date.now()}`;
+		turnId = `turn-${++turnSequence}`;
+		if (mode?.startsWith("turn-identity-")) {
+			const item = answer => {
+				let value = { answer };
+				if (message.params.outputSchema.properties.verdict) {
+					const packet = JSON.parse(readFileSync("review-packet.json", "utf8"));
+					const snapshot = JSON.parse(readFileSync("review-target-snapshot.json", "utf8"));
+					const refs = [`evidence:${packet.evidenceId}`, "review-packet.json", "review-target-snapshot.json"];
+					const criteria = snapshot.reviewCriteria.map(group => group.criterion);
+					value = { verdict: answer === "draft" ? "fail" : answer === "corrected" ? "partial" : "pass", score: answer === "corrected" ? 0.5 : 1, findings: [answer], verifiedRefs: refs, criteria: criteria.map(criterion => ({ criterion, passed: answer !== "corrected", score: answer === "corrected" ? 0.5 : 1, evidenceRefs: refs, rationale: answer })), astraValidatedReview: null };
+				}
+				return { type: "agentMessage", phase: "final_answer", text: JSON.stringify(value) };
+			};
+			const completed = id => ({ method: "turn/completed", params: { threadId, turn: { id, status: "completed", error: null } } });
+			const current = () => {
+				send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+				if (mode.endsWith("flat")) {
+					for (const id of ["old-turn", turnId]) {
+						send({ method: "turn/diff/updated", params: { threadId, turnId: id, diff: id } });
+						send({ method: "turn/plan/updated", params: { threadId, turnId: id, explanation: id, plan: [] } });
+					}
+				}
+				send({ method: "item/completed", params: { threadId, turnId, item: item(turnSequence === 1 ? "draft" : "corrected") } });
+				if (turnSequence === 2 && mode.endsWith("message")) send({ method: "item/completed", params: { threadId, turnId: "turn-1", item: item("stale") } });
+				send(completed(turnId));
+			};
+			if (turnSequence === 2) {
+				const old = "turn-1";
+				if (mode.endsWith("started")) send({ method: "turn/started", params: { threadId, turn: { id: old } } });
+				if (mode.endsWith("message")) send({ method: "item/completed", params: { threadId, turnId: old, item: item("stale") } });
+				if (mode.endsWith("completion")) send(completed(old));
+				if (mode.endsWith("error")) send({ method: "error", params: { threadId, turnId: old, willRetry: false, error: { message: "stale failure" } } });
+				if (mode.endsWith("search")) {
+					const stale = { type: "webSearch", id: "stale-search", query: "stale" };
+					send({ method: "item/started", params: { threadId, turnId: old, item: stale } });
+					send({ method: "item/completed", params: { threadId, turnId: old, item: stale } });
+				}
+				if (mode.endsWith("tool")) send({ id: "stale-tool", method: "item/tool/call", params: { threadId, turnId: old, tool: "audit_tool", arguments: { query: "stale" } } });
+			}
+			if (mode.endsWith("pre-response")) {
+				current();
+				send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
+			} else {
+				send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
+				setTimeout(current, turnSequence === 2 ? 30 : 0);
+			}
+			return;
+		}
 		if (validatedReviewOutput && message.params.input[0].text.startsWith("Astra final submission rejected:")) {
 			send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
 			send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
@@ -179,6 +230,13 @@ createInterface({ input: process.stdin }).on("line", line => {
 			writeFileSync(path, JSON.stringify(queue));
 		}
 		if (mode === "full-research") output = fullResearchOutput(message.params.outputSchema);
+		if (mode === "pre-response-host") {
+			send({ method: "item/started", params: { threadId, item: { id: "early-host", type: "dynamicToolCall" } } });
+			send({ id: "tool-call", method: "item/tool/call", params: { threadId, tool: "audit_tool", arguments: { query: "early" } } });
+			complete();
+			send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
+			return;
+		}
 		send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
 		send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
 		if (mode === "review-preflight") {

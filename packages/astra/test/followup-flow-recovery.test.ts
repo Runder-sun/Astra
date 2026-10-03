@@ -214,20 +214,22 @@ it.each([
 				"offline",
 				"2026-10-02T00:00:00Z",
 			);
-		const changed = await job.recordEvidence({
-			id: old.id,
-			taskId,
-			stageId: old.stageId,
-			type: old.type,
-			content: old.content,
-			refs: changedVersion ? ["https://example.invalid/changed-reference"] : old.refs,
-			currentEvidenceSetId: mode === "changed-current-lineage" ? "unrelated-lineage" : old.currentEvidenceSetId,
-			supersededByTaskId: winnerEvidence.taskId,
-		});
-		await job.decideEvidence(changed.id, false);
-		expect(changed.checksum).toBe(old.checksum);
-		if (changedVersion) expect(changed.versionHash).not.toBe(old.versionHash);
-		else expect(changed.versionHash).toBe(old.versionHash);
+		const unchanged = job.state;
+		await expect(
+			job.recordEvidence({
+				id: old.id,
+				taskId,
+				stageId: old.stageId,
+				type: old.type,
+				content: old.content,
+				refs: changedVersion ? ["https://example.invalid/changed-reference"] : old.refs,
+				currentEvidenceSetId: mode === "changed-current-lineage" ? "unrelated-lineage" : old.currentEvidenceSetId,
+				supersededByTaskId: winnerEvidence.taskId,
+			}),
+		).rejects.toThrow(/identity declaration/);
+		expect(job.state).toEqual(unchanged);
+		// These former public overwrites now stop at registration, before adoption or pruning.
+		return;
 	}
 	if (["changed-pruned-version", "changed-pruned-task"].includes(mode)) {
 		const prune = structuredClone(events[firstPruned]);
@@ -361,7 +363,7 @@ it("T14 audits moved Codex sessions by their exact completed cleanup mapping and
 	expect(audit().runtimeIntegrity.codexSessionsVerified).toBe(true);
 });
 
-it("T11 preserves a reused task's archived session across a second cleanup and refuses a missing archive", async () => {
+it("T11 retains a shared session until its last owner retires and refuses a missing archive", async () => {
 	const { root, job, store } = await setup(true);
 	const first = await evidence(job, "reused delivery");
 	const source = join(root, "external-session.jsonl");
@@ -387,9 +389,11 @@ it("T11 preserves a reused task's archived session across a second cleanup and r
 	await job.recordReview(reviewFixture(job, { evidenceId: second.id, verdict: "pass", findings: [] }));
 	await job.decideEvidence(second.id, true);
 	await job.adoptEvidence(second.id, artifact.id);
-	const archived = job.state.sessions["reused-thread"].sessionFile!;
-	expect(await readFile(archived, "utf8")).toBe("preserved historical session\n");
+	expect(job.state.sessions["reused-thread"].sessionFile).toBe(source);
+	expect(await readFile(source, "utf8")).toBe("preserved historical session\n");
 	await job.reopenStage("validation", "reused-reopen", "retain the existing archive");
+	const archived = job.state.sessions["reused-thread"].sessionFile!;
+	expect(archived).not.toBe(source);
 	const reopened = (await ResearchJob.open(store, job.state.frame.jobId))!;
 	await reopened.recoverPendingOperations();
 	expect(reopened.state.sessions["reused-thread"].sessionFile).toBe(archived);

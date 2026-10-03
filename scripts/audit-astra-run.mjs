@@ -1,11 +1,30 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+const inputFailures = [];
 function readJson(path) {
-	return JSON.parse(readFileSync(path, "utf8"));
+	try { return JSON.parse(readFileSync(path, "utf8")); }
+	catch (error) { inputFailures.push({ path, reason: error.message }); return null; }
+}
+
+function stableJson(value) {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(",")}}`;
+}
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const checksum = (value) => sha256(stableJson(value));
+const isDigest = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+
+function readAuditedBytes(path, failures) {
+	try {
+		if (!lstatSync(path).isFile()) throw new Error("not a regular file");
+		return readFileSync(path);
+	} catch (error) { failures.push(`Cannot read ${path}: ${error.message}`); return null; }
 }
 
 function readJsonIfPresent(path) {
@@ -14,7 +33,12 @@ function readJsonIfPresent(path) {
 
 function readJsonl(path) {
 	if (!existsSync(path)) return [];
-	return readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	try {
+		return readFileSync(path, "utf8").split("\n").filter(Boolean).flatMap((line, index) => {
+			try { return [JSON.parse(line)]; }
+			catch (error) { inputFailures.push({ path, line: index + 1, reason: error.message }); return []; }
+		});
+	} catch (error) { inputFailures.push({ path, reason: error.message }); return []; }
 }
 
 function collectJsonlFiles(root) {
@@ -35,7 +59,7 @@ function usage() {
 
 const workspace = resolve(process.argv[2] ?? ".");
 const activeJobPath = join(workspace, ".astra", "active-job.json");
-const jobId = process.argv[3] ?? (existsSync(activeJobPath) ? readJson(activeJobPath).jobId : undefined);
+const jobId = process.argv[3] ?? (existsSync(activeJobPath) ? readJson(activeJobPath)?.jobId : undefined);
 const parentSessionRoot = process.argv[4] ? resolve(process.argv[4]) : process.env.PI_CODING_AGENT_SESSION_DIR;
 if (!jobId) usage();
 
@@ -44,6 +68,14 @@ const snapshotPath = join(jobRoot, "job.json");
 if (!existsSync(snapshotPath)) throw new Error(`Astra job snapshot not found: ${snapshotPath}`);
 
 const snapshot = readJson(snapshotPath);
+const invalidSnapshotFields = ["frame", "tasks", "evidence", "reviews", "obligations", "canonical", "stages"]
+	.filter((key) => !snapshot?.[key] || typeof snapshot[key] !== "object" || Array.isArray(snapshot[key]));
+if (invalidSnapshotFields.length > 0) {
+	console.log(JSON.stringify({ schemaVersion: "astra.run_audit.v4", passed: false, workspace, jobId,
+		contractChecks: { inputFilesValid: false }, inputFailures: [...inputFailures,
+			{ path: snapshotPath, reason: `Invalid job snapshot collections: ${invalidSnapshotFields.join(", ")}` }] }, null, 2));
+	process.exit(0);
+}
 const backend = readJsonIfPresent(join(jobRoot, "backend.json"))?.backend ?? "pi";
 if (!["pi", "codex"].includes(backend)) throw new Error(`Unknown Astra backend: ${backend}`);
 const events = readJsonl(join(jobRoot, "events.jsonl"));
@@ -112,36 +144,76 @@ const sourceTaskAudits = workerContexts.flatMap((entry) => {
 	if (minSourceRefs <= 0) return [];
 	const manifestPath = join(jobRoot, "tasks", entry.task.id, "output-manifest.json");
 	const manifest = readJsonIfPresent(manifestPath);
-	const sourceRefs = (manifest?.outputRefs ?? [])
-		.filter((ref) => ref.kind === "source")
-		.map((ref) => ref.ref);
-	return [{ taskId: entry.task.id, stageId: entry.task.stageId, minSourceRefs, sourceRefs, manifestPath }];
+	if (!Array.isArray(manifest?.outputRefs)) inputFailures.push({ path: manifestPath, reason: "outputRefs must be an array" });
+	const sourceOutputs = (Array.isArray(manifest?.outputRefs) ? manifest.outputRefs : []).flatMap((output, index) => {
+		if (!output || typeof output !== "object" || Array.isArray(output)) {
+			inputFailures.push({ path: manifestPath, reason: `outputRefs[${index}] must be an object` });
+			return [];
+		}
+		if (output.kind !== "source") return [];
+		if (typeof output.ref !== "string" || !output.ref.trim()) {
+			inputFailures.push({ path: manifestPath, reason: `outputRefs[${index}].ref must be a nonempty source string` });
+			return [];
+		}
+		return [output];
+	});
+	const sourceRefs = sourceOutputs.map((output) => output.ref);
+	return [{ taskId: entry.task.id, stageId: entry.task.stageId, minSourceRefs, sourceRefs,
+		sourceOutputs, manifestPath }];
 });
 const sourceRoot = join(jobRoot, "sources");
+function sourceFilename(sourceRef) {
+	const id = /^openalex:(W\d+)$/.exec(sourceRef)?.[1];
+	if (id) return `openalex-${id}.json`;
+	return /^(?:doi:10\.\d{4,9}\/\S+|arxiv:(?:\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?\/\d{7})|https:\/\/\S+)$/.test(sourceRef)
+		? `source-${sha256(sourceRef)}.json` : undefined;
+}
+function auditSourceReceipt(path, expectedDigest) {
+	const failures = [];
+	const bytes = readAuditedBytes(path, failures);
+	let receipt = null;
+	if (bytes) {
+		try { receipt = JSON.parse(bytes.toString("utf8")); }
+		catch (error) { failures.push(`Invalid source receipt JSON: ${error.message}`); }
+	}
+	if (expectedDigest && (!isDigest(expectedDigest) || !bytes || sha256(bytes) !== expectedDigest)) failures.push("Frozen source digest mismatch");
+	if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) failures.push("Invalid source receipt object");
+	else {
+		const { sha256: digest, ...body } = receipt;
+		if (!isDigest(digest) || digest !== sha256(JSON.stringify(body))) failures.push("Source receipt internal sha256 mismatch");
+		if (!sourceFilename(receipt.sourceRef) || receipt.record?.sourceRef !== receipt.sourceRef) failures.push("Source receipt identity mismatch");
+		if (!expectedDigest && path !== join(sourceRoot, sourceFilename(receipt.sourceRef) ?? "invalid")) failures.push("Source receipt filename mismatch");
+	}
+	const doi = receipt?.record?.doi;
+	const aliases = receipt ? [receipt.sourceRef, receipt.record?.sourceRef, receipt.record?.landingPageUrl,
+		receipt.record?.pdfUrl, doi, doi ? `doi:${doi}` : undefined, doi ? `https://doi.org/${doi}` : undefined]
+		.filter((ref) => typeof ref === "string") : [];
+	return { path, receipt, failures, aliases, valid: failures.length === 0 };
+}
 const sourceReceipts = existsSync(sourceRoot)
 	? readdirSync(sourceRoot)
 			.filter((name) => name.endsWith(".json"))
-			.map((name) => ({ path: join(sourceRoot, name), receipt: readJson(join(sourceRoot, name)) }))
+			.map((name) => auditSourceReceipt(join(sourceRoot, name)))
 	: [];
-const receivedSourceRefs = new Set(
-	sourceReceipts.flatMap(({ receipt }) => {
-		const doi = receipt.record?.doi;
-		return [
-			receipt.sourceRef,
-			receipt.record?.sourceRef,
-			receipt.record?.landingPageUrl,
-			receipt.record?.pdfUrl,
-			doi,
-			doi ? `doi:${doi}` : undefined,
-			doi ? `https://doi.org/${doi}` : undefined,
-		].filter((ref) => typeof ref === "string");
-	}),
-);
+const frozenSourceReceipts = new Map();
+const sourceRefAudits = sourceTaskAudits.flatMap((entry) => entry.sourceOutputs.map((output) => {
+	let candidates;
+	if (output.sha256 !== undefined) {
+		if (!frozenSourceReceipts.has(output.sha256)) frozenSourceReceipts.set(output.sha256,
+			auditSourceReceipt(join(jobRoot, "versions", "files", isDigest(output.sha256) ? output.sha256 : "invalid-digest"), output.sha256));
+		candidates = [frozenSourceReceipts.get(output.sha256)];
+	} else candidates = sourceReceipts;
+	const matches = candidates.filter((candidate) => candidate.valid && candidate.aliases.includes(output.ref));
+	const canonicalRefs = [...new Set(matches.map((candidate) => candidate.receipt.sourceRef))];
+	return { taskId: entry.taskId, ref: output.ref, canonicalSourceRef: canonicalRefs.length === 1 ? canonicalRefs[0] : null,
+		failures: canonicalRefs.length === 1 ? [] : [canonicalRefs.length ? "Ambiguous source alias" : "No intact matching source receipt"] };
+}));
 const insufficientSourceTaskIds = sourceTaskAudits
-	.filter((entry) => entry.sourceRefs.length < entry.minSourceRefs)
+	.filter((entry) => new Set(sourceRefAudits.filter((source) => source.taskId === entry.taskId && source.canonicalSourceRef)
+		.map((source) => source.canonicalSourceRef)).size < entry.minSourceRefs)
 	.map((entry) => entry.taskId);
 const missingSourceReceiptRefs = [
-	...new Set(sourceTaskAudits.flatMap((entry) => entry.sourceRefs).filter((ref) => !receivedSourceRefs.has(ref))),
+	...new Set(sourceRefAudits.filter((entry) => !entry.canonicalSourceRef).map((entry) => entry.ref)),
 ].sort();
 const activeArtifacts = Object.values(snapshot.canonical).filter((artifact) => artifact.status === "active");
 const canonicalEvidenceCounts = Object.values(snapshot.canonical).reduce((counts, artifact) => {
@@ -155,8 +227,18 @@ const duplicateCanonicalEvidenceIds = Object.entries(canonicalEvidenceCounts)
 const artifactDir = join(jobRoot, "canonical");
 const receiptFor = (artifactId) => join(artifactDir, `${artifactId}.json.receipt.json`);
 const receiptParity = activeArtifacts.map((artifact) => {
+	const failures = [];
 	const receiptPath = receiptFor(artifact.id);
 	const receipt = existsSync(receiptPath) ? readJson(receiptPath) : null;
+	const expectedPath = join(artifactDir, `${artifact.id}.json`);
+	const bytes = readAuditedBytes(expectedPath, failures);
+	const expectedReceipt = { schemaVersion: "astra.materialization_receipt.v1", artifactId: artifact.id,
+		sourceSha256: artifact.sourceSha256, targetSha256: artifact.targetSha256, targetPath: expectedPath, createdAt: artifact.adoptedAt };
+	if (!receipt || checksum(receipt) !== checksum(expectedReceipt)) failures.push("Materialization receipt schema/content/state mismatch");
+	if (artifact.materializationRef !== expectedPath) failures.push("Materialization path mismatch");
+	if (!isDigest(artifact.sourceSha256) || artifact.sourceSha256 !== artifact.checksum) failures.push("Source checksum mismatch");
+	if (!isDigest(artifact.targetSha256) || artifact.targetSha256 !== sha256(`${JSON.stringify(artifact.content, null, 2)}\n`)) failures.push("Canonical content digest mismatch");
+	if (!bytes || sha256(bytes) !== artifact.targetSha256) failures.push("Materialized bytes digest mismatch");
 	return {
 		artifactId: artifact.id,
 		status: artifact.status,
@@ -164,17 +246,52 @@ const receiptParity = activeArtifacts.map((artifact) => {
 		materializationRef: artifact.materializationRef ?? null,
 		receiptPath,
 		receiptPresent: receipt !== null,
-		receiptMatchesState: receipt !== null && receipt.artifactId === artifact.id && receipt.sourceSha256 === artifact.sourceSha256 && receipt.targetSha256 === artifact.targetSha256 && receipt.targetPath === artifact.materializationRef,
+		receiptMatchesState: failures.length === 0,
+		failures,
 		sourceSha256: artifact.sourceSha256 ?? null,
 		targetSha256: artifact.targetSha256 ?? null,
 	};
 });
-const retiredReceiptParity = retiredArtifacts.map((receipt) => ({
-	artifactId: receipt.artifactId,
-	receiptPath: receipt.materializationReceiptRef ?? receiptFor(receipt.artifactId),
-	receiptPresent: existsSync(receipt.materializationReceiptRef ?? receiptFor(receipt.artifactId)),
-	materializedArtifactRemoved: !existsSync(join(artifactDir, `${receipt.artifactId}.json`)),
-}));
+const retiredReceiptParity = retiredArtifacts.map((state) => {
+	const receiptPath = state.materializationReceiptRef ?? receiptFor(state.artifactId);
+	const receipt = readJsonIfPresent(receiptPath);
+	const failures = [];
+	if (receiptPath !== receiptFor(state.artifactId)) failures.push("Retired receipt path mismatch");
+	if (!isDigest(state.checksum) || !state.evidenceId || !state.taskId || !state.type || !Array.isArray(state.reviewIds) ||
+		state.cleanupStatus !== "completed" || !state.retiredAt) failures.push("Retired receipt state is incomplete");
+	if (!receipt || checksum(receipt) !== checksum({ schemaVersion: "astra.retired_artifact_receipt.v1", ...state })) failures.push("Retired receipt schema/identity/checksum/state mismatch");
+	return { artifactId: state.artifactId, receiptPath, receiptPresent: receipt !== null,
+		receiptMatchesState: failures.length === 0, failures,
+		materializedArtifactRemoved: !existsSync(join(artifactDir, `${state.artifactId}.json`)) };
+});
+const versionParity = activeArtifacts.map((artifact) => {
+	const evidence = snapshot.evidence[artifact.evidenceId];
+	const failures = [];
+	if (!evidence || evidence.status !== "accepted") failures.push("Current source evidence is missing or not accepted");
+	if (evidence) {
+		const expectedChecksum = checksum(evidence.incrementalRevision ? { content: evidence.content, incrementalRevision: evidence.incrementalRevision } : evidence.content);
+		const expectedVersion = checksum({ content: evidence.content, refs: evidence.refs, files: evidence.files,
+			taskVersion: evidence.taskVersion, ...(evidence.incrementalRevision ? { incrementalRevision: evidence.incrementalRevision } : {}) });
+		if (evidence.checksum !== expectedChecksum || artifact.checksum !== evidence.checksum ||
+			artifact.sourceSha256 !== evidence.checksum || checksum(artifact.content) !== checksum(evidence.content) || artifact.type !== evidence.type)
+			failures.push("Canonical content/checksum does not belong to current source evidence");
+		if (!isDigest(evidence.versionHash) || evidence.versionHash !== expectedVersion) failures.push("Current source evidence versionHash mismatch");
+		const evidenceSetId = evidence.currentEvidenceSetId ?? evidence.taskId;
+		const acceptedRevisionRefs = Object.values(snapshot.evidence).filter((entry) => entry.status === "accepted" &&
+			(entry.currentEvidenceSetId ?? entry.taskId) === evidenceSetId).map((entry) => entry.id).sort();
+		if (artifact.evidenceSnapshotHash !== checksum({ stageId: evidence.stageId, acceptedRevisionRefs })) failures.push("Canonical evidence snapshot mismatch");
+	}
+	const requiredPassingReviews = ["result-to-claim", "research-review"].includes(artifact.type) ? 2 : 1;
+	const reviews = Object.values(snapshot.reviews ?? {}).filter((review) => review.evidenceId === artifact.evidenceId &&
+		review.verdict === "pass" && Number(review.score ?? 0) >= 0.8);
+	const currentReviewIds = reviews.filter((review) => evidence && isDigest(evidence.versionHash) && review.targetVersionHash === evidence.versionHash).map((review) => review.id);
+	const evidenceMatches = failures.length === 0;
+	const reviewsMatch = currentReviewIds.length >= requiredPassingReviews;
+	if (!reviewsMatch) failures.push("Passing reviews target a different or missing current evidence version");
+	return { artifactId: artifact.id, evidenceId: artifact.evidenceId, currentVersionHash: evidence?.versionHash ?? null,
+		historicalPassingReviewIds: reviews.map((review) => review.id), currentPassingReviewIds: currentReviewIds,
+		evidenceMatches, reviewsMatch, failures };
+});
 const eventTypes = {};
 for (const stored of events) {
 	const type = stored.event?.type ?? "unknown";
@@ -401,9 +518,10 @@ const runtimeIntegrity = {
 	sourceMinimumsSatisfied: insufficientSourceTaskIds.length === 0,
 	sourceReceiptsPresent: missingSourceReceiptRefs.length === 0,
 	canonicalRouteIsUnique: routeUsesOnlyActiveArtifacts && new Set(canonicalRouteArtifactIds).size === canonicalRouteArtifactIds.length,
-	canonicalReceiptsMatch: receiptParity.every((entry) => entry.receiptMatchesState),
+	canonicalReceiptsMatch: receiptParity.every((entry) => entry.receiptMatchesState) && versionParity.every((entry) => entry.evidenceMatches),
+	canonicalEvidenceVersionsMatch: versionParity.every((entry) => entry.evidenceMatches),
 	retiredArtifactsPruned: retiredReceiptParity.every(
-		(entry) => entry.receiptPresent && entry.materializedArtifactRemoved,
+		(entry) => entry.receiptMatchesState && entry.materializedArtifactRemoved,
 	),
 	mainAgentSessionStable,
 	acceptedChildSessionsValid: backend === "codex" ? codexSessionsVerified : unrecoveredFailedSessions.length === 0,
@@ -418,6 +536,7 @@ const runtimeIntegrity = {
 const researchQuality = {
 	researchCompletedByDecision: snapshot.frame.status === "completed" && Boolean(completionDecision),
 	canonicalArtifactsReviewed,
+	canonicalReviewVersionsMatch: versionParity.every((entry) => entry.reviewsMatch),
 	selectedSearchesEvaluated,
 	scientificOutcomeRecorded,
 	claimOutcomeConsistent,
@@ -496,6 +615,9 @@ const report = {
 		receipts: sourceReceipts.length,
 		insufficientTaskIds: insufficientSourceTaskIds,
 		missingReceiptRefs: missingSourceReceiptRefs,
+		refAudits: sourceRefAudits,
+		receiptFailures: [...sourceReceipts, ...frozenSourceReceipts.values()].filter((entry) => !entry.valid)
+			.map(({ path, failures }) => ({ path, failures })),
 	},
 	evidence: { total: Object.keys(snapshot.evidence).length, reviews: Object.keys(snapshot.reviews).length },
 	obligations: {
@@ -508,6 +630,7 @@ const report = {
 		duplicateEvidenceIds: duplicateCanonicalEvidenceIds,
 		receiptParity,
 		retiredReceiptParity,
+		versionParity,
 		routeArtifactIds: canonicalRouteArtifactIds,
 		discardedCandidates: discardedCandidateReceipts.length,
 		discardedEvidence: discardedEvidenceReceipts.length,
@@ -551,6 +674,10 @@ const report = {
 			}
 		: null,
 	migrationReport: existsSync(migrationPath) ? readJson(migrationPath) : null,
+	inputFailures,
 };
+report.runtimeIntegrity.inputFilesValid = inputFailures.length === 0;
+report.contractChecks.inputFilesValid = inputFailures.length === 0;
+report.passed = Object.values(report.contractChecks).every(Boolean);
 
 console.log(JSON.stringify(report, null, 2));

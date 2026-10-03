@@ -34,6 +34,7 @@ import {
 	planEvidence as planReviewEvidence,
 	planReviewStatus,
 	taskHasBoundRepairAncestor,
+	taskHasRetainedOwner,
 	taskIsCurrentFromSnapshot,
 } from "./plan-review.ts";
 import { captureGitVersion } from "./project-version.ts";
@@ -213,9 +214,85 @@ function reviewBody(review: Omit<Review, "createdAt">): string {
 	return checksum(JSON.parse(JSON.stringify(review)));
 }
 
+function taskDeclaration(task: Partial<TaskPacket>, retry = false): string {
+	const {
+		id: _id,
+		agentId: _agentId,
+		jobId: _jobId,
+		schemaVersion: _schema,
+		createdAt: _created,
+		status: _status,
+		version: _version,
+		runnerKind: _runner,
+		outputManifestRequired: _manifest,
+		...declaration
+	} = task;
+	if (retry) {
+		delete declaration.attempt;
+		delete declaration.supersedesTaskId;
+	}
+	return checksum(JSON.parse(JSON.stringify(declaration)));
+}
+
+function evidenceDeclaration(evidence: Partial<Evidence>): string {
+	const {
+		id: _id,
+		checksum: _checksum,
+		createdAt: _created,
+		status: _status,
+		files: _files,
+		taskVersion: _taskVersion,
+		versionHash: _versionHash,
+		acceptanceAuthority: _authority,
+		mainAgentDecisionRef: _decision,
+		supersededByTaskId: _superseded,
+		...declaration
+	} = evidence;
+	return checksum(JSON.parse(JSON.stringify(declaration)));
+}
+
 function checkReviewHistory(events: StoredEvent[]): Map<string, Review> {
 	const reviews = new Map<string, Review>();
+	const tasks = new Map<string, TaskPacket>();
+	const evidence = new Map<string, Evidence>();
 	for (const stored of events) {
+		if (stored.event.type === "task_dispatched") {
+			const task = stored.event.task;
+			const previous = tasks.get(task.id);
+			if (
+				previous &&
+				(taskDeclaration(previous) !== taskDeclaration(task) ||
+					previous.agentId !== task.agentId ||
+					previous.jobId !== task.jobId)
+			)
+				throw new Error(`task history identity conflict for id ${task.id}`);
+			const replay = [...tasks.values()].filter((value) => value.replayKey === task.replayKey).at(-1);
+			if (
+				!previous &&
+				replay &&
+				(replay.status !== "failed" ||
+					taskDeclaration(replay, true) !== taskDeclaration(task, true) ||
+					(task.attempt === replay.attempt
+						? task.role !== "reviewer"
+						: task.attempt !== replay.attempt + 1 || task.supersedesTaskId !== replay.id))
+			)
+				throw new Error(`task history replay declaration conflict for key ${task.replayKey}`);
+			tasks.set(task.id, previous ?? structuredClone(task));
+		}
+		if (stored.event.type === "task_status") {
+			const task = tasks.get(stored.event.taskId);
+			if (task) task.status = stored.event.status;
+		}
+		if (stored.event.type === "evidence_recorded") {
+			const value = stored.event.evidence;
+			const previous = evidence.get(value.id);
+			if (
+				previous &&
+				(evidenceDeclaration(previous) !== evidenceDeclaration(value) || previous.versionHash !== value.versionHash)
+			)
+				throw new Error(`evidence history identity conflict for id ${value.id}`);
+			evidence.set(value.id, previous ?? value);
+		}
 		if (stored.event.type !== "review_recorded") continue;
 		const review = stored.event.review;
 		const existing = reviews.get(review.id);
@@ -270,6 +347,7 @@ export interface JobStatus {
 
 export interface BudgetBlock {
 	limit: BudgetLimit;
+	requiredMinimum: number;
 	reason: string;
 }
 
@@ -559,12 +637,14 @@ export class ResearchJob {
 		if (tasks + additionalTasks > this.snapshot.frame.budget.maxTasks) {
 			return {
 				limit: "maxTasks",
+				requiredMinimum: tasks + additionalTasks,
 				reason: `task budget requires ${tasks + additionalTasks}, limit is ${this.snapshot.frame.budget.maxTasks}`,
 			};
 		}
 		if (usage.turnsUsed + additionalTurns > this.snapshot.frame.budget.maxTurns) {
 			return {
 				limit: "maxTurns",
+				requiredMinimum: usage.turnsUsed + additionalTurns,
 				reason: `turn budget requires ${usage.turnsUsed + additionalTurns}, limit is ${this.snapshot.frame.budget.maxTurns}`,
 			};
 		}
@@ -572,6 +652,7 @@ export class ResearchJob {
 		if (maxCostUsd !== undefined && usage.costUsdUsed >= maxCostUsd) {
 			return {
 				limit: "maxCostUsd",
+				requiredMinimum: usage.costUsdUsed,
 				reason: `cost budget used $${usage.costUsdUsed.toFixed(6)}, limit is $${maxCostUsd.toFixed(6)}`,
 			};
 		}
@@ -646,6 +727,14 @@ export class ResearchJob {
 	}
 
 	async requireUserGate(input: UserGateRequest): Promise<void> {
+		if (
+			input.kind === "budget" &&
+			input.requiredMinimum !== undefined &&
+			(!Number.isFinite(input.requiredMinimum) ||
+				input.requiredMinimum < 0 ||
+				(input.limit !== "maxCostUsd" && !Number.isInteger(input.requiredMinimum)))
+		)
+			throw new Error("budget gate minimum must be a non-negative valid capacity");
 		const current = this.snapshot.frame.userGate;
 		if (
 			current?.kind === input.kind &&
@@ -659,6 +748,17 @@ export class ResearchJob {
 						current.decisionRef === input.decisionRef &&
 						current.planId === input.planId)
 		) {
+			if (
+				current.kind === "budget" &&
+				input.kind === "budget" &&
+				input.requiredMinimum !== undefined &&
+				(current.requiredMinimum === undefined || input.requiredMinimum > current.requiredMinimum)
+			) {
+				await this.commit({
+					type: "user_gate_required",
+					gate: { ...current, reason: input.reason, requiredMinimum: input.requiredMinimum },
+				});
+			}
 			return;
 		}
 		if (current) throw new Error(`research job already waits at user gate: ${current.reason}`);
@@ -1233,7 +1333,9 @@ export class ResearchJob {
 			.filter((artifact) => artifact.status === "active" && invalidRefs.has(artifact.id))
 			.map((artifact) => artifact.id);
 		const affectedStageIds = [...new Set([targetStageId, ...this.dependentStageIds(invalidRefs)])];
-		const cleanups = await Promise.all(invalidArtifactIds.map((id) => this.retirementIntent(id)));
+		const cleanups = await Promise.all(
+			invalidArtifactIds.map((id) => this.retirementIntent(id, undefined, invalidRefs)),
+		);
 		const objection = createResearchNode({
 			kind: "objection",
 			statement: reason,
@@ -1245,7 +1347,11 @@ export class ResearchJob {
 		return { targetStageId, affectedStageIds, decisionRef, reason, objection, cleanups };
 	}
 
-	private async retirementIntent(artifactId: string, replacementId?: string): Promise<CleanupIntent> {
+	private async retirementIntent(
+		artifactId: string,
+		replacementId?: string,
+		excludedEvidenceIds?: Set<string>,
+	): Promise<CleanupIntent> {
 		const artifact = this.snapshot.canonical[artifactId];
 		if (!artifact || artifact.status === "retired") throw new Error("retirement requires an existing artifact");
 		const evidence = this.snapshot.evidence[artifact.evidenceId];
@@ -1257,6 +1363,11 @@ export class ResearchJob {
 			const reviewerTaskId = this.snapshot.reviews[reviewId]?.reviewerTaskId;
 			return reviewerTaskId ? [reviewerTaskId] : [];
 		});
+		reviewerTaskIds.push(
+			...Object.values(this.snapshot.reviewDeliveryRejections ?? {})
+				.filter((rejection) => rejection.evidenceId === evidence.id)
+				.map((rejection) => rejection.taskId),
+		);
 		const receipt: RetiredArtifactReceipt = {
 			artifactId,
 			type: artifact.type,
@@ -1279,7 +1390,11 @@ export class ResearchJob {
 			receipt,
 			materializationRef: artifact.materializationRef,
 			status: "pending",
-			tasks: await cleanupTaskFiles(this.snapshot, [evidence.taskId, ...reviewerTaskIds]),
+			tasks: await cleanupTaskFiles(
+				this.snapshot,
+				[evidence.taskId, ...reviewerTaskIds],
+				excludedEvidenceIds ?? new Set([evidence.id]),
+			),
 		};
 	}
 
@@ -1287,6 +1402,11 @@ export class ResearchJob {
 	private async finishCleanupsInternal(): Promise<void> {
 		for (const intent of Object.values(this.snapshot.cleanupIntents ?? {})) {
 			if (intent.status === "completed") continue;
+			const evidenceId = intent.receipt.evidenceId;
+			for (const rejection of Object.values(this.snapshot.reviewDeliveryRejections ?? {})) {
+				if (rejection.evidenceId === evidenceId)
+					await this.finishReviewRejectionInternal(this.snapshot.tasks[rejection.taskId], rejection);
+			}
 			const archiveRefs = await archiveAndPruneTasks(this.snapshot, intent.tasks);
 			if (intent.kind === "retirement") {
 				if (intent.materializationRef) await rm(intent.materializationRef, { force: true });
@@ -1345,9 +1465,38 @@ export class ResearchJob {
 		> & { id?: string; agentId?: string; replayKey?: string; attempt?: number },
 	): Promise<TaskPacket> {
 		return this.exclusive(async () => {
+			const replayKey = input.replayKey ?? `${this.snapshot.frame.jobId}:${input.stageId}:${input.objective}`;
+			const registered = Object.values(this.snapshot.tasks);
+			const identified = input.id ? registered.find((task) => task.id === input.id) : undefined;
+			const sameReplay = registered.filter((task) => task.replayKey === replayKey);
+			const prior = identified ?? sameReplay.at(-1);
+			if (prior) {
+				const request = {
+					...input,
+					replayKey,
+					attempt: input.attempt ?? 1,
+					stageRevision: input.stageRevision ?? prior.stageRevision,
+				};
+				const current = this.snapshot.tasks[prior.id] ?? prior;
+				if (identified || current.status !== "failed") {
+					if (
+						(input.id && input.id !== prior.id) ||
+						(input.agentId && input.agentId !== prior.agentId) ||
+						taskDeclaration(request) !== taskDeclaration(prior)
+					)
+						throw new Error(`task identity declaration conflicts with registered history: ${prior.id}`);
+					return structuredClone(current);
+				}
+				if (
+					taskDeclaration(request, true) !== taskDeclaration(prior, true) ||
+					((input.attempt ?? 1) !== prior.attempt &&
+						((input.attempt ?? 1) !== prior.attempt + 1 || input.supersedesTaskId !== prior.id)) ||
+					((input.attempt ?? 1) === prior.attempt && (input.role !== "reviewer" || input.id !== undefined))
+				)
+					throw new Error("task retry declaration differs from its failed predecessor");
+			}
 			await this.finishCleanupsInternal();
 			if (this.snapshot.paused) throw new Error("research job is paused");
-			const replayKey = input.replayKey ?? `${this.snapshot.frame.jobId}:${input.stageId}:${input.objective}`;
 			this.assertCurrentInputs(input.inputArtifactRefs, input.repairOfEvidenceId);
 			let reviewedContract: ReturnType<typeof buildEffectiveTaskContract> | undefined;
 			let legacyReviewedPlan = false;
@@ -1526,6 +1675,22 @@ export class ResearchJob {
 	assertTaskCurrent(taskId: string, packet?: TaskPacket): void {
 		const task = this.snapshot.tasks[taskId];
 		if (!task) throw new Error(`unknown task ${taskId}`);
+		const archive = join(
+			this.snapshot.frame.permissions.workspaceRoot,
+			".astra",
+			"jobs",
+			task.jobId,
+			"archive",
+			"tasks",
+			task.id,
+		);
+		if (
+			taskHasRetainedOwner(this.snapshot, taskId) &&
+			Object.values(this.snapshot.cleanupIntents ?? {}).some(
+				(intent) => intent.status === "completed" && intent.archiveRefs?.includes(archive),
+			)
+		)
+			throw new Error(`retained task files were already pruned; verified restoration is required: ${taskId}`);
 		if (packet) {
 			const { status: _status, version: _version, ...binding } = packet;
 			const { status: _currentStatus, version: _currentVersion, ...current } = task;
@@ -1837,6 +2002,22 @@ export class ResearchJob {
 		input: Omit<Evidence, "id" | "checksum" | "createdAt" | "status"> & { id?: string },
 	): Promise<Evidence> {
 		return this.exclusive(async () => {
+			if (input.id) {
+				const history = await this.store.readEvents(this.snapshot.frame.jobId);
+				checkReviewHistory(history);
+				const registered = history.find(
+					(saved) => saved.event.type === "evidence_recorded" && saved.event.evidence.id === input.id,
+				)?.event;
+				if (registered?.type === "evidence_recorded") {
+					const request = {
+						...input,
+						currentEvidenceSetId: input.currentEvidenceSetId ?? `${input.stageId}::${input.taskId}`,
+					};
+					if (evidenceDeclaration(request) !== evidenceDeclaration(registered.evidence))
+						throw new Error("evidence identity declaration conflicts with registered history");
+					return structuredClone(this.snapshot.evidence[input.id] ?? registered.evidence);
+				}
+			}
 			const evidence = await this.prepareEvidence(input);
 			await this.appendEvent({
 				type: "evidence_recorded",
@@ -1903,9 +2084,12 @@ export class ResearchJob {
 				(next) =>
 					next.supersedesTaskId === task.id || (next.replayKey === task.replayKey && next.attempt > task.attempt),
 			) ||
-			Object.values(this.snapshot.retiredArtifacts).some((receipt) => receipt.taskId === task.id) ||
-			Object.values(this.snapshot.discardedEvidence).some((receipt) => receipt.taskId === task.id) ||
-			Object.values(this.snapshot.discardedCandidates).some((receipt) => receipt.taskId === task.id) ||
+			([
+				...Object.values(this.snapshot.retiredArtifacts),
+				...Object.values(this.snapshot.discardedEvidence),
+				...Object.values(this.snapshot.discardedCandidates),
+			].some((receipt) => receipt.taskId === task.id) &&
+				!taskHasRetainedOwner(this.snapshot, task.id)) ||
 			(task.stageRevision ?? 1) !== (this.snapshot.stages[task.stageId]?.revision ?? 1)
 		)
 			throw new StaleResearchInputError(`completion task identity, attempt or stage is stale: ${task.id}`);
@@ -2206,7 +2390,9 @@ export class ResearchJob {
 				...Object.values(this.snapshot.retiredArtifacts),
 				...Object.values(this.snapshot.discardedEvidence),
 				...Object.values(this.snapshot.discardedCandidates),
-			].map((receipt) => receipt.taskId),
+			]
+				.filter((receipt) => receipt.taskId && !taskHasRetainedOwner(this.snapshot, receipt.taskId))
+				.map((receipt) => receipt.taskId),
 		);
 		for (const task of candidates) {
 			if (superseded.has(task.id) || task.attempt < latestAttempts.get(task.replayKey)! || archived.has(task.id))
@@ -2302,6 +2488,14 @@ export class ResearchJob {
 		)
 			throw new Error("reviewer task identity does not match its frozen target");
 		this.assertTaskCurrent(task.id);
+		this.assertEvidenceCurrent(evidence.id);
+		for (const ref of await this.frozenReviewerReferences(task, evidence)) refs.add(ref);
+		return refs;
+	}
+
+	private async frozenReviewerReferences(task: TaskPacket, evidence: Evidence): Promise<Set<string>> {
+		const source = this.snapshot.tasks[evidence.taskId];
+		const refs = new Set<string>();
 		const [taskBytes, packetBytes, snapshotBytes] = await Promise.all([
 			this.readTaskCompletionFile(task, "task-packet.json"),
 			this.readTaskCompletionFile(task, "review-packet.json"),
@@ -2350,7 +2544,17 @@ export class ResearchJob {
 				})
 		)
 			throw new Error("review completion identity, frozen target or contract mismatch");
-		this.assertEvidenceCurrent(evidence.id, frozen.evidence);
+		if (
+			evidenceDeclaration(frozen.evidence) !== evidenceDeclaration(evidence) ||
+			frozen.evidence.checksum !== evidence.checksum ||
+			checksum({
+				files: frozen.evidence.files,
+				taskVersion: frozen.evidence.taskVersion,
+				versionHash: frozen.evidence.versionHash,
+			}) !==
+				checksum({ files: evidence.files, taskVersion: evidence.taskVersion, versionHash: evidence.versionHash })
+		)
+			throw new Error("review frozen evidence differs from its registered identity");
 		if (frozen.resources !== undefined) {
 			const resources = [...(await taskInputResources(task, this)), ...(await taskInputResources(source, this))].map(
 				({ artifactId, artifactType, taskId, root }) => ({ artifactId, artifactType, taskId, root }),
@@ -2598,6 +2802,97 @@ export class ResearchJob {
 	}
 
 	private async finishReviewRejectionInternal(task: TaskPacket, rejection: ReviewDeliveryRejection): Promise<void> {
+		if (
+			!task ||
+			task.jobId !== this.snapshot.frame.jobId ||
+			task.role !== "reviewer" ||
+			task.id !== rejection.taskId ||
+			task.attempt !== rejection.attempt ||
+			task.inputArtifactRefs[0] !== rejection.evidenceId
+		)
+			throw new Error("rejected review manifest digest or task/target identity changed");
+		const target = this.snapshot.evidence[rejection.evidenceId];
+		if (!target) {
+			const history = await this.store.readEvents(this.snapshot.frame.jobId);
+			checkReviewHistory(history);
+			const recorded = history.find(
+				(saved) => saved.event.type === "evidence_recorded" && saved.event.evidence.id === rejection.evidenceId,
+			)?.event;
+			const rejected = history.find(
+				(saved) => saved.event.type === "review_delivery_rejected" && saved.event.rejection.taskId === task.id,
+			);
+			const intent = Object.values(this.snapshot.cleanupIntents ?? {}).find(
+				(value) => value.receipt.evidenceId === rejection.evidenceId,
+			);
+			const declaredIntent = history
+				.flatMap(({ event }) =>
+					event.type === "cleanup_requested"
+						? [event.intent]
+						: event.type === "canonical_artifact_status"
+							? (event.completion?.cleanups ?? [])
+							: event.type === "stage_reopened"
+								? (event.cleanups ?? [])
+								: event.type === "route_decided" || event.type === "route_consequences_recovered"
+									? (event.consequences?.reopening?.cleanups ?? [])
+									: [],
+				)
+				.find((value) => value.id === intent?.id);
+			if (
+				recorded?.type !== "evidence_recorded" ||
+				recorded.evidence.versionHash !== rejection.targetVersionHash ||
+				rejected?.event.type !== "review_delivery_rejected" ||
+				checksum(rejected.event.rejection) !== checksum(rejection) ||
+				!intent ||
+				!declaredIntent ||
+				checksum(
+					JSON.parse(JSON.stringify({ kind: intent.kind, receipt: intent.receipt, tasks: intent.tasks })),
+				) !==
+					checksum(
+						JSON.parse(
+							JSON.stringify({
+								kind: declaredIntent.kind,
+								receipt: declaredIntent.receipt,
+								tasks: declaredIntent.tasks,
+							}),
+						),
+					) ||
+				intent.receipt.taskId !== recorded.evidence.taskId ||
+				("checksum" in intent.receipt ? intent.receipt.checksum : intent.receipt.evidenceChecksum) !==
+					recorded.evidence.checksum
+			)
+				throw new Error("rejected review manifest digest or task/target identity changed");
+			if (
+				task.status === "failed" &&
+				Object.values(this.snapshot.sessions).every(
+					(session) =>
+						session.taskId !== task.id ||
+						session.role !== "reviewer" ||
+						session.attempt !== task.attempt ||
+						session.status === "failed",
+				)
+			)
+				return;
+			const initial = history[0]?.event;
+			if (initial?.type !== "job_created") throw new Error("rejected review original event prefix unavailable");
+			const original = new ResearchJob(structuredClone(initial.snapshot), this.store, this.definitions);
+			for (const saved of history) {
+				if (saved.seq > rejected.seq) break;
+				original.apply(saved.event, saved.timestamp);
+				original.snapshot.eventSeq = saved.seq;
+				original.snapshot.updatedAt = saved.timestamp;
+			}
+			original.snapshot = normalizeSnapshot(original.snapshot);
+			const originalTask = original.snapshot.tasks[task.id];
+			const originalTarget = original.snapshot.evidence[rejection.evidenceId];
+			if (
+				!originalTask ||
+				!originalTarget ||
+				originalTarget.versionHash !== rejection.targetVersionHash ||
+				checksum(this.completionTaskBinding(originalTask)) !== checksum(this.completionTaskBinding(task))
+			)
+				throw new Error("rejected review original task/target identity changed");
+			await original.frozenReviewerReferences(originalTask, originalTarget);
+		}
 		const bytes = await this.readTaskCompletionFile(task, "review-manifest.json");
 		if (
 			!bytes ||
@@ -2605,9 +2900,10 @@ export class ResearchJob {
 			task.id !== rejection.taskId ||
 			task.attempt !== rejection.attempt ||
 			task.inputArtifactRefs[0] !== rejection.evidenceId ||
-			this.snapshot.evidence[rejection.evidenceId]?.versionHash !== rejection.targetVersionHash
+			(target && target.versionHash !== rejection.targetVersionHash)
 		)
 			throw new Error("rejected review manifest digest or task/target identity changed");
+		if (target) await this.frozenReviewerReferences(task, target);
 		if (task.status !== "failed") await this.appendEvent({ type: "task_status", taskId: task.id, status: "failed" });
 		for (const session of Object.values(this.snapshot.sessions)) {
 			if (
@@ -3275,10 +3571,17 @@ export class ResearchJob {
 				kind: "evidence",
 				receipt,
 				status: "pending",
-				tasks: await cleanupTaskFiles(this.snapshot, [
-					evidence.taskId,
-					...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
-				]),
+				tasks: await cleanupTaskFiles(
+					this.snapshot,
+					[
+						evidence.taskId,
+						...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
+						...Object.values(this.snapshot.reviewDeliveryRejections ?? {})
+							.filter((rejection) => rejection.evidenceId === evidence.id)
+							.map((rejection) => rejection.taskId),
+					],
+					new Set(superseded.map((value) => value.id)),
+				),
 			});
 		}
 		return intents;
@@ -3951,10 +4254,17 @@ export class ResearchJob {
 			kind: "search-candidate",
 			receipt,
 			status: "pending",
-			tasks: await cleanupTaskFiles(this.snapshot, [
-				...(candidate.taskId ? [candidate.taskId] : []),
-				...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
-			]),
+			tasks: await cleanupTaskFiles(
+				this.snapshot,
+				[
+					...(candidate.taskId ? [candidate.taskId] : []),
+					...reviews.flatMap((review) => (review.reviewerTaskId ? [review.reviewerTaskId] : [])),
+					...Object.values(this.snapshot.reviewDeliveryRejections ?? {})
+						.filter((rejection) => rejection.evidenceId === candidate.evidenceId)
+						.map((rejection) => rejection.taskId),
+				],
+				new Set(candidate.evidenceId ? [candidate.evidenceId] : []),
+			),
 		};
 		await this.appendEvent({ type: "cleanup_requested", intent });
 		await this.finishCleanupsInternal();
@@ -4310,10 +4620,16 @@ export class ResearchJob {
 			}
 			if (gate.kind === "budget") {
 				const usage = this.snapshot.budgetUsage ?? { turnsUsed: 0, costUsdUsed: 0 };
+				if (gate.limit !== "maxCostUsd" && gate.requiredMinimum === undefined)
+					throw new Error(
+						"budget gate capacity requirement is missing; keep paused until the pending action is recalculated",
+					);
 				const stillBlocked =
 					(gate.limit === "maxTasks" &&
-						Object.keys(this.snapshot.tasks).length >= this.snapshot.frame.budget.maxTasks) ||
-					(gate.limit === "maxTurns" && usage.turnsUsed >= this.snapshot.frame.budget.maxTurns) ||
+						Math.max(gate.requiredMinimum!, Object.keys(this.snapshot.tasks).length) >
+							this.snapshot.frame.budget.maxTasks) ||
+					(gate.limit === "maxTurns" &&
+						Math.max(gate.requiredMinimum!, usage.turnsUsed) > this.snapshot.frame.budget.maxTurns) ||
 					(gate.limit === "maxCostUsd" &&
 						this.snapshot.frame.budget.maxCostUsd !== undefined &&
 						usage.costUsdUsed >= this.snapshot.frame.budget.maxCostUsd);
@@ -4714,6 +5030,7 @@ export class ResearchJob {
 				if ("workspacePrunedAt" in receipt || intent.kind !== "retirement")
 					(receipt as DiscardedEvidenceReceipt | DiscardedCandidateReceipt).workspacePrunedAt = event.completedAt;
 				for (const task of intent.tasks) {
+					if (taskHasRetainedOwner(this.snapshot, task.taskId)) continue;
 					for (const session of Object.values(this.snapshot.sessions)) {
 						if (session.taskId !== task.taskId) continue;
 						const saved = task.sessions.find((entry) => entry.sessionId === session.sessionId);
@@ -4788,7 +5105,7 @@ export class ResearchJob {
 				delete this.snapshot.evidence[event.receipt.evidenceId];
 				for (const reviewId of event.receipt.reviewIds) delete this.snapshot.reviews[reviewId];
 				for (const session of Object.values(this.snapshot.sessions)) {
-					if (!prunedTaskIds.has(session.taskId)) continue;
+					if (!prunedTaskIds.has(session.taskId) || taskHasRetainedOwner(this.snapshot, session.taskId)) continue;
 					session.sessionFile = undefined;
 					session.manifestRef = undefined;
 				}
@@ -5017,6 +5334,7 @@ export class ResearchJob {
 					for (const session of Object.values(this.snapshot.sessions)) {
 						if (session.taskId !== event.receipt.taskId && !prunedReviewerTaskIds.includes(session.taskId))
 							continue;
+						if (taskHasRetainedOwner(this.snapshot, session.taskId)) continue;
 						session.sessionFile = undefined;
 						session.manifestRef = undefined;
 					}
@@ -5035,7 +5353,7 @@ export class ResearchJob {
 				delete this.snapshot.evidence[event.receipt.evidenceId];
 				for (const reviewId of event.receipt.reviewIds) delete this.snapshot.reviews[reviewId];
 				for (const session of Object.values(this.snapshot.sessions)) {
-					if (!prunedTaskIds.has(session.taskId)) continue;
+					if (!prunedTaskIds.has(session.taskId) || taskHasRetainedOwner(this.snapshot, session.taskId)) continue;
 					session.sessionFile = undefined;
 					session.manifestRef = undefined;
 				}

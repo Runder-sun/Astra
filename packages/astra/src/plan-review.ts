@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import {
 	backtrackChecksFromSnapshot,
 	buildEffectiveTaskContractFromSnapshot,
@@ -102,9 +103,7 @@ function currentPlanBasis(snapshot: JobSnapshot, planId: string, evidence: Evide
 	return (
 		evidence.status !== "rejected" &&
 		!snapshot.discardedEvidence[evidence.id] &&
-		!Object.values(snapshot.discardedCandidates).some(
-			(receipt) => receipt.evidenceId === evidence.id || receipt.taskId === evidence.taskId,
-		) &&
+		!Object.values(snapshot.discardedCandidates).some((receipt) => receipt.evidenceId === evidence.id) &&
 		taskIdentityIsCurrent(snapshot, snapshot.tasks[evidence.taskId]) &&
 		planBasisUnchanged(snapshot, planId, evidence)
 	);
@@ -279,7 +278,7 @@ export function evidenceHasCurrentPlanApprovalFromSnapshot(snapshot: JobSnapshot
 	return taskIsCurrentFromSnapshot(snapshot, worker);
 }
 
-function taskIdentityIsCurrent(snapshot: JobSnapshot, task: TaskPacket): boolean {
+function taskBindingIsCurrent(snapshot: JobSnapshot, task: TaskPacket): boolean {
 	if (
 		!task ||
 		task.jobId !== snapshot.frame.jobId ||
@@ -289,15 +288,63 @@ function taskIdentityIsCurrent(snapshot: JobSnapshot, task: TaskPacket): boolean
 		Object.values(snapshot.tasks).some(
 			(next) =>
 				next.supersedesTaskId === task.id || (next.replayKey === task.replayKey && next.attempt > task.attempt),
-		) ||
-		[
-			...Object.values(snapshot.retiredArtifacts),
-			...Object.values(snapshot.discardedEvidence),
-			...Object.values(snapshot.discardedCandidates),
-		].some((receipt) => receipt.taskId === task.id)
+		)
 	)
 		return false;
 	return true;
+}
+
+/** Retained evidence and current unfinished consumers own source files; historical task rows do not. */
+export function taskHasRetainedOwner(
+	snapshot: JobSnapshot,
+	taskId: string,
+	excludedEvidenceIds = new Set<string>(),
+): boolean {
+	const retained = Object.values(snapshot.evidence).filter(
+		(evidence) =>
+			!excludedEvidenceIds.has(evidence.id) &&
+			taskBindingIsCurrent(snapshot, snapshot.tasks[evidence.taskId]) &&
+			!snapshot.discardedEvidence[evidence.id] &&
+			!Object.values(snapshot.retiredArtifacts).some((receipt) => receipt.evidenceId === evidence.id) &&
+			!Object.values(snapshot.discardedCandidates).some((receipt) => receipt.evidenceId === evidence.id),
+	);
+	if (retained.some((evidence) => evidence.taskId === taskId)) return true;
+	return Object.values(snapshot.tasks).some((consumer) => {
+		if (!["ready", "running"].includes(consumer.status) || !taskBindingIsCurrent(snapshot, consumer)) return false;
+		if (consumer.id === taskId) return true;
+		if (consumer.supersedesTaskId === taskId) return true;
+		return consumer.inputArtifactRefs.some((ref) => {
+			const evidence = retained.find((value) => value.id === (snapshot.canonical[ref]?.evidenceId ?? ref));
+			return evidence?.taskId === taskId;
+		});
+	});
+}
+
+function taskIdentityIsCurrent(snapshot: JobSnapshot, task: TaskPacket): boolean {
+	return (
+		taskBindingIsCurrent(snapshot, task) &&
+		!Object.values(snapshot.cleanupIntents ?? {}).some(
+			(intent) =>
+				intent.status === "completed" &&
+				intent.archiveRefs?.includes(
+					join(
+						snapshot.frame.permissions.workspaceRoot,
+						".astra",
+						"jobs",
+						task.jobId,
+						"archive",
+						"tasks",
+						task.id,
+					),
+				),
+		) &&
+		(![
+			...Object.values(snapshot.retiredArtifacts),
+			...Object.values(snapshot.discardedEvidence),
+			...Object.values(snapshot.discardedCandidates),
+		].some((receipt) => receipt.taskId === task.id) ||
+			taskHasRetainedOwner(snapshot, task.id))
+	);
 }
 
 /** The original frozen input and exact winner, not a shared lineage label, authorize a repair comparison. */
@@ -444,7 +491,7 @@ export function planReviewStatusFromSnapshot(
 			source &&
 			(!taskIsCurrentFromSnapshot(snapshot, source) ||
 				[...Object.values(snapshot.discardedEvidence), ...Object.values(snapshot.discardedCandidates)].some(
-					(receipt) => receipt.taskId === source.id,
+					(receipt) => receipt.taskId === source.id && !taskHasRetainedOwner(snapshot, source.id),
 				))
 		)
 			return "stale";

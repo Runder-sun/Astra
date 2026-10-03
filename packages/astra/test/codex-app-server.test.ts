@@ -341,6 +341,66 @@ it("F03-07 a budget expiring while a completed turn drains a host tool cannot be
 });
 
 describe("official Codex app-server transport", () => {
+	it("C7 buffers a legitimate host request before turn/start responds and drains it before validation", async () => {
+		const request = await options("pre-response-host");
+		const execute = vi.fn(async () => ({ receipt: "current" }));
+		request.tools = [
+			{ name: "audit_tool", description: "offline", inputSchema: Type.Object({ query: Type.String() }), execute },
+		];
+		expect(
+			(await runner.run({ ...request, validateOutput: () => expect(execute).toHaveBeenCalledOnce() })).output,
+		).toEqual({ answer: "ok" });
+		expect(execute).toHaveBeenCalledWith({ query: "early" });
+	});
+	it("C7 retains current flat turn notifications and excludes old flat updates", async () => {
+		const request = await options("turn-identity-flat");
+		await runner.run(request);
+		const updates = (await readFile(request.logPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line))
+			.filter((row) => ["turn/diff/updated", "turn/plan/updated"].includes(row.method));
+		expect(updates).toHaveLength(2);
+		expect(updates.every((row) => row.params.turnId === "turn-1")).toBe(true);
+	});
+	it.each(["message", "completion", "error", "search", "tool", "started", "pre-response"])(
+		"C7 binds correction to its response turn and excludes stale %s notifications",
+		async (kind) => {
+			const request = await options(`turn-identity-${kind}`);
+			const execute = vi.fn(async () => ({}));
+			const observe = vi.fn(async () => {});
+			request.webSearch = true;
+			request.onWebSearch = observe;
+			request.maxToolCalls = 0;
+			request.tools = [
+				{ name: "audit_tool", description: "offline", inputSchema: Type.Object({ query: Type.String() }), execute },
+			];
+			const validate = vi.fn((output: { answer: string }) => {
+				if (output.answer === "draft") throw new Error("correct the draft");
+			});
+			expect((await runner.run({ ...request, validateOutput: validate })).output).toEqual({ answer: "corrected" });
+			expect(validate).toHaveBeenCalledTimes(2);
+			expect(execute).not.toHaveBeenCalled();
+			expect(observe).not.toHaveBeenCalled();
+			if (kind === "started") {
+				const events = (await readFile(request.logPath, "utf8"))
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(events.filter((row) => row.method === "turn/started").map((row) => row.params.turn.id)).toEqual([
+					"turn-1",
+					"turn-2",
+				]);
+			}
+			if (kind === "tool") {
+				const calls = (await readFile(join(request.cwd, "requests.jsonl"), "utf8"))
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(calls.find((call) => call.id === "stale-tool")?.error).toMatchObject({ code: -32600 });
+			}
+		},
+	);
 	it("bounds final-output correction to one attempt and retains both rejection records", async () => {
 		const request = await options();
 		const validateOutput = vi.fn(() => {

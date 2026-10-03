@@ -26,6 +26,7 @@ interface RunState {
 	output: string;
 	error?: string;
 	pauseRequested?: boolean;
+	jobId?: string;
 }
 
 export async function startWorkbench(options: { root: string; watch?: string[]; port?: number; runnerPath?: string }) {
@@ -47,15 +48,23 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 	}
 	async function snapshot(entry: Entry): Promise<JobSnapshot | undefined> {
 		try {
-			const active = JSON.parse(await readFile(join(entry.root, ".astra/active-job.json"), "utf8")) as {
-				jobId: string;
-			};
+			const owned = running.get(entry.id);
+			const active =
+				owned?.child && owned.jobId
+					? { jobId: owned.jobId }
+					: (JSON.parse(await readFile(join(entry.root, ".astra/active-job.json"), "utf8")) as {
+							jobId: string;
+						});
 			assertAstraId(active.jobId, "job id");
 			return (await ResearchJob.open(new JsonlAstraStore(entry.root), active.jobId))?.state;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
 		}
+	}
+	function displayedRun(entry: Entry, state: JobSnapshot | undefined): RunState | undefined {
+		const execution = running.get(entry.id);
+		return state && execution?.jobId && execution.jobId !== state.frame.jobId ? undefined : execution;
 	}
 	function launch(entry: Entry, request: ResearchControlRequest) {
 		if (running.get(entry.id)?.child) throw new Error("当前任务已有执行进程，请勿重复启动");
@@ -67,25 +76,47 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				options.runnerPath ??
 					fileURLToPath(new URL(`./workbench-runner${extname(fileURLToPath(import.meta.url))}`, import.meta.url)),
 			],
-			{ cwd: entry.root, env, stdio: ["pipe", "pipe", "pipe"] },
+			{ cwd: entry.root, env, stdio: ["pipe", "pipe", "pipe", "ipc"] },
 		);
-		const state: RunState = { child, output: "" };
+		const state: RunState = { child, output: "", jobId: request.jobId };
 		running.set(entry.id, state);
 		const collect = (chunk: Buffer) => {
 			state.output = (state.output + chunk.toString()).slice(-16000);
 		};
 		child.stdout?.on("data", collect);
 		child.stderr?.on("data", collect);
+		child.on("message", (message: unknown) => {
+			if (
+				!message ||
+				typeof message !== "object" ||
+				!("type" in message) ||
+				message.type !== "astra/job-published" ||
+				!("jobId" in message) ||
+				typeof message.jobId !== "string"
+			)
+				return;
+			try {
+				assertAstraId(message.jobId, "job id");
+				if (state.jobId && state.jobId !== message.jobId) throw new Error("执行进程发布的研究身份不一致");
+				state.jobId = message.jobId;
+				if (state.pauseRequested) state.child?.kill("SIGINT");
+			} catch (error) {
+				state.error = error instanceof Error ? error.message : String(error);
+			}
+		});
 		child.on("error", (error) => {
 			state.error = error.message;
 		});
 		child.on("close", (code, signal) => {
 			state.child = undefined;
+			if (!state.jobId)
+				state.error = `${state.error ? `${state.error}\n` : ""}执行进程退出前没有发布研究身份，无法确认控制目标`;
 			if (code !== 0) state.error ??= `执行进程退出（${signal ?? code}），请查看运行输出与任务状态`;
 			void writeFile(join(entry.root, "workbench-output.log"), state.output).catch((error) => {
 				state.error = String(error);
 			});
-			if (state.pauseRequested) launch(entry, { action: "pause", reason: "用户从工作台暂停" });
+			if (state.pauseRequested && state.jobId)
+				launch(entry, { action: "pause", jobId: state.jobId, reason: "用户从工作台暂停" });
 		});
 		child.stdin?.on("error", (error) => {
 			state.error = error.message;
@@ -137,13 +168,14 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 					[...entries.values()].map(async (entry) => {
 						try {
 							const state = await snapshot(entry);
+							const execution = displayedRun(entry, state);
 							return {
 								...entry,
 								frame: state?.frame,
 								paused: state?.paused,
 								updatedAt: state?.updatedAt,
-								running: Boolean(running.get(entry.id)?.child),
-								error: running.get(entry.id)?.error,
+								running: Boolean(execution?.child),
+								error: execution?.error,
 							};
 						} catch (error) {
 							return { ...entry, error: String(error) };
@@ -156,13 +188,14 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 			const entry = entries.get(url.searchParams.get("id") ?? "");
 			if (req.method === "GET" && url.pathname === "/api/job" && entry) {
 				const state = await snapshot(entry);
+				const execution = displayedRun(entry, state);
 				json(200, {
 					...entry,
 					snapshot: state,
 					milestones: state ? researchMilestones(state) : [],
-					running: Boolean(running.get(entry.id)?.child),
-					output: running.get(entry.id)?.output ?? "",
-					error: running.get(entry.id)?.error,
+					running: Boolean(execution?.child),
+					output: execution?.output ?? "",
+					error: execution?.error,
 				});
 				return;
 			}
@@ -242,14 +275,17 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 			if (url.pathname === "/api/pause") {
 				const processState = running.get(entry.id);
 				if (!processState?.child) throw new Error("工作台没有正在执行的进程");
+				if (processState.jobId ? input.jobId !== processState.jobId : input.jobId !== undefined)
+					throw new Error("页面研究目标已变化，请刷新后操作");
 				processState.pauseRequested = true;
-				processState.child.kill("SIGINT");
+				if (processState.jobId) processState.child.kill("SIGINT");
 				json(202, { id: entry.id });
 				return;
 			}
 			if (url.pathname === "/api/resume") {
 				const state = await snapshot(entry);
 				if (!state || state.frame.status === "completed") throw new Error("当前任务不存在或已经完成");
+				if (input.jobId !== state.frame.jobId) throw new Error("页面研究目标已变化，请刷新后操作");
 				if (!state.paused) throw new Error("仅可继续已暂停的任务");
 				if (input.guidance !== undefined && (typeof input.guidance !== "string" || input.guidance.length > 10000))
 					throw new Error("补充说明格式不正确");
@@ -263,6 +299,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 					throw new Error("预算不能小于已创建的任务数或超过 144");
 				launch(entry, {
 					action: "resume",
+					jobId: state.frame.jobId,
 					backend: "codex",
 					...(typeof input.maxTasks === "number"
 						? { maxTasks: input.maxTasks, maxTurns: Math.max(state.frame.budget.maxTurns, input.maxTasks * 4) }

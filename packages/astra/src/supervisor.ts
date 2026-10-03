@@ -869,6 +869,7 @@ export class ResearchSupervisor {
 			kind: "budget",
 			stageId,
 			limit: block.limit,
+			requiredMinimum: block.requiredMinimum,
 			reason: block.reason,
 		});
 		return true;
@@ -941,8 +942,12 @@ export class ResearchSupervisor {
 					return undefined;
 				}
 				const attempt = prior?.status === "failed" ? prior.attempt + 1 : (prior?.attempt ?? 1);
-				const taskId = `task_${checksum({ planId: plan.id, taskKey: planned.key, attempt }).slice(0, 24)}`;
+				const taskId =
+					prior && prior.status !== "failed"
+						? prior.id
+						: `task_${checksum({ planId: plan.id, taskKey: planned.key, attempt }).slice(0, 24)}`;
 				return this.job.dispatchTask({
+					...(prior && "inputVersions" in prior ? { inputVersions: prior.inputVersions } : {}),
 					planId: plan.id,
 					effectiveContractHash: semanticContractHash(contract),
 					responsibilityBindings: contract.responsibilityBindings,
