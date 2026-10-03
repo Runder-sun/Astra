@@ -88,9 +88,14 @@ describe("Astra research control commands", () => {
 			1,
 			{ action: "run", objective: "durable literature review" },
 			"/workspace",
+			expect.any(Function),
 		);
-		expect(control.run).toHaveBeenNthCalledWith(2, { action: "pause", reason: "operator requested" }, "/workspace");
-		expect(control.run).toHaveBeenNthCalledWith(3, { action: "resume" }, "/workspace");
+		expect(control.run).toHaveBeenNthCalledWith(
+			2,
+			{ action: "pause", reason: "operator requested", jobId: "job_control" },
+			"/workspace",
+		);
+		expect(control.run).toHaveBeenNthCalledWith(3, { action: "resume", jobId: "job_control" }, "/workspace");
 		expect(fixture.appendEntry).toHaveBeenCalledTimes(3);
 		expect(fixture.sendMessage).toHaveBeenCalledTimes(3);
 	});

@@ -21,6 +21,7 @@ import { transferableResponsibilityCandidatesFromSnapshot } from "./effective-co
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
 import type { ResearchJob } from "./research.ts";
 import { checksum } from "./research.ts";
+import { frozenReviewCriteria } from "./review-validation.ts";
 import {
 	NonRetryableResearchError,
 	ProviderCapacityError,
@@ -789,7 +790,7 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 			},
 			task.scope.workspaceRoot,
 		);
-		const frozenCriteria = [...new Set([...workerTask.acceptanceChecks, ...workerTask.successCriteria])];
+		const frozenCriteria = frozenReviewCriteria(workerTask);
 		const sessionId = safeSessionId(task.jobId, task.id, task.attempt);
 		await job.recordChildSession({
 			sessionId,
@@ -803,7 +804,7 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 		const result = await this.runner.runTask(
 			task,
 			"reviewer",
-			`You are an independent Astra reviewer. Read review-packet.json and review-target-snapshot.json from the current directory; do not search parent directories, job logs, or session transcripts. Judge only the current ${evidence.stageId} stage artifact against stageContract and workerContract. Review evidence ${evidence.id} from the immutable snapshot and inspect every relevant file listed in resolvedEvidenceRefs before passing a criterion that depends on it. If the worker claims a required file but resolvedEvidenceRefs does not contain it, fail the corresponding criterion. Source identifiers and Pi session refs remain provenance pointers and are not local files. Do not evaluate overall mission completion: future experiment, result, paper, or final mission deliverables are out of scope unless the current stage contract explicitly requires them. In astra_submit_review, include every workerContract.acceptanceChecks and workerContract.successCriteria string as a separate criterion, deduplicated only when the strings are identical, and copy each string exactly, including case and punctuation; do not paraphrase or normalize them. A pass verdict requires every frozen criterion to have passed=true. Call astra_submit_review exactly once with criterion-level scores, verified refs, pass, fail, partial, or blocked, and concrete findings. Do not modify canonical artifacts.`,
+			`You are an independent Astra reviewer. Read review-packet.json and review-target-snapshot.json from the current directory; do not search parent directories, job logs, or session transcripts. Judge only the current ${evidence.stageId} stage artifact against stageContract and workerContract. Review evidence ${evidence.id} from the immutable snapshot and inspect every relevant file listed in resolvedEvidenceRefs before passing a criterion that depends on it. If the worker claims a required file but resolvedEvidenceRefs does not contain it, fail the corresponding criterion. Source identifiers and Pi session refs remain provenance pointers and are not local files. Do not evaluate overall mission completion: future experiment, result, paper, or final mission deliverables are out of scope unless the current stage contract explicitly requires them. In astra_submit_review, include every frozen criterion from ASTRA_REVIEW_CRITERIA (the union of worker acceptance checks, success criteria and repair checks) as a separate criterion, deduplicated only when the strings are identical, and copy each string exactly, including case and punctuation; do not paraphrase or normalize them. A pass verdict requires every frozen criterion to have passed=true. Call astra_submit_review exactly once with criterion-level scores, verified refs, pass, fail, partial, or blocked, and concrete findings. Do not modify canonical artifacts.\nFrozen review criteria: ${JSON.stringify(frozenCriteria)}`,
 			{
 				ASTRA_EVIDENCE_ID: evidence.id,
 				ASTRA_REVIEW_CRITERIA: JSON.stringify(frozenCriteria),
@@ -837,6 +838,39 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 				updatedAt: new Date().toISOString(),
 			});
 			throw new Error(`Pi reviewer exited with ${result.exitCode}: ${result.stderr}`);
+		}
+		for (const event of result.jsonEvents) {
+			if (!event || typeof event !== "object") continue;
+			const toolEvent = event as { type?: unknown; toolName?: unknown; result?: { details?: unknown } };
+			if (toolEvent.type !== "tool_execution_end" || toolEvent.toolName !== "astra_submit_review") continue;
+			const details = toolEvent.result?.details;
+			if (!details || typeof details !== "object") continue;
+			const failure = details as {
+				schemaVersion?: unknown;
+				jobId?: unknown;
+				taskId?: unknown;
+				attempt?: unknown;
+				error?: unknown;
+			};
+			if (failure.schemaVersion !== "astra.reviewer_failure.v1") continue;
+			const reason =
+				failure.jobId === task.jobId &&
+				failure.taskId === task.id &&
+				failure.attempt === task.attempt &&
+				typeof failure.error === "string"
+					? failure.error
+					: "reviewer failure identity does not match TaskPacket";
+			await job.setTaskStatus(task.id, "failed");
+			await job.recordChildSession({
+				sessionId,
+				role: "reviewer",
+				taskId: task.id,
+				status: "failed",
+				attempt: task.attempt,
+				error: reason,
+				updatedAt: new Date().toISOString(),
+			});
+			throw new NonRetryableResearchError(reason);
 		}
 		const path = join(
 			task.scope.workspaceRoot,

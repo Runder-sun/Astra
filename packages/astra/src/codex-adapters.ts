@@ -43,7 +43,7 @@ import { searchLiterature } from "./literature-search.ts";
 import { loadStageSkills } from "./memory.ts";
 import { planDispatchAdditionsFromSnapshot } from "./plan-review.ts";
 import { checksum, type ResearchJob } from "./research.ts";
-import { groupRepairCriteria, validateReviewAssessment } from "./review-validation.ts";
+import { frozenReviewCriteria, groupRepairCriteria, validateReviewAssessment } from "./review-validation.ts";
 import { captureSourcePage } from "./source-capture.ts";
 import {
 	NonRetryableResearchError,
@@ -478,13 +478,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	async review(evidence: Evidence, job: ResearchJob): Promise<ReviewerRunResult> {
 		job.assertEvidenceCurrent(evidence.id, evidence);
 		const sourceTask = job.state.tasks[evidence.taskId];
-		const required = [
-			...new Set([
-				...sourceTask.acceptanceChecks,
-				...sourceTask.successCriteria,
-				...(sourceTask.repairChecks ?? []).map((check) => check.criterion),
-			]),
-		];
+		const required = frozenReviewCriteria(sourceTask);
 		const reviewCriteria = groupRepairCriteria(
 			required,
 			new Set(Object.values(job.state.obligations).flatMap((issue) => (issue.items ?? []).map((item) => item.id))),
@@ -601,18 +595,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 				task.scope.workspaceRoot,
 			);
 			await job.setTaskStatus(task.id, "running");
-			const allowedRefs = new Set([
-				"review-packet.json",
-				"review-target-snapshot.json",
-				"review-criteria.json",
-				targetEvidenceRef,
-				`evidence:${evidence.id}`,
-				evidence.id,
-				...evidence.refs,
-				...sourceTask.inputArtifactRefs,
-				...resources.map((resource) => resource.artifactId),
-				...resolvedEvidenceRefs.flatMap((ref) => [ref.sourceRef, ref.path]),
-			]);
+			const allowedRefs = await job.reviewReferences(evidence.id, task.id);
 			const skills = await loadStageSkills(task.scope.workspaceRoot, task.stageId, "reviewer");
 			const reviewSchema = codexReviewSchema(presentedCriteria, [...allowedRefs]);
 			const reviews = new Map<string, Static<typeof reviewSchema>>();
@@ -637,6 +620,14 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 				)
 					throw new NonRetryableResearchError("Codex review cited evidence outside its packet");
 			};
+			const expandReview = (review: Static<typeof reviewSchema>) => ({
+				...review,
+				criteria: review.criteria.flatMap((assessment) =>
+					reviewCriteria
+						.find((group) => group.criterion === assessment.criterion)!
+						.frozenCriteria.map((criterion) => ({ ...assessment, criterion })),
+				),
+			});
 			const resolveReviewOutput = (output: Static<typeof finalSchema>) => {
 				const { astraValidatedReview, ...assessment } = output;
 				let review: Static<typeof reviewSchema> = assessment;
@@ -689,6 +680,11 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 							execute: async (input) => {
 								const draft = structuredClone(input as Static<typeof reviewSchema>);
 								validateReview(draft);
+								await job.validateReview({
+									...expandReview(draft),
+									evidenceId: evidence.id,
+									reviewerTaskId: task.id,
+								});
 								// Receipts address this invocation's map; artifact integrity uses separate hashes.
 								const receipt = `review-${reviews.size + 1}`;
 								reviews.set(receipt, draft);
@@ -714,15 +710,8 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 				},
 				async (result) => {
 					const review = resolveReviewOutput(result.output);
-					const expandedReview = {
-						...review,
-						criteria: review.criteria.flatMap((assessment) =>
-							reviewCriteria
-								.find((group) => group.criterion === assessment.criterion)!
-								.frozenCriteria.map((criterion) => ({ ...assessment, criterion })),
-						),
-					};
-					validateReviewAssessment(expandedReview, required);
+					const expandedReview = expandReview(review);
+					await job.validateReview({ ...expandedReview, evidenceId: evidence.id, reviewerTaskId: task.id });
 					const manifestRef = await writeReviewerOutputManifest(
 						{
 							...expandedReview,

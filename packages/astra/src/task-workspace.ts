@@ -14,15 +14,79 @@ import {
 } from "./contracts.ts";
 import { sourceTaskContractHash } from "./effective-contract.ts";
 import { readSourceReceipt, sourceReceiptFilename } from "./literature.ts";
-import type { ResearchJob } from "./research.ts";
+import { checksum, type ResearchJob } from "./research.ts";
 import type {
 	Evidence,
 	EvidenceFileVersion,
 	OutputRef,
+	ReviewPacket,
 	TaskPacket,
 	TaskRecoveryMaterials,
 	WorkerOutputManifest,
 } from "./types.ts";
+
+/** Verify the declared copies as ordinary files; never regenerate a reviewer's damaged bundle. */
+export async function verifyReviewEvidenceBundle(
+	task: TaskPacket,
+	evidence: Evidence,
+	packet: ReviewPacket,
+	job: ResearchJob,
+): Promise<void> {
+	const root = resolve(taskDir(task.scope.workspaceRoot, task.jobId, task.id));
+	const rootReal = await realpath(root);
+	const expected = await collectReviewEvidenceBundle(task, evidence, job, false);
+	if (expected.length !== packet.resolvedEvidenceRefs.length)
+		throw new Error("review frozen file declarations differ from their bound sources");
+	for (const file of expected) {
+		const actual = packet.resolvedEvidenceRefs.find(
+			(ref) => ref.sourceRef === file.sourceRef && ref.path === file.path,
+		);
+		if (!actual || (!file.path.startsWith("input-evidence/") && actual.sha256 !== file.sha256))
+			throw new Error(`review frozen file binding is missing or has the wrong version: ${file.sourceRef}`);
+	}
+	const seen = new Set<string>();
+	for (const ref of packet.resolvedEvidenceRefs) {
+		if (
+			!ref ||
+			typeof ref.path !== "string" ||
+			typeof ref.sourceRef !== "string" ||
+			!/^[a-f0-9]{64}$/.test(ref.sha256)
+		)
+			throw new Error("invalid review evidence file declaration");
+		const path = resolve(root, ref.path);
+		if (isAbsolute(ref.path) || !isInside(root, path) || path === root || seen.has(path))
+			throw new Error(`review evidence path is outside its bundle or duplicated: ${ref.path}`);
+		seen.add(path);
+		let parent = root;
+		for (const component of relative(root, path).split(/[\\/]/)) {
+			parent = join(parent, component);
+			if ((await lstat(parent)).isSymbolicLink())
+				throw new Error(`review evidence may not use symbolic links: ${ref.path}`);
+		}
+		if (!(await lstat(path)).isFile() || (await realpath(path)) !== join(rootReal, relative(root, path)))
+			throw new Error(`review evidence is not an ordinary bundle file: ${ref.path}`);
+		const bytes = await readFile(path);
+		if (createHash("sha256").update(bytes).digest("hex") !== ref.sha256)
+			throw new Error(`review evidence file integrity failure: ${ref.path}`);
+		if (ref.path.startsWith("input-evidence/")) {
+			const id = ref.path.slice("input-evidence/".length, -".json".length);
+			const input = job.state.evidence[id];
+			const saved = JSON.parse(bytes.toString("utf8")) as Evidence;
+			const immutable = (value: Evidence) =>
+				JSON.parse(
+					JSON.stringify({
+						...value,
+						status: undefined,
+						acceptanceAuthority: undefined,
+						mainAgentDecisionRef: undefined,
+						supersededByTaskId: undefined,
+					}),
+				) as unknown;
+			if (!input || checksum(immutable(saved)) !== checksum(immutable(input)))
+				throw new Error("review upstream evidence frozen identity mismatch");
+		}
+	}
+}
 
 const RESEARCH_REVIEW_FIELDS: Record<string, string[]> = {
 	validation: ["researchQuestion", "scope", "nonGoals", "acceptanceCriteria", "falsifiableNextStep"],
@@ -93,6 +157,8 @@ export interface TaskInputResource {
 export async function taskInputResources(task: TaskPacket, job: ResearchJob): Promise<TaskInputResource[]> {
 	const snapshot = job.state;
 	const resources: TaskInputResource[] = [];
+	const project = resolve(task.scope.workspaceRoot);
+	const projectReal = await realpath(project);
 	for (const ref of new Set(task.inputArtifactRefs)) {
 		const artifact = snapshot.canonical[ref];
 		const evidence = snapshot.evidence[artifact?.evidenceId ?? ref];
@@ -100,7 +166,7 @@ export async function taskInputResources(task: TaskPacket, job: ResearchJob): Pr
 		const root = taskResourcePath(task.scope.workspaceRoot, task.jobId, evidence.taskId);
 		try {
 			const metadata = await lstat(root);
-			if (metadata.isSymbolicLink()) {
+			if (metadata.isSymbolicLink() || (await realpath(root)) !== join(projectReal, relative(project, root))) {
 				throw new Error(`upstream task resource may not use a symbolic link: ${evidence.taskId}`);
 			}
 			if (metadata.isDirectory()) {
@@ -129,7 +195,7 @@ export async function taskInputResources(task: TaskPacket, job: ResearchJob): Pr
 		if (!receipt.archiveRefs?.includes(root)) continue;
 		try {
 			const metadata = await lstat(root);
-			if (metadata.isSymbolicLink())
+			if (metadata.isSymbolicLink() || (await realpath(root)) !== join(projectReal, relative(project, root)))
 				throw new Error(`retired task archive may not use a symbolic link: ${receipt.taskId}`);
 			if (metadata.isDirectory())
 				resources.push({
@@ -620,10 +686,11 @@ export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): 
 	return workspace;
 }
 
-export async function prepareReviewEvidenceBundle(
+async function collectReviewEvidenceBundle(
 	task: TaskPacket,
 	evidence: Evidence,
 	job: ResearchJob,
+	publish: boolean,
 ): Promise<Array<{ sourceRef: string; path: string; sha256: string }>> {
 	const projectRoot = resolve(task.scope.workspaceRoot);
 	const sourceWorkspace = taskWorkspacePath(projectRoot, task.jobId, evidence.taskId);
@@ -647,7 +714,7 @@ export async function prepareReviewEvidenceBundle(
 		const copyKey = `${sourceRef}\0${sha256}`;
 		if (copiedSources.has(copyKey)) return;
 		if (sourceReceiptFilename(originalRef)) path = join("sources", sha256, basename(path));
-		await writeEvidenceFile(reviewRoot, path, content);
+		if (publish) await writeEvidenceFile(reviewRoot, path, content);
 		copiedSources.add(copyKey);
 		bundle.push({
 			sourceRef,
@@ -675,7 +742,7 @@ export async function prepareReviewEvidenceBundle(
 	const sourceTask = job.state.tasks[evidence.taskId];
 	if (!sourceTask) throw new Error(`source task not found for review evidence: ${evidence.id}`);
 	for (const file of await observedExecutionFiles(sourceTask)) {
-		await writeEvidenceFile(reviewRoot, file.path, file.content);
+		if (publish) await writeEvidenceFile(reviewRoot, file.path, file.content);
 		bundle.push({
 			sourceRef: file.sourceRef,
 			path: file.path,
@@ -685,7 +752,7 @@ export async function prepareReviewEvidenceBundle(
 	const canonicalRoot = join(projectRoot, ".astra", "jobs", task.jobId, "canonical");
 	for (const inputRef of sourceTask.inputArtifactRefs) {
 		for (const file of await repairSourceFiles(sourceTask, job, inputRef)) {
-			await writeEvidenceFile(reviewRoot, file.path, file.content);
+			if (publish) await writeEvidenceFile(reviewRoot, file.path, file.content);
 			bundle.push({
 				sourceRef: file.sourceRef,
 				path: file.path,
@@ -706,7 +773,7 @@ export async function prepareReviewEvidenceBundle(
 			job.state.tasks[upstreamEvidence.taskId],
 			`inputs/${inputRef}/`,
 		)) {
-			await writeEvidenceFile(reviewRoot, file.path, file.content);
+			if (publish) await writeEvidenceFile(reviewRoot, file.path, file.content);
 			bundle.push({
 				sourceRef: file.sourceRef,
 				path: file.path,
@@ -716,7 +783,7 @@ export async function prepareReviewEvidenceBundle(
 		if (!artifact) {
 			const path = join("input-evidence", `${inputRef}.json`).split("\\").join("/");
 			const content = Buffer.from(JSON.stringify(upstreamEvidence, null, 2));
-			await writeEvidenceFile(reviewRoot, path, content);
+			if (publish) await writeEvidenceFile(reviewRoot, path, content);
 			bundle.push({ sourceRef: path, path, sha256: createHash("sha256").update(content).digest("hex") });
 		}
 		const upstreamWorkspace = taskWorkspacePath(projectRoot, task.jobId, upstreamEvidence.taskId);
@@ -739,4 +806,12 @@ export async function prepareReviewEvidenceBundle(
 		}
 	}
 	return bundle;
+}
+
+export async function prepareReviewEvidenceBundle(
+	task: TaskPacket,
+	evidence: Evidence,
+	job: ResearchJob,
+): Promise<Array<{ sourceRef: string; path: string; sha256: string }>> {
+	return collectReviewEvidenceBundle(task, evidence, job, true);
 }

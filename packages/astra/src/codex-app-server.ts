@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
+import { ReviewIntegrityError } from "./review-validation.ts";
 import { NonRetryableResearchError, ProviderCapacityError } from "./supervisor.ts";
 
 export interface CodexTool {
@@ -416,6 +417,10 @@ export class CodexAppServerRunner {
 								result: { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(value) }] },
 							});
 						} catch (error) {
+							if (error instanceof ReviewIntegrityError) {
+								terminate(error);
+								return;
+							}
 							connection.send({
 								id: message.id,
 								result: {

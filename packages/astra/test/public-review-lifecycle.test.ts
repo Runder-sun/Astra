@@ -170,7 +170,7 @@ it.each(["review-criteria.json", "review-target-evidence.json"] as const)(
 		const input = reviewFixture(f.job, { ...result, evidenceId: evidence.id, verifiedRefs: [ref] });
 		input.criteria[0].evidenceRefs = [ref];
 		const seq = f.job.state.eventSeq;
-		await expect(f.job.recordReview(input)).rejects.toThrow(/reference|refs|declared|packet/);
+		await expect(f.job.recordReview(input)).rejects.toThrow(/auxiliary file identity mismatch/);
 		expect(f.job.state.eventSeq).toBe(seq);
 		expect(Object.values(f.job.state.reviews)).toHaveLength(0);
 	},

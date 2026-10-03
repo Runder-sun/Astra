@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CodexResearchAdapters } from "./codex-adapters.ts";
 import { CodexAppServerRunner } from "./codex-app-server.ts";
@@ -24,6 +24,8 @@ const RESEARCH_CONTROL_ACTIONS: readonly ResearchControlAction[] = [
 
 export interface ResearchControlRequest {
 	action: ResearchControlAction;
+	/** Host-selected target, carried unchanged through backend selection and execution. */
+	jobId?: string;
 	backend?: "pi" | "codex";
 	objective?: string;
 	reason?: string;
@@ -157,6 +159,7 @@ export function parseResearchControlArgs(args: string[]): ResearchControlRequest
 
 export function decodeResearchControl(value: string): ResearchControlRequest {
 	const request = JSON.parse(value) as Partial<ResearchControlRequest>;
+	if (request.jobId !== undefined) assertAstraId(request.jobId, "job id");
 	if (request.backend !== undefined && request.backend !== "pi" && request.backend !== "codex") {
 		throw new Error(`unknown Astra backend: ${String(request.backend)}`);
 	}
@@ -197,13 +200,23 @@ async function activeJobId(cwd: string): Promise<string | undefined> {
 }
 
 async function bindActiveJob(cwd: string, jobId: string): Promise<void> {
-	await mkdir(join(cwd, ".astra"), { recursive: true });
-	await writeFile(join(cwd, ".astra", "active-job.json"), `${JSON.stringify({ jobId }, null, 2)}\n`, "utf8");
+	await atomicWriteJson(join(cwd, ".astra", "active-job.json"), { jobId });
+}
+
+export async function resolveResearchControlTarget(
+	request: ResearchControlRequest,
+	cwd: string,
+	jobId?: string,
+): Promise<ResearchControlRequest> {
+	if (request.action === "run" || request.action === "migrate") return request;
+	const target = request.jobId ?? jobId ?? process.env.ASTRA_JOB_ID ?? (await activeJobId(cwd));
+	if (target) assertAstraId(target, "job id");
+	return { ...request, jobId: target };
 }
 
 export async function researchBackend(request: ResearchControlRequest, cwd: string): Promise<"pi" | "codex"> {
 	if (request.action === "run") return request.backend ?? "pi";
-	const jobId = await activeJobId(cwd);
+	const jobId = request.jobId ?? (await activeJobId(cwd));
 	if (!jobId) return request.backend ?? "pi";
 	assertAstraId(jobId, "job id");
 	let backend: "pi" | "codex" = "pi";
@@ -285,11 +298,16 @@ async function mutateLatestJob(
 	});
 }
 
-export async function runResearchControl(request: ResearchControlRequest, cwd: string): Promise<ResearchControlResult> {
+export async function runResearchControl(
+	request: ResearchControlRequest,
+	cwd: string,
+	onJobPublished?: (jobId: string) => void,
+): Promise<ResearchControlResult> {
 	if (request.action === "migrate") {
 		return { action: request.action, migration: await migratePmcli(cwd) };
 	}
 
+	request = await resolveResearchControlTarget(request, cwd);
 	const store = new JsonlAstraStore(cwd);
 	const backend = await researchBackend(request, cwd);
 	const accounting = {
@@ -316,11 +334,12 @@ export async function runResearchControl(request: ResearchControlRequest, cwd: s
 		});
 		await atomicWriteJson(join(cwd, ".astra", "jobs", job.state.frame.jobId, "backend.json"), { backend });
 		await bindActiveJob(cwd, job.state.frame.jobId);
+		onJobPublished?.(job.state.frame.jobId);
 		await driveToCompletion(job, store, cwd, backend);
 		return { action: request.action, ...accounting, jobId: job.state.frame.jobId, status: job.status() };
 	}
 
-	const jobId = await activeJobId(cwd);
+	const jobId = request.jobId;
 	if (!jobId) throw new Error("no active Astra research job");
 	let job = await ResearchJob.open(store, jobId);
 	if (!job) throw new Error(`active Astra research job not found: ${jobId}`);

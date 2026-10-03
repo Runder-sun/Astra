@@ -278,7 +278,7 @@ describe("Pi reviewer TaskPacket budget", () => {
 			"Read review-packet.json and review-target-snapshot.json from the current directory",
 		);
 		expect(reviewerPrompt).toContain("copy each string exactly, including case and punctuation");
-		expect(reviewerPrompt).toContain("workerContract.successCriteria string as a separate criterion");
+		expect(reviewerPrompt).toContain("the union of worker acceptance checks, success criteria and repair checks");
 		expect(reviewerEnv.ASTRA_REVIEW_CRITERIA).toBe(
 			JSON.stringify(["question is bounded", "question is falsifiable"]),
 		);

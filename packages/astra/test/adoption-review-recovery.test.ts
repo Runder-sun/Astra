@@ -628,7 +628,21 @@ it.each([
 	}
 	const reopened = (await ResearchJob.open(store, job.state.frame.jobId))!;
 	const turns = reopened.state.budgetUsage?.turnsUsed;
-	await expect(supervisor(reopened, store, adapter).tick()).rejects.toThrow();
+	if (["duplicate", "missing-criterion", "foreign-ref"].includes(fault)) {
+		const badBytes = await readFile(path, "utf8");
+		await reopened.recoverPendingOperations();
+		await reopened.recoverPendingOperations();
+		expect(await readFile(path, "utf8")).toBe(badBytes);
+		expect(Object.keys(reopened.state.reviewDeliveryRejections ?? {})).toEqual([taskId]);
+		expect(reopened.state.tasks[taskId].status).toBe("failed");
+		expect(
+			Object.values(reopened.state.sessions)
+				.filter((session) => session.taskId === taskId)
+				.every((session) => session.status === "failed"),
+		).toBe(true);
+	} else {
+		await expect(supervisor(reopened, store, adapter).tick()).rejects.toThrow();
+	}
 	expect(Object.keys(reopened.state.reviews)).toHaveLength(0);
 	expect(run).toHaveBeenCalledOnce();
 	expect(reopened.state.budgetUsage?.turnsUsed).toBe(turns);
@@ -647,7 +661,7 @@ it.each(["content", "refs", "taskVersion", "checksum", "versionHash"] as const)(
 			field === "refs" ? ["foreign"] : field === "content" ? { content: "tampered" } : "foreign";
 		await writeFile(path, JSON.stringify(snapshot));
 		const reopened = (await ResearchJob.open(store, job.state.frame.jobId))!;
-		await expect(reopened.recoverPendingOperations()).rejects.toThrow(/frozen target/);
+		await expect(reopened.recoverPendingOperations()).rejects.toThrow(/registered identity|frozen target/);
 		expect(Object.keys(reopened.state.reviews)).toHaveLength(0);
 		expect(run).toHaveBeenCalledOnce();
 	},

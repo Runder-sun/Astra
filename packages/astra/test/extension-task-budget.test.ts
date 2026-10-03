@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { taskPacketPath, writeTaskPacket } from "../src/contracts.ts";
 import { createAstraExtension } from "../src/extension.ts";
 import { writeSourceReceipt } from "../src/literature.ts";
+import { PiChildSessionRunner, PiReviewerAdapter } from "../src/pi-child-session.ts";
 import { ResearchJob } from "../src/research.ts";
 import { JsonlAstraStore } from "../src/store.ts";
 import { prepareTaskWorkspace, taskWorkspacePath } from "../src/task-workspace.ts";
@@ -929,58 +930,76 @@ describe("Astra TaskPacket inner-loop controls", () => {
 	});
 
 	it("requires reviewer criteria to preserve every frozen criterion exactly", async () => {
-		const { fixture, task } = await setup("reviewer");
-		const frozenCriteria = ["research question is bounded and falsifiable", "acceptance criteria are measurable"];
-		await writeTaskPacket({ ...task, inputArtifactRefs: ["evidence_expected"] });
-		vi.stubEnv("ASTRA_REVIEW_CRITERIA", JSON.stringify(frozenCriteria));
-		const submit = fixture.tools.get("astra_submit_review");
-		if (!submit) throw new Error("review submission tool was not registered");
-		const baseSubmission = {
-			evidenceId: "evidence_expected",
-			verdict: "pass",
-			findings: [],
-			score: 1,
-			verifiedRefs: ["review-target-snapshot.json"],
-		};
+		const { fixture: workerFixture, task } = await setup();
+		const job = (await ResearchJob.open(new JsonlAstraStore(workerFixture.context.cwd), task.jobId))!;
+		await job.setTaskStatus(task.id, "succeeded");
+		const evidence = await job.recordEvidence({
+			taskId: task.id,
+			stageId: task.stageId,
+			type: task.requiredOutputType,
+			content: Object.fromEntries(task.requiredOutputFields.map((field) => [field, "offline"])),
+			refs: [],
+		});
+		const runner = new PiChildSessionRunner();
+		vi.spyOn(runner, "run").mockImplementation(async (_cwd, _jobId, _taskId, _attempt, _role, _prompt, env = {}) => {
+			for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+			vi.stubEnv("ASTRA_ROLE", "reviewer");
+			const fixture = createFixture(
+				createAstraExtension({ jobId: task.jobId, role: "reviewer" }),
+				workerFixture.context.cwd,
+			);
+			const frozenCriteria = [...new Set([...task.acceptanceChecks, ...task.successCriteria])];
+			const submit = fixture.tools.get("astra_submit_review");
+			if (!submit) throw new Error("review submission tool was not registered");
+			const baseSubmission = {
+				evidenceId: evidence.id,
+				verdict: "pass",
+				findings: [],
+				score: 1,
+				verifiedRefs: ["review-target-snapshot.json"],
+			};
 
-		const paraphrased = await submit.execute(
-			"review-submit-paraphrased-criteria",
-			{
-				...baseSubmission,
-				criteria: frozenCriteria.map((criterion) => ({
-					criterion: criterion[0].toUpperCase() + criterion.slice(1),
-					passed: true,
-					score: 1,
-					evidenceRefs: ["review-target-snapshot.json"],
-					rationale: "verified",
-				})),
-			},
-			undefined,
-			undefined,
-			fixture.context,
-		);
+			const paraphrased = await submit.execute(
+				"review-submit-paraphrased-criteria",
+				{
+					...baseSubmission,
+					criteria: frozenCriteria.map((criterion) => ({
+						criterion: criterion[0].toUpperCase() + criterion.slice(1),
+						passed: true,
+						score: 1,
+						evidenceRefs: ["review-target-snapshot.json"],
+						rationale: "verified",
+					})),
+				},
+				undefined,
+				undefined,
+				fixture.context,
+			);
 
-		expect(paraphrased.terminate).toBeUndefined();
-		expect(paraphrased.content[0]).toMatchObject({ text: expect.stringContaining(frozenCriteria[0]) });
+			expect(paraphrased.terminate).toBeUndefined();
+			expect(paraphrased.content[0]).toMatchObject({ text: expect.stringContaining(frozenCriteria[0]) });
 
-		const exact = await submit.execute(
-			"review-submit-exact-criteria",
-			{
-				...baseSubmission,
-				criteria: frozenCriteria.map((criterion) => ({
-					criterion,
-					passed: true,
-					score: 1,
-					evidenceRefs: ["review-target-snapshot.json"],
-					rationale: "verified",
-				})),
-			},
-			undefined,
-			undefined,
-			fixture.context,
-		);
+			const exact = await submit.execute(
+				"review-submit-exact-criteria",
+				{
+					...baseSubmission,
+					criteria: frozenCriteria.map((criterion) => ({
+						criterion,
+						passed: true,
+						score: 1,
+						evidenceRefs: ["review-target-snapshot.json"],
+						rationale: "verified",
+					})),
+				},
+				undefined,
+				undefined,
+				fixture.context,
+			);
 
-		expect(exact.terminate).toBe(true);
+			expect(exact.terminate).toBe(true);
+			return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
+		});
+		await new PiReviewerAdapter(runner).review(evidence, job);
 	});
 
 	it("aborts after maxTurns when no terminal manifest was submitted", async () => {

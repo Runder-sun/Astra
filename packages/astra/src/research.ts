@@ -9,6 +9,7 @@ import {
 	canonicalReceiptPath,
 	readMainAgentDelivery,
 	readWorkerOutputManifest,
+	reviewerManifestPath,
 	reviewSnapshotPath,
 	sha256,
 	taskDir,
@@ -45,10 +46,22 @@ import {
 	createResearchNode,
 	updateNodeStatus,
 } from "./research-graph.ts";
-import { validateReviewAssessment } from "./review-validation.ts";
+import {
+	frozenReviewCriteria,
+	ReviewAssessmentError,
+	ReviewIntegrityError,
+	validateReviewAssessment,
+	validateReviewReferences,
+} from "./review-validation.ts";
 import { DEFAULT_STAGES, stageMap } from "./stages.ts";
 import type { AstraStore } from "./store.ts";
-import { freezeEvidenceFiles, readVersionedFile, taskWorkspacePath } from "./task-workspace.ts";
+import {
+	freezeEvidenceFiles,
+	readVersionedFile,
+	taskInputResources,
+	taskWorkspacePath,
+	verifyReviewEvidenceBundle,
+} from "./task-workspace.ts";
 import type {
 	AdoptionCompletion,
 	AstraEvent,
@@ -77,6 +90,7 @@ import type {
 	RetiredArtifactReceipt,
 	Review,
 	ReviewConsequences,
+	ReviewDeliveryRejection,
 	ReviewerOutputManifest,
 	ReviewPacket,
 	RouteConsequences,
@@ -195,6 +209,23 @@ export function checksum(value: unknown): string {
 	return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
+function reviewBody(review: Omit<Review, "createdAt">): string {
+	return checksum(JSON.parse(JSON.stringify(review)));
+}
+
+function checkReviewHistory(events: StoredEvent[]): Map<string, Review> {
+	const reviews = new Map<string, Review>();
+	for (const stored of events) {
+		if (stored.event.type !== "review_recorded") continue;
+		const review = stored.event.review;
+		const existing = reviews.get(review.id);
+		if (existing && reviewBody(existing) !== reviewBody(review))
+			throw new Error(`review history integrity conflict for id ${review.id}`);
+		reviews.set(review.id, existing ?? review);
+	}
+	return reviews;
+}
+
 export interface CreateJobOptions {
 	jobId?: string;
 	goalId?: string;
@@ -260,6 +291,7 @@ function mainSessionId(jobId: string): string {
 
 function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
 	snapshot.cleanupIntents ??= {};
+	snapshot.reviewDeliveryRejections ??= {};
 	snapshot.stagePlans ??= {};
 	snapshot.graph ??= createResearchGraph(snapshot.frame.jobId, snapshot.frame.objective);
 	snapshot.searchBatches ??= {};
@@ -433,6 +465,7 @@ export class ResearchJob {
 	static async open(store: AstraStore, jobId: string): Promise<ResearchJob | undefined> {
 		let snapshot = await store.loadSnapshot(jobId);
 		const events = await store.readEvents(jobId);
+		checkReviewHistory(events);
 		for (const [index, stored] of events.entries()) {
 			if (stored.jobId !== jobId || stored.seq !== index + 1)
 				throw new Error(`invalid research event sequence for ${jobId}`);
@@ -2224,85 +2257,150 @@ export class ResearchJob {
 		return this.exclusive(() => this.recordReviewInternal(input));
 	}
 
-	private async recordReviewInternal(input: Omit<Review, "id" | "createdAt"> & { id?: string }): Promise<Review> {
-		const evidence = this.snapshot.evidence[input.evidenceId];
-		if (!evidence) throw new Error(`unknown evidence ${input.evidenceId}`);
-		this.assertEvidenceCurrent(evidence.id);
-		if (input.targetVersionHash && input.targetVersionHash !== evidence.versionHash)
-			throw new Error("review target version does not match evidence");
-		const definition = this.definitions[evidence.stageId];
-		const sourceTask = this.snapshot.tasks[evidence.taskId];
-		const expectedCriteria = [
-			...new Set([
-				...(sourceTask?.acceptanceChecks ?? definition?.acceptanceChecks ?? []),
-				...(sourceTask?.successCriteria ?? []),
-				...(sourceTask?.repairChecks ?? []).map((check) => check.criterion),
-			]),
-		];
-		validateReviewAssessment(input, expectedCriteria);
-		const allowedRefs = new Set([
+	/** Shared async preflight for Pi, Codex and registration. Integrity precedes semantic judgment. */
+	async validateReview(input: Omit<Review, "id" | "createdAt">): Promise<void> {
+		try {
+			const evidence = this.snapshot.evidence[input.evidenceId];
+			if (!evidence) throw new Error(`unknown evidence ${input.evidenceId}`);
+			this.assertEvidenceCurrent(evidence.id);
+			if (input.targetVersionHash && input.targetVersionHash !== evidence.versionHash)
+				throw new Error("review target version does not match evidence");
+			const refs = await this.reviewReferences(evidence.id, input.reviewerTaskId);
+			validateReviewAssessment(input, frozenReviewCriteria(this.snapshot.tasks[evidence.taskId]));
+			validateReviewReferences(input, refs);
+		} catch (error) {
+			if (error instanceof ReviewAssessmentError) throw error;
+			throw new ReviewIntegrityError(error instanceof Error ? error.message : String(error), { cause: error });
+		}
+	}
+
+	async reviewReferences(evidenceId: string, reviewerTaskId?: string): Promise<Set<string>> {
+		const evidence = this.snapshot.evidence[evidenceId];
+		if (!evidence) throw new Error(`unknown evidence ${evidenceId}`);
+		const source = this.snapshot.tasks[evidence.taskId];
+		const refs = new Set([
 			evidence.id,
 			`evidence:${evidence.id}`,
 			...evidence.refs,
-			...sourceTask.inputArtifactRefs,
-			...sourceTask.inputArtifactRefs.flatMap(
+			...source.inputArtifactRefs,
+			...source.inputArtifactRefs.flatMap(
 				(ref) => this.snapshot.evidence[this.snapshot.canonical[ref]?.evidenceId ?? ref]?.refs ?? [],
 			),
 		]);
-		const reviewer = input.reviewerTaskId ? this.snapshot.tasks[input.reviewerTaskId] : undefined;
-		if (reviewer) {
-			const [packetBytes, snapshotBytes] = await Promise.all([
-				this.readTaskCompletionFile(reviewer, "review-packet.json"),
-				this.readTaskCompletionFile(reviewer, "review-target-snapshot.json"),
-			]);
-			if (packetBytes || snapshotBytes) {
-				if (!packetBytes || !snapshotBytes) throw new Error("review reference binding has missing frozen packages");
-				const packet = JSON.parse(packetBytes) as ReviewPacket;
-				const frozen = JSON.parse(snapshotBytes) as {
-					evidence: Evidence;
-					reviewCriteria?: Array<{ criterion: string }>;
-					resolvedEvidenceRefs: ReviewPacket["resolvedEvidenceRefs"];
-					resources?: Array<{ artifactId: string }>;
-				};
-				if (
-					reviewer.role !== "reviewer" ||
-					reviewer.jobId !== this.snapshot.frame.jobId ||
-					reviewer.stageId !== evidence.stageId ||
-					packet.schemaVersion !== "astra.review_packet.v1" ||
-					packet.jobId !== reviewer.jobId ||
-					packet.taskId !== reviewer.id ||
-					packet.evidenceId !== evidence.id ||
-					packet.reviewerRole !== "reviewer" ||
-					checksum(packet.inputRefs) !== checksum(reviewer.inputArtifactRefs) ||
-					!reviewer.inputArtifactRefs.includes(evidence.id) ||
-					packet.targetSnapshotRef !==
-						reviewSnapshotPath(reviewer.scope.workspaceRoot, reviewer.jobId, reviewer.id) ||
-					packet.targetSnapshotHash !== evidence.versionHash ||
-					frozen.evidence.id !== evidence.id ||
-					frozen.evidence.versionHash !== evidence.versionHash ||
-					checksum(JSON.parse(JSON.stringify(frozen.evidence.content))) !==
-						checksum(JSON.parse(JSON.stringify(evidence.content))) ||
-					checksum(frozen.evidence.refs) !== checksum(evidence.refs) ||
-					checksum(packet.resolvedEvidenceRefs) !== checksum(frozen.resolvedEvidenceRefs)
-				)
-					throw new Error("review reference binding does not match its frozen target");
-				this.assertTaskCurrent(reviewer.id);
-				for (const ref of [
-					"review-packet.json",
-					"review-target-snapshot.json",
-					...(await this.boundReviewAuxiliaryRefs(reviewer, frozen)),
-					...(frozen.resources ?? []).map((resource) => resource.artifactId),
-					...packet.resolvedEvidenceRefs.flatMap((ref) => [ref.sourceRef, ref.path]),
-				])
-					allowedRefs.add(ref);
-			}
+		if (reviewerTaskId === undefined) return refs;
+		const task = this.snapshot.tasks[reviewerTaskId];
+		if (this.snapshot.reviewDeliveryRejections?.[reviewerTaskId])
+			throw new Error("reviewer delivery was already durably rejected");
+		if (
+			!task ||
+			task.role !== "reviewer" ||
+			task.jobId !== this.snapshot.frame.jobId ||
+			task.stageId !== evidence.stageId ||
+			(task.stageRevision ?? 1) !== (source.stageRevision ?? 1) ||
+			task.inputArtifactRefs.length !== 1 ||
+			task.inputArtifactRefs[0] !== evidence.id
+		)
+			throw new Error("reviewer task identity does not match its frozen target");
+		this.assertTaskCurrent(task.id);
+		const [taskBytes, packetBytes, snapshotBytes] = await Promise.all([
+			this.readTaskCompletionFile(task, "task-packet.json"),
+			this.readTaskCompletionFile(task, "review-packet.json"),
+			this.readTaskCompletionFile(task, "review-target-snapshot.json"),
+		]);
+		if (!taskBytes || !packetBytes || !snapshotBytes)
+			throw new Error("review completion has missing frozen packages");
+		const savedTask = JSON.parse(taskBytes) as TaskPacket;
+		const packet = JSON.parse(packetBytes) as ReviewPacket;
+		const frozen = JSON.parse(snapshotBytes) as {
+			evidence: Evidence;
+			reviewCriteria?: Array<{ criterion: string; frozenCriteria: string[] }>;
+			resolvedEvidenceRefs: ReviewPacket["resolvedEvidenceRefs"];
+			resources?: Array<{ artifactId: string; artifactType: string; taskId: string; root: string }>;
+		};
+		const definition = taskStageContract(this.definitions[evidence.stageId], source);
+		if (
+			checksum(this.completionTaskBinding(savedTask)) !== checksum(this.completionTaskBinding(task)) ||
+			packet.schemaVersion !== "astra.review_packet.v1" ||
+			packet.jobId !== task.jobId ||
+			packet.taskId !== task.id ||
+			packet.evidenceId !== evidence.id ||
+			packet.reviewerRole !== "reviewer" ||
+			packet.objective !== task.objective ||
+			checksum(packet.inputRefs) !== checksum(task.inputArtifactRefs) ||
+			packet.targetSnapshotRef !== reviewSnapshotPath(task.scope.workspaceRoot, task.jobId, task.id) ||
+			packet.targetSnapshotHash !== evidence.versionHash ||
+			!Array.isArray(packet.resolvedEvidenceRefs) ||
+			checksum(packet.resolvedEvidenceRefs) !== checksum(frozen.resolvedEvidenceRefs) ||
+			checksum(packet.workerContract) !==
+				checksum({
+					objective: source.objective,
+					requiredOutputFields: source.requiredOutputFields,
+					acceptanceChecks: source.acceptanceChecks,
+					failureSignals: source.failureSignals,
+					successCriteria: source.successCriteria,
+				}) ||
+			checksum(packet.stageContract) !==
+				checksum({
+					stageId: definition.id,
+					label: definition.label,
+					outputArtifactType: definition.outputArtifactType,
+					requiredOutputFields: definition.requiredOutputFields,
+					acceptanceChecks: definition.acceptanceChecks,
+					failureSignals: definition.failureSignals,
+				})
+		)
+			throw new Error("review completion identity, frozen target or contract mismatch");
+		this.assertEvidenceCurrent(evidence.id, frozen.evidence);
+		if (frozen.resources !== undefined) {
+			const resources = [...(await taskInputResources(task, this)), ...(await taskInputResources(source, this))].map(
+				({ artifactId, artifactType, taskId, root }) => ({ artifactId, artifactType, taskId, root }),
+			);
+			if (!Array.isArray(frozen.resources) || checksum(frozen.resources) !== checksum(resources))
+				throw new Error("review resource identity binding does not match its declared tasks");
 		}
 		if (
-			[...input.verifiedRefs!, ...input.criteria!.flatMap((item) => item.evidenceRefs)].some(
-				(ref) => !allowedRefs.has(ref),
-			)
+			frozen.reviewCriteria &&
+			checksum(frozen.reviewCriteria.flatMap((group) => group.frozenCriteria).sort()) !==
+				checksum(frozenReviewCriteria(source).sort())
 		)
-			throw new Error("review cites references outside its declared evidence or bound packet");
+			throw new Error("review frozen criteria do not match the worker contract");
+		await verifyReviewEvidenceBundle(task, evidence, packet, this);
+		for (const ref of [
+			"review-packet.json",
+			"review-target-snapshot.json",
+			...(await this.boundReviewAuxiliaryRefs(task, frozen)),
+			...(frozen.resources ?? []).map((resource) => resource.artifactId),
+			...packet.resolvedEvidenceRefs.flatMap((ref) => [ref.sourceRef, ref.path]),
+		])
+			refs.add(ref);
+		return refs;
+	}
+
+	private async recordReviewInternal(input: Omit<Review, "id" | "createdAt"> & { id?: string }): Promise<Review> {
+		const history = checkReviewHistory(await this.store.readEvents(this.snapshot.frame.jobId));
+		const existing = input.id ? (history.get(input.id) ?? this.snapshot.reviews[input.id]) : undefined;
+		if (existing) {
+			const { createdAt: _createdAt, ...body } = existing;
+			const { createdAt: _providedCreatedAt, ...submitted } = input as Review;
+			if (
+				reviewBody(body) !==
+				reviewBody({
+					...submitted,
+					id: existing.id,
+					targetVersionHash:
+						input.targetVersionHash ??
+						this.snapshot.evidence[input.evidenceId]?.versionHash ??
+						existing.targetVersionHash,
+				})
+			)
+				throw new Error(`review id already has different content: ${existing.id}`);
+			await this.recoverReviewsInternal();
+			if (existing.reviewerTaskId)
+				await this.recoverReviewerCompletionsInternal(existing.evidenceId, existing.reviewerTaskId);
+			return structuredClone(existing);
+		}
+		await this.validateReview(input);
+		const evidence = this.snapshot.evidence[input.evidenceId];
 		if (
 			input.reviewerTaskId &&
 			Object.values(this.snapshot.reviews).some(
@@ -2330,8 +2428,10 @@ export class ResearchJob {
 			["review-target-evidence.json", frozen.reviewCriteria ? frozen.evidence : undefined],
 		] as const) {
 			const bytes = await this.readTaskCompletionFile(task, filename);
-			if (bytes && expected && checksum(JSON.parse(bytes)) === checksum(JSON.parse(JSON.stringify(expected))))
-				refs.push(filename);
+			if (!expected) continue;
+			if (!bytes || checksum(JSON.parse(bytes)) !== checksum(JSON.parse(JSON.stringify(expected))))
+				throw new Error(`review auxiliary file identity mismatch: ${filename}`);
+			refs.push(filename);
 		}
 		return refs;
 	}
@@ -2354,9 +2454,13 @@ export class ResearchJob {
 			if (committed.length) {
 				if (committed.length !== 1 || (evidenceId && committed[0].evidenceId !== evidenceId))
 					throw new Error("reviewer completion conflicts with its registered review");
-				if (task.status !== "succeeded")
-					await this.appendEvent({ type: "task_status", taskId: task.id, status: "succeeded" });
+				await this.finishReviewSuccessInternal(task);
 				if (taskId) recovered.push(structuredClone(committed[0]));
+				continue;
+			}
+			const rejection = this.snapshot.reviewDeliveryRejections?.[task.id];
+			if (rejection) {
+				await this.finishReviewRejectionInternal(task, rejection);
 				continue;
 			}
 			const evidence = this.snapshot.evidence[task.inputArtifactRefs[0]];
@@ -2405,6 +2509,7 @@ export class ResearchJob {
 					peer.stageId === task.stageId &&
 					(peer.stageRevision ?? 1) === (task.stageRevision ?? 1) &&
 					peer.status !== "blocked" &&
+					!this.snapshot.reviewDeliveryRejections?.[peer.id] &&
 					!Object.values(this.snapshot.reviews).some((review) => review.reviewerTaskId === peer.id) &&
 					!Object.values(this.snapshot.tasks).some((next) => next.supersedesTaskId === peer.id),
 			)) {
@@ -2421,135 +2526,102 @@ export class ResearchJob {
 				)
 					throw new Error("reviewer completion is ambiguous for the same replay key and attempt");
 			}
-			const [taskBytes, packetBytes, snapshotBytes] = await Promise.all([
-				this.readTaskCompletionFile(task, "task-packet.json"),
-				this.readTaskCompletionFile(task, "review-packet.json"),
-				this.readTaskCompletionFile(task, "review-target-snapshot.json"),
-			]);
-			if (!taskBytes || !packetBytes || !snapshotBytes)
-				throw new Error("review completion has missing frozen packages");
-			const savedTask = JSON.parse(taskBytes) as TaskPacket;
-			const packet = JSON.parse(packetBytes) as ReviewPacket;
-			const snapshot = JSON.parse(snapshotBytes) as {
-				evidence: Evidence;
-				reviewCriteria?: Array<{ criterion: string }>;
-				resolvedEvidenceRefs: ReviewPacket["resolvedEvidenceRefs"];
-				resources?: Array<{ artifactId: string }>;
-			};
 			const manifest = JSON.parse(bytes) as ReviewerOutputManifest;
-			const frozen = snapshot.evidence;
-			const source = this.snapshot.tasks[evidence.taskId];
 			if (
-				!frozen ||
-				!source ||
-				source.jobId !== task.jobId ||
-				source.stageId !== task.stageId ||
-				(source.stageRevision ?? 1) !== (task.stageRevision ?? 1)
-			)
-				throw new Error("review completion has an invalid frozen evidence or source task");
-			const definition = taskStageContract(this.definitions[evidence.stageId], source);
-			if (
-				checksum(this.completionTaskBinding(savedTask)) !== checksum(this.completionTaskBinding(task)) ||
-				task.jobId !== this.snapshot.frame.jobId ||
-				task.stageId !== evidence.stageId ||
-				task.inputArtifactRefs.length !== 1 ||
 				manifest.schemaVersion !== "astra.reviewer_output_manifest.v1" ||
 				!["pass", "fail", "partial", "blocked"].includes(manifest.verdict) ||
 				!Array.isArray(manifest.findings) ||
 				manifest.findings.some((finding) => typeof finding !== "string") ||
 				manifest.jobId !== task.jobId ||
 				manifest.taskId !== task.id ||
-				manifest.evidenceId !== evidence.id ||
-				packet.schemaVersion !== "astra.review_packet.v1" ||
-				packet.jobId !== task.jobId ||
-				packet.taskId !== task.id ||
-				packet.evidenceId !== evidence.id ||
-				packet.reviewerRole !== "reviewer" ||
-				packet.objective !== task.objective ||
-				checksum(packet.inputRefs) !== checksum(task.inputArtifactRefs) ||
-				packet.targetSnapshotRef !== reviewSnapshotPath(task.scope.workspaceRoot, task.jobId, task.id) ||
-				packet.targetSnapshotHash !== frozen.versionHash ||
-				// JSON snapshots omit undefined keys. Compare every persisted immutable field, including the original hashes.
-				checksum(
-					JSON.parse(
-						JSON.stringify({
-							...frozen,
-							status: undefined,
-							acceptanceAuthority: undefined,
-							mainAgentDecisionRef: undefined,
-							supersededByTaskId: undefined,
-						}),
-					),
-				) !==
-					checksum(
-						JSON.parse(
-							JSON.stringify({
-								...evidence,
-								status: undefined,
-								acceptanceAuthority: undefined,
-								mainAgentDecisionRef: undefined,
-								supersededByTaskId: undefined,
-							}),
-						),
-					) ||
-				checksum(packet.resolvedEvidenceRefs) !== checksum(snapshot.resolvedEvidenceRefs) ||
-				checksum(packet.workerContract) !==
-					checksum({
-						objective: source.objective,
-						requiredOutputFields: source.requiredOutputFields,
-						acceptanceChecks: source.acceptanceChecks,
-						failureSignals: source.failureSignals,
-						successCriteria: source.successCriteria,
-					}) ||
-				checksum(packet.stageContract) !==
-					checksum({
-						stageId: definition.id,
-						label: definition.label,
-						outputArtifactType: definition.outputArtifactType,
-						requiredOutputFields: definition.requiredOutputFields,
-						acceptanceChecks: definition.acceptanceChecks,
-						failureSignals: definition.failureSignals,
-					})
+				manifest.evidenceId !== evidence.id
 			)
-				throw new Error("review completion identity, frozen target or contract mismatch");
-			this.assertCurrentInputs(source.inputArtifactRefs, source.repairOfEvidenceId, new Set(), source);
-			validateReviewAssessment(manifest, [
-				...source.acceptanceChecks,
-				...source.successCriteria,
-				...(source.repairChecks ?? []).map((check) => check.criterion),
-			]);
-			const allowedRefs = new Set([
-				"review-packet.json",
-				"review-target-snapshot.json",
-				...(await this.boundReviewAuxiliaryRefs(task, snapshot)),
-				`evidence:${evidence.id}`,
-				evidence.id,
-				...evidence.refs,
-				...source.inputArtifactRefs,
-				...(snapshot.resources ?? []).map((resource) => resource.artifactId),
-				...packet.resolvedEvidenceRefs.flatMap((ref) => [ref.sourceRef, ref.path]),
-			]);
-			if (
-				[...manifest.verifiedRefs, ...manifest.criteria.flatMap((item) => item.evidenceRefs)].some(
-					(ref) => !allowedRefs.has(ref),
-				)
-			)
-				throw new Error("review completion cited evidence outside its frozen packet");
-			const review = await this.recordReviewInternal({
+				throw new Error("review completion manifest identity mismatch");
+			const source = this.snapshot.tasks[evidence.taskId];
+			const input = {
 				evidenceId: evidence.id,
 				reviewerTaskId: task.id,
-				targetVersionHash: frozen.versionHash,
+				targetVersionHash: evidence.versionHash,
 				verdict: manifest.verdict,
 				findings: manifest.findings,
 				score: manifest.score,
 				criteria: manifest.criteria,
 				verifiedRefs: manifest.verifiedRefs,
 				blocking: evidence.type !== "stage-plan" && source.searchBatchId === undefined,
-			});
-			await this.appendEvent({ type: "task_status", taskId: task.id, status: "succeeded" });
+			};
+			try {
+				await this.validateReview(input);
+			} catch (error) {
+				if (!(error instanceof ReviewAssessmentError)) throw error;
+				const rejection: ReviewDeliveryRejection = {
+					taskId: task.id,
+					attempt: task.attempt,
+					evidenceId: evidence.id,
+					targetVersionHash: evidence.versionHash!,
+					manifestSha256: sha256(bytes),
+					reason: error.message,
+					createdAt: new Date().toISOString(),
+				};
+				await this.appendEvent({ type: "review_delivery_rejected", rejection });
+				await this.finishReviewRejectionInternal(task, rejection);
+				continue;
+			}
+			const review = await this.recordReviewInternal(input);
+			await this.finishReviewSuccessInternal(task);
 			recovered.push(review);
 		}
 		return recovered;
+	}
+
+	private async finishReviewSuccessInternal(task: TaskPacket): Promise<void> {
+		if (task.status !== "succeeded")
+			await this.appendEvent({ type: "task_status", taskId: task.id, status: "succeeded" });
+		for (const session of Object.values(this.snapshot.sessions)) {
+			if (
+				session.taskId !== task.id ||
+				session.role !== "reviewer" ||
+				session.attempt !== task.attempt ||
+				session.status === "completed"
+			)
+				continue;
+			await this.appendEvent({
+				type: "child_session_recorded",
+				session: {
+					...session,
+					status: "completed",
+					error: undefined,
+					manifestRef: reviewerManifestPath(task.scope.workspaceRoot, task.jobId, task.id),
+					updatedAt: new Date().toISOString(),
+				},
+			});
+		}
+	}
+
+	private async finishReviewRejectionInternal(task: TaskPacket, rejection: ReviewDeliveryRejection): Promise<void> {
+		const bytes = await this.readTaskCompletionFile(task, "review-manifest.json");
+		if (
+			!bytes ||
+			sha256(bytes) !== rejection.manifestSha256 ||
+			task.id !== rejection.taskId ||
+			task.attempt !== rejection.attempt ||
+			task.inputArtifactRefs[0] !== rejection.evidenceId ||
+			this.snapshot.evidence[rejection.evidenceId]?.versionHash !== rejection.targetVersionHash
+		)
+			throw new Error("rejected review manifest digest or task/target identity changed");
+		if (task.status !== "failed") await this.appendEvent({ type: "task_status", taskId: task.id, status: "failed" });
+		for (const session of Object.values(this.snapshot.sessions)) {
+			if (
+				session.taskId !== task.id ||
+				session.role !== "reviewer" ||
+				session.attempt !== task.attempt ||
+				session.status === "failed"
+			)
+				continue;
+			await this.appendEvent({
+				type: "child_session_recorded",
+				session: { ...session, status: "failed", error: rejection.reason, updatedAt: new Date().toISOString() },
+			});
+		}
 	}
 
 	/** Same constructor serves atomic new reviews and narrow historical repair. */
@@ -4330,7 +4402,20 @@ export class ResearchJob {
 
 	/** Only called inside exclusive: no queue reentry and no second lock. */
 	private async appendEvent(event: AstraEvent): Promise<void> {
-		const stored = await this.store.append(this.snapshot.frame.jobId, event);
+		let stored: StoredEvent;
+		try {
+			stored = await this.store.append(this.snapshot.frame.jobId, event);
+		} catch (error) {
+			// An append may have committed before reporting failure. Reconcile under the held journal lock.
+			const history = await this.store.readEvents(this.snapshot.frame.jobId);
+			checkReviewHistory(history);
+			for (const saved of history.slice(this.snapshot.eventSeq)) {
+				this.apply(saved.event, saved.timestamp);
+				this.snapshot.eventSeq = saved.seq;
+				this.snapshot.updatedAt = saved.timestamp;
+			}
+			throw error;
+		}
 		this.apply(stored.event, stored.timestamp);
 		this.snapshot.eventSeq = stored.seq;
 		this.snapshot.updatedAt = stored.timestamp;
@@ -4508,7 +4593,20 @@ export class ResearchJob {
 							batch.acceptanceCompleted = true;
 					}
 				return;
+			case "review_delivery_rejected": {
+				this.snapshot.reviewDeliveryRejections ??= {};
+				const prior = this.snapshot.reviewDeliveryRejections[event.rejection.taskId];
+				if (prior && checksum(prior) !== checksum(event.rejection))
+					throw new Error("review rejection history integrity conflict");
+				this.snapshot.reviewDeliveryRejections[event.rejection.taskId] = structuredClone(event.rejection);
+				return;
+			}
 			case "review_recorded":
+				if (
+					this.snapshot.reviews[event.review.id] &&
+					reviewBody(this.snapshot.reviews[event.review.id]) !== reviewBody(event.review)
+				)
+					throw new Error("review history integrity conflict");
 				this.snapshot.reviews[event.review.id] = structuredClone(event.review);
 				if (event.review.verdict !== "pass" || (event.review.score ?? 0) < 0.8) {
 					const evidence = this.snapshot.evidence[event.review.evidenceId];

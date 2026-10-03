@@ -1,9 +1,10 @@
-import { readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	atomicWriteJson,
 	readTaskPacket,
 	taskStageContract,
 	writeMainDecisionManifest,
@@ -13,7 +14,7 @@ import {
 } from "./contracts.ts";
 import { compactLiteratureSearch, type Fetcher } from "./literature.ts";
 import { searchLiterature } from "./literature-search.ts";
-import { appendJobMemory, loadStageSkills, readJobMemory } from "./memory.ts";
+import { type AuxiliaryDiagnostic, appendJobMemory, loadStageSkills, readJobMemory } from "./memory.ts";
 import { migratePmcli } from "./migration.ts";
 import { ResearchJob } from "./research.ts";
 import { buildResearchBoard, formatResearchBoard } from "./research-board.ts";
@@ -24,6 +25,7 @@ import {
 	type ResearchControlResult,
 	runResearchControl,
 } from "./research-control.ts";
+import { ReviewAssessmentError } from "./review-validation.ts";
 import { JsonlAstraStore } from "./store.ts";
 import { readVersionedFile, taskRecoveryMaterials } from "./task-workspace.ts";
 import type {
@@ -65,7 +67,6 @@ interface AstraExtensionOptions {
 
 interface AstraContext {
 	store: JsonlAstraStore;
-	job?: ResearchJob;
 	role: Exclude<Role, "supervisor">;
 	jobIdOverride?: string;
 	taskPacket?: TaskPacket;
@@ -90,7 +91,7 @@ async function readActiveJobId(cwd: string): Promise<string | undefined> {
 }
 
 async function setActiveJobId(cwd: string, jobId: string): Promise<void> {
-	await writeFile(join(cwd, ...ACTIVE_JOB_FILE), `${JSON.stringify({ jobId }, null, 2)}\n`, "utf8");
+	await atomicWriteJson(join(cwd, ...ACTIVE_JOB_FILE), { jobId });
 }
 
 function projectRoot(ctx: ExtensionContext): string {
@@ -109,11 +110,9 @@ function absoluteShellPaths(command: string): string[] {
 }
 
 async function loadJob(ctx: AstraContext, cwd: string): Promise<ResearchJob | undefined> {
-	if (ctx.job) return ctx.job;
-	const jobId = ctx.jobIdOverride ?? (await readActiveJobId(cwd));
+	const jobId = ctx.jobIdOverride ?? ctx.taskPacket?.jobId ?? (await readActiveJobId(cwd));
 	if (!jobId) return undefined;
-	ctx.job = await ResearchJob.open(ctx.store, jobId);
-	return ctx.job;
+	return ResearchJob.open(ctx.store, jobId);
 }
 
 export function createAstraExtension(options: AstraExtensionOptions = {}): ExtensionFactory {
@@ -124,6 +123,49 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 		let taskToolCallCount = 0;
 		let literatureSearchCallCount = 0;
 		let terminalSubmissionCompleted = false;
+		const failReviewSubmission = (
+			packet: TaskPacket,
+			error: unknown,
+			ctx: ExtensionContext,
+		): AgentToolResult<unknown> => {
+			terminalSubmissionCompleted = true;
+			ctx.abort();
+			return terminalResult("Reviewer submission failed: frozen input or delivery integrity error", {
+				schemaVersion: "astra.reviewer_failure.v1",
+				jobId: packet.jobId,
+				taskId: packet.id,
+				attempt: packet.attempt,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		};
+		const reportAuxiliary = (diagnostic: AuxiliaryDiagnostic): void => {
+			try {
+				pi.appendEntry("astra_auxiliary_diagnostic", diagnostic);
+			} catch {
+				/* Keep core context available. */
+			}
+		};
+		const checkpointMemory = async (
+			status: ReturnType<ResearchJob["status"]>,
+			ctx: ExtensionContext,
+			role: Role,
+			shutdown = false,
+		): Promise<void> => {
+			try {
+				await appendJobMemory(projectRoot(ctx), status.jobId, {
+					stageId: status.activeStageId,
+					role,
+					kind: "checkpoint",
+					content: `${shutdown ? "shutdown " : ""}eventSeq=${status.eventSeq}; next=${status.nextAction}`,
+					sourceRefs: [`job:${status.jobId}`, `event:${status.eventSeq}`],
+				});
+			} catch (error) {
+				reportAuxiliary({
+					path: join(projectRoot(ctx), ".astra", "jobs", status.jobId, "memory"),
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
 		pi.registerFlag("astra-research-control", {
 			description: "Run an Astra research control action through the Pi runtime",
 			type: "string",
@@ -172,7 +214,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			notify: boolean,
 		): Promise<void> => {
 			const current = getState(ctx);
-			if (controlResult.jobId) current.job = await ResearchJob.open(current.store, controlResult.jobId);
+			if (controlResult.action === "run" && controlResult.jobId) current.jobIdOverride = controlResult.jobId;
 			pi.appendEntry("astra_research_result", controlResult);
 			pi.sendMessage({
 				customType: "astra_research_result",
@@ -183,8 +225,24 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			if (controlResult.status) projectStatus(controlResult.status, ctx);
 			if (notify) ctx.ui.notify(JSON.stringify(controlResult, null, 2));
 		};
+		const runControl = async (
+			request: ResearchControlRequest,
+			ctx: ExtensionContext,
+		): Promise<ResearchControlResult> => {
+			const current = getState(ctx);
+			const target = request.jobId ?? current.jobIdOverride ?? current.taskPacket?.jobId;
+			const bound =
+				target && request.action !== "run" && request.action !== "migrate"
+					? { ...request, jobId: target }
+					: request;
+			if (request.action === "run")
+				return runResearchControl(bound, projectRoot(ctx), (jobId) => {
+					current.jobIdOverride = jobId;
+				});
+			return runResearchControl(bound, projectRoot(ctx));
+		};
 		const executeResearchControl = async (request: ResearchControlRequest, ctx: ExtensionContext): Promise<void> => {
-			const controlResult = await runResearchControl(request, projectRoot(ctx));
+			const controlResult = await runControl(request, ctx);
 			await recordResearchControlResult(controlResult, ctx, true);
 		};
 
@@ -195,7 +253,10 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			const controlValue = pi.getFlag("astra-research-control");
 			if (!researchControlStarted && typeof controlValue === "string") {
 				researchControlStarted = true;
-				const controlResult = await runResearchControl(decodeResearchControl(controlValue), projectRoot(ctx));
+				const request = decodeResearchControl(controlValue);
+				if (request.jobId && request.action !== "run" && request.action !== "migrate")
+					current.jobIdOverride = request.jobId;
+				const controlResult = await runControl(request, ctx);
 				await recordResearchControlResult(controlResult satisfies ResearchControlResult, ctx, false);
 				return;
 			}
@@ -212,8 +273,8 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			const job = await loadJob(current, projectRoot(ctx));
 			if (!job) return;
 			const status = job.status();
-			const skills = await loadStageSkills(projectRoot(ctx), status.activeStageId, current.role);
-			const memory = await readJobMemory(projectRoot(ctx), status.jobId, 8);
+			const skills = await loadStageSkills(projectRoot(ctx), status.activeStageId, current.role, reportAuxiliary);
+			const memory = await readJobMemory(projectRoot(ctx), status.jobId, 8, reportAuxiliary);
 			const skillContext = skills.length > 0 ? `\n\nAstra stage/role skills:\n${skills.join("\n\n")}` : "";
 			const memoryContext =
 				memory.length > 0
@@ -229,7 +290,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			const job = await loadJob(current, projectRoot(ctx));
 			if (!job) return;
 			const status = job.status();
-			const memory = await readJobMemory(projectRoot(ctx), status.jobId, 8);
+			const memory = await readJobMemory(projectRoot(ctx), status.jobId, 8, reportAuxiliary);
 			const missionContext: AgentMessage = {
 				role: "custom",
 				customType: "astra_context",
@@ -243,8 +304,13 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 
 		pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
 			const current = getState(ctx);
+			await loadTaskPacket(ctx);
 			const job = await loadJob(current, projectRoot(ctx));
-			if (!job) return;
+			if (!job) {
+				if (current.jobIdOverride || current.taskPacket || process.env.ASTRA_TASK_PACKET)
+					return { block: true, reason: "The explicitly bound Astra research job is missing" };
+				return;
+			}
 			const input = event.input as Record<string, unknown>;
 			const packet =
 				current.role === "worker" || current.role === "reviewer" ? await loadTaskPacket(ctx) : undefined;
@@ -429,13 +495,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			const job = await loadJob(current, projectRoot(ctx));
 			if (!job) return;
 			const status = job.status();
-			await appendJobMemory(projectRoot(ctx), status.jobId, {
-				stageId: status.activeStageId,
-				role: current.role,
-				kind: "checkpoint",
-				content: `eventSeq=${status.eventSeq}; next=${status.nextAction}`,
-				sourceRefs: [`job:${status.jobId}`, `event:${status.eventSeq}`],
-			});
+			await checkpointMemory(status, ctx, current.role);
 			pi.appendEntry("astra_checkpoint", {
 				jobId: status.jobId,
 				activeStageId: status.activeStageId,
@@ -454,13 +514,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			const job = await loadJob(current, projectRoot(ctx));
 			if (job) {
 				const status = job.status();
-				await appendJobMemory(projectRoot(ctx), status.jobId, {
-					stageId: status.activeStageId,
-					role: current.role,
-					kind: "checkpoint",
-					content: `shutdown eventSeq=${status.eventSeq}; next=${status.nextAction}`,
-					sourceRefs: [`job:${status.jobId}`, `event:${status.eventSeq}`],
-				});
+				await checkpointMemory(status, ctx, current.role, true);
 				pi.appendEntry("astra_checkpoint", job.status());
 				pi.appendEntry("astra_shutdown", job.status());
 			}
@@ -684,37 +738,15 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 						receivedEvidenceId: params.evidenceId,
 					}) as AgentToolResult<unknown>;
 				}
-				let expectedCriteria: string[];
 				try {
-					const parsed = JSON.parse(process.env.ASTRA_REVIEW_CRITERIA ?? "null") as unknown;
-					if (
-						!Array.isArray(parsed) ||
-						parsed.length === 0 ||
-						parsed.some((criterion) => typeof criterion !== "string")
-					) {
-						throw new Error("expected a non-empty string array");
-					}
-					expectedCriteria = parsed;
+					const job = await loadJob(current, projectRoot(ctx));
+					if (!job) throw new Error("The bound review job is missing");
+					await job.validateReview({ ...params, reviewerTaskId: packet.id });
 				} catch (error) {
-					return result(
-						`Reviewer submission rejected: frozen review criteria are unavailable (${error instanceof Error ? error.message : String(error)})`,
-					) as AgentToolResult<unknown>;
-				}
-				const missingCriteria = expectedCriteria.filter(
-					(expected) => !params.criteria.some((criterion) => criterion.criterion === expected),
-				);
-				const failedCriteria =
-					params.verdict === "pass"
-						? expectedCriteria.filter(
-								(expected) =>
-									!params.criteria.some((criterion) => criterion.criterion === expected && criterion.passed),
-							)
-						: [];
-				if (missingCriteria.length > 0 || failedCriteria.length > 0) {
-					return result(
-						`Reviewer submission rejected: use every frozen criterion exactly as written${params.verdict === "pass" ? " and mark each one passed" : ""}: ${expectedCriteria.join("; ")}`,
-						{ expectedCriteria, missingCriteria, failedCriteria },
-					) as AgentToolResult<unknown>;
+					if (!(error instanceof ReviewAssessmentError)) return failReviewSubmission(packet, error, ctx);
+					return result(`Reviewer submission rejected: ${error.message}`, {
+						error: error.message,
+					}) as AgentToolResult<unknown>;
 				}
 				const manifest = {
 					schemaVersion: "astra.reviewer_output_manifest.v1" as const,
@@ -730,9 +762,13 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					sessionRef: `pi-session:${process.env.ASTRA_SESSION_ID ?? `${packet.jobId}:${packet.id}:${packet.attempt}`}`,
 					createdAt: new Date().toISOString(),
 				};
-				const path = await writeReviewerOutputManifest(manifest, packet.scope.workspaceRoot);
-				terminalSubmissionCompleted = true;
-				return terminalResult(`Reviewer manifest written: ${path}`, manifest);
+				try {
+					const path = await writeReviewerOutputManifest(manifest, packet.scope.workspaceRoot);
+					terminalSubmissionCompleted = true;
+					return terminalResult(`Reviewer manifest written: ${path}`, manifest);
+				} catch (error) {
+					return failReviewSubmission(packet, error, ctx);
+				}
 			},
 		});
 
@@ -750,9 +786,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			async execute(_id, params, _signal, _update, ctx) {
 				const current = getState(ctx);
 				if (current.role !== "main-agent") return result("Only the main-agent session may read research objects");
-				const jobId = current.jobIdOverride ?? (await readActiveJobId(projectRoot(ctx)));
-				if (!jobId) return result("No active Astra research job");
-				const job = await ResearchJob.open(current.store, jobId);
+				const job = await loadJob(current, projectRoot(ctx));
 				if (!job) return result("No active Astra research job");
 				const collections = [
 					job.state.canonical,
@@ -1176,8 +1210,8 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					maxCostUsd: params.maxCostUsd,
 					requiredArtifactTypes: params.requirePaper ? ["paper-write", "paper-compile"] : undefined,
 				});
-				current.job = job;
 				await setActiveJobId(projectRoot(ctx), job.state.frame.jobId);
+				current.jobIdOverride = job.state.frame.jobId;
 				return result(
 					`Started Astra research job ${job.state.frame.jobId} at stage ${job.state.frame.activeStageId}`,
 					job.status(),

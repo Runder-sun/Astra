@@ -430,6 +430,16 @@ export interface Review {
 	createdAt: string;
 }
 
+export interface ReviewDeliveryRejection {
+	taskId: string;
+	attempt: number;
+	evidenceId: string;
+	targetVersionHash: string;
+	manifestSha256: string;
+	reason: string;
+	createdAt: string;
+}
+
 export interface Obligation {
 	stageId?: string;
 	evidenceId?: string;
@@ -700,6 +710,7 @@ export interface CanonicalResearchRoute {
 }
 
 export interface JobSnapshot {
+	reviewDeliveryRejections?: Record<string, ReviewDeliveryRejection>;
 	mainAgentCalls?: Record<string, MainAgentCall>;
 	cleanupIntents?: Record<string, CleanupIntent>;
 	stageDefinitions?: Record<string, StageDefinition>;
@@ -763,6 +774,7 @@ export type AstraEvent =
 			searchSelection?: { batchId: string; candidateId: string; decisionRef: string };
 	  }
 	| { type: "review_recorded"; review: Review; consequences?: ReviewConsequences }
+	| { type: "review_delivery_rejected"; rejection: ReviewDeliveryRejection }
 	| { type: "obligation_created"; obligation: Obligation }
 	| { type: "obligation_resolved"; obligationId: string; satisfiedBy: string }
 	| { type: "repair_item_resolved"; obligationId: string; itemId: string; reviewId: string; evidenceId: string }

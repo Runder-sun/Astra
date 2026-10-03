@@ -851,18 +851,26 @@ it("T9 preserves a committed reviewer when its review snapshot fails", async () 
 		if (review.evidenceId === accepted.id) delete snapshot.reviews[id];
 	await store.writeSnapshot(snapshot);
 	await job.reload();
-	const reviewer = await job.dispatchTask({ ...taskInput(job, "reviewer"), role: "reviewer" });
-	await job.setTaskStatus(reviewer.id, "succeeded");
-	failSnapshotAfter(store, (event) => event.type === "review_recorded" && event.review.reviewerTaskId === reviewer.id);
-	const adapters = forbiddenSupervisor(job, store);
-	const review = vi.fn(async () =>
-		reviewFixture(job, {
-			evidenceId: accepted.id,
-			reviewerTaskId: reviewer.id,
-			verdict: "fail",
-			findings: ["missing evidence"],
+	vi.stubEnv("ASTRA_FAKE_CODEX_MODE", "research");
+	const reviewerAdapter = new CodexResearchAdapters(
+		new CodexAppServerRunner({
+			executable: process.execPath,
+			prefixArgs: [fileURLToPath(new URL("./fixtures/codex-app-server.mjs", import.meta.url))],
 		}),
 	);
+	let reviewerId: string | undefined;
+	failSnapshotAfter(store, (event) => event.type === "review_recorded" && event.review.reviewerTaskId === reviewerId);
+	const adapters = forbiddenSupervisor(job, store);
+	const review = vi.fn(async () => {
+		const prepared = await reviewerAdapter.review(accepted, job);
+		reviewerId = prepared.reviewerTaskId;
+		return reviewFixture(job, {
+			evidenceId: accepted.id,
+			reviewerTaskId: reviewerId,
+			verdict: "fail",
+			findings: ["missing evidence"],
+		});
+	});
 	const supervisor = new ResearchSupervisor(job, store, {
 		worker: { run: adapters.forbidden },
 		reviewer: { review },
@@ -875,6 +883,7 @@ it("T9 preserves a committed reviewer when its review snapshot fails", async () 
 		},
 	});
 	await supervisor.tick();
+	const reviewer = job.state.tasks[reviewerId!];
 	expect(job.state.tasks[reviewer.id].status).toBe("succeeded");
 	expect(Object.values(job.state.reviews).some((r) => r.reviewerTaskId === reviewer.id)).toBe(true);
 	expect(Object.values(job.state.reviews).filter((r) => r.reviewerTaskId === reviewer.id)).toHaveLength(1);
