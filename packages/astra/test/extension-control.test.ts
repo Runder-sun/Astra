@@ -1,7 +1,13 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionFactory,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ResearchControlRequest, ResearchControlResult } from "../src/research-control.ts";
 
@@ -33,6 +39,7 @@ type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<vo
 interface ExtensionFixture {
 	api: ExtensionAPI;
 	commands: Map<string, CommandHandler>;
+	tools: Map<string, ToolDefinition<TSchema, unknown, unknown>>;
 	context: ExtensionCommandContext;
 	appendEntry: ReturnType<typeof vi.fn<ExtensionAPI["appendEntry"]>>;
 	sendMessage: ReturnType<typeof vi.fn<ExtensionAPI["sendMessage"]>>;
@@ -40,6 +47,7 @@ interface ExtensionFixture {
 
 function createFixture(factory: ExtensionFactory, cwd = "/workspace"): ExtensionFixture {
 	const commands = new Map<string, CommandHandler>();
+	const tools = new Map<string, ToolDefinition<TSchema, unknown, unknown>>();
 	const appendEntry = vi.fn<ExtensionAPI["appendEntry"]>();
 	const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
 	const api = {
@@ -50,7 +58,9 @@ function createFixture(factory: ExtensionFactory, cwd = "/workspace"): Extension
 			commands.set(name, command.handler);
 		},
 		registerFlag: vi.fn(),
-		registerTool: vi.fn(),
+		registerTool(tool: ToolDefinition<TSchema, unknown, unknown>) {
+			tools.set(tool.name, tool);
+		},
 		sendMessage,
 	} as unknown as ExtensionAPI;
 	const context = {
@@ -62,7 +72,7 @@ function createFixture(factory: ExtensionFactory, cwd = "/workspace"): Extension
 		},
 	} as unknown as ExtensionCommandContext;
 	void factory(api);
-	return { api, commands, context, appendEntry, sendMessage };
+	return { api, commands, tools, context, appendEntry, sendMessage };
 }
 
 async function runCommand(fixture: ExtensionFixture, name: string, args = ""): Promise<void> {
@@ -77,6 +87,72 @@ beforeEach(() => {
 });
 
 describe("Astra research control commands", () => {
+	it.each([
+		"research_dispatch",
+		"research_record_evidence",
+		"research_decide_evidence",
+		"research_review",
+		"research_adopt",
+	])("rejects busy canonical tool %s before any mutation", async (name) => {
+		const root = await mkdtemp(join(tmpdir(), "astra-tool-held-"));
+		try {
+			const store = new JsonlAstraStore(root);
+			const job = await ResearchJob.create(store, { objective: "busy tool", workspaceRoot: root });
+			await writeFile(join(root, ".astra", "active-job.json"), JSON.stringify({ jobId: job.state.frame.jobId }));
+			const fixture = createFixture(createAstraExtension(), root);
+			const before = await store.readEvents(job.state.frame.jobId);
+			await store.withJobLock(job.state.frame.jobId, "held supervisor", async () => {
+				await expect(
+					fixture.tools.get(name)!.execute(
+						"test",
+						{
+							objective: "dispatch",
+							role: "worker",
+							requiredOutputType: "validation",
+							taskId: "unknown",
+							evidenceId: "unknown",
+							type: "validation",
+							content: {},
+							refs: [],
+							accepted: true,
+							verdict: "pass",
+							findings: [],
+							score: 1,
+							criteria: [],
+							verifiedRefs: [],
+						},
+						undefined,
+						undefined,
+						fixture.context,
+					),
+				).rejects.toThrow("supervisor lock held");
+				expect(await store.readEvents(job.state.frame.jobId)).toEqual(before);
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	it("accepts guidance while the supervisor is held without changing its journal", async () => {
+		const root = await mkdtemp(join(tmpdir(), "astra-guidance-held-"));
+		try {
+			const store = new JsonlAstraStore(root);
+			const job = await ResearchJob.create(store, { objective: "held supervisor", workspaceRoot: root });
+			await writeFile(join(root, ".astra", "active-job.json"), JSON.stringify({ jobId: job.state.frame.jobId }));
+			const fixture = createFixture(createAstraExtension(), root);
+			const before = await store.readEvents(job.state.frame.jobId);
+			let guidance: Promise<void> | undefined;
+			await store.withJobLock(job.state.frame.jobId, "held supervisor", async () => {
+				guidance = runCommand(fixture, "research-guide", "preserve both worker outputs");
+				await vi.waitFor(() =>
+					expect(fixture.context.ui.notify).toHaveBeenCalledWith(expect.stringContaining("accepted")),
+				);
+				expect(await store.readEvents(job.state.frame.jobId)).toEqual(before);
+			});
+			await guidance;
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 	it("routes run, pause, and continue through the shared control service", async () => {
 		const fixture = createFixture(createAstraExtension());
 

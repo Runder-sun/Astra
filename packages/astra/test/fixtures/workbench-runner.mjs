@@ -19,17 +19,26 @@ if (request.action === "run") {
 	if (mode === "delayed-publication") await new Promise(resolve => setTimeout(resolve, 250));
 	const job = await ResearchJob.create(store, { objective: request.objective, workspaceRoot: root, maxTasks: request.maxTasks });
 	await writeFile(join(root, ".astra/active-job.json"), JSON.stringify({ jobId: job.state.frame.jobId }));
+	await store.withExecutionLock(job.state.frame.jobId, "workbench-fixture", async () => {
 	await publish(job.state.frame.jobId);
 	if (mode === "failed-after-publication") { console.error(`fixture-job-error:${job.state.frame.jobId}`); if (process.connected) process.disconnect(); process.exit(1); }
 	await job.pause("模拟任务等待用户输入；不调用模型");
+	});
 } else {
 	const jobId = request.jobId ?? JSON.parse(await readFile(join(root, ".astra/active-job.json"), "utf8")).jobId;
 	const job = await ResearchJob.open(store, jobId);
 	if (request.action === "pause") await job.pause(request.reason);
 	else {
+		await store.withExecutionLock(jobId, "workbench-fixture", async () => {
 		await job.resume();
+		await publish(jobId);
+		console.log(`fixture-resume-output:${jobId}`);
+		if (mode === "resume-output-exit") return;
+		if (mode === "resume-output-stream") setTimeout(() => console.log(`fixture-second-output:${jobId}`), 600);
 		const timer = setInterval(() => {}, 1000);
-		process.once("SIGINT", () => { clearInterval(timer); });
+		await new Promise(resolve => process.once("SIGINT", resolve));
+		clearInterval(timer);
+		});
 	}
 }
 if (process.connected) process.disconnect();

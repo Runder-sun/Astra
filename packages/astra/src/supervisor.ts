@@ -5,6 +5,7 @@ import {
 	semanticContractHash,
 	taskContractMatches,
 } from "./effective-contract.ts";
+import { applyPendingGuidance } from "./guidance-control.ts";
 import { applyPendingPauses } from "./pause-control.ts";
 import {
 	evidenceHasCurrentPlanApproval,
@@ -139,7 +140,11 @@ export class ResearchSupervisor {
 			try {
 				return await this.tickLeased();
 			} finally {
-				await this.job.releaseLease(this.owner);
+				try {
+					if (!this.mainDeliveryPending) await applyPendingGuidance(this.job);
+				} finally {
+					await this.job.releaseLease(this.owner);
+				}
 			}
 		});
 	}
@@ -156,6 +161,7 @@ export class ResearchSupervisor {
 		}
 		const initialStageId = this.job.state.frame.activeStageId;
 		if (this.job.state.frame.status === "completed") return this.result(initialStageId, [], false);
+		await applyPendingGuidance(this.job);
 		const stage = this.job.state.stages[initialStageId];
 		if (stage.status !== "running") throw new Error(`active research capability ${initialStageId} is not running`);
 		if (this.shouldYield()) return this.result(initialStageId, [], false);
@@ -189,6 +195,7 @@ export class ResearchSupervisor {
 			await this.job.consumeTurns(readyTasks.length);
 			const results = await Promise.allSettled(readyTasks.map((task) => this.runWorker(task)));
 			await this.handleSettledErrors(results);
+			await applyPendingGuidance(this.job);
 			if (this.shouldYield()) return this.result(initialStageId, dispatchedTaskIds, false);
 		}
 
@@ -555,6 +562,7 @@ export class ResearchSupervisor {
 		await this.job.consumeTurns(runnable.length);
 		const results = await Promise.allSettled(runnable.map((task) => this.runWorker(task)));
 		await this.handleSettledErrors(results);
+		await applyPendingGuidance(this.job);
 	}
 
 	private async reviewPendingEvidence(stageId: string): Promise<void> {
@@ -654,6 +662,7 @@ export class ResearchSupervisor {
 	}
 
 	private async decideSearch(batch: SearchBatch, stageId: string): Promise<void> {
+		if (planReviewStatus(this.job, batch.planId) !== "passed") return;
 		const evaluations = Object.values(this.job.state.candidateEvaluations).filter(
 			(evaluation) => evaluation.batchId === batch.id,
 		);
@@ -795,6 +804,7 @@ export class ResearchSupervisor {
 	private async callMainAgent<T extends StagePlanManifest | MainAgentDecisionManifest>(
 		run: () => Promise<T>,
 	): Promise<T> {
+		await applyPendingGuidance(this.job);
 		const before = new Set(Object.keys(this.job.state.mainAgentCalls ?? {}));
 		let result: T | undefined;
 		let failure: unknown;
@@ -843,6 +853,7 @@ export class ResearchSupervisor {
 		let executed = false;
 		try {
 			await this.checkPauseRequests();
+			if (!deferCapacityRefund) await applyPendingGuidance(this.job);
 			if (this.job.modelControl().paused) throw new ResearchPausedError("research paused before model call");
 			executed = true;
 			const result = await run();
@@ -979,7 +990,11 @@ export class ResearchSupervisor {
 					successCriteria: contract.successCriteria,
 					...(contract.searchBatchId ? { searchBatchId: contract.searchBatchId } : {}),
 					...(contract.searchCandidateId ? { searchCandidateId: contract.searchCandidateId } : {}),
-					...(prior?.status === "failed" ? { supersedesTaskId: prior.id } : {}),
+					...(prior?.status === "failed"
+						? { supersedesTaskId: prior.id }
+						: prior?.supersedesTaskId
+							? { supersedesTaskId: prior.supersedesTaskId }
+							: {}),
 				});
 			}),
 		);
@@ -991,6 +1006,7 @@ export class ResearchSupervisor {
 		let outputReturned = false;
 		try {
 			await this.callAdapter(async () => {
+				await this.job.markSearchExecutionStarted(task.id);
 				const output = await this.worker.run(task, this.job);
 				outputReturned = true;
 				await this.job.completeWorkerTask(task.id, output);

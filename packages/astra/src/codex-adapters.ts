@@ -37,7 +37,11 @@ import {
 	writeTaskPacket,
 	writeWorkerOutputManifest,
 } from "./contracts.ts";
-import { repairContext, transferableResponsibilityCandidatesFromSnapshot } from "./effective-contract.ts";
+import {
+	previousExecutedSearchBatch,
+	repairContext,
+	transferableResponsibilityCandidatesFromSnapshot,
+} from "./effective-contract.ts";
 import { readSourceRecord } from "./literature.ts";
 import { searchLiterature } from "./literature-search.ts";
 import { loadStageSkills } from "./memory.ts";
@@ -907,6 +911,11 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	): Promise<StagePlanManifest> {
 		const stageId = job.state.frame.activeStageId;
 		const id = `plan_${randomUUID()}`;
+		const previousSearch = requestedMode === "search" ? previousExecutedSearchBatch(job.state, stageId) : undefined;
+		const searchRound = previousSearch ? previousSearch.round + 1 : 1;
+		const maxSearchRounds = previousSearch?.maxRounds ?? job.definitions[stageId].searchPolicy?.maxRounds ?? 2;
+		if (requestedMode === "search" && searchRound > maxSearchRounds)
+			throw new NonRetryableResearchError("search execution round budget is exhausted");
 		const inputArtifactRefs = [...new Set([...Object.keys(job.state.canonical), ...Object.keys(job.state.evidence)])];
 		return job
 			.registerMainAgentCall({
@@ -947,7 +956,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 						},
 						{ additionalProperties: false },
 					),
-					`Design actionable worker assignments for the active capability ${stageId} in mode ${requestedMode}. ${obligation ? `Resolve obligation ${obligation.id} with one complete repair task. Read its source review and all open requirements for the same evidence lineage from the indexed state; do not copy historical ID wrappers into criteria.` : requestedMode === "search" ? "Create diverse independent candidates within searchPolicy bounds. Inspect previous batches and evaluations before continuing a search." : "Create one focused task, or two independently useful tasks."} Stage and synthesis tasks must include every requiredOutputFields field from the capability contract. Accepted local inputs awaiting synthesis: ${JSON.stringify(job.unsynthesizedLocalEvidence(stageId).map((evidence) => evidence.id))}. Read relevant previous plan reviews by their IDs in research-summary.json; their full criteria and findings are in research-context.json. Use exact existing artifact/evidence IDs as inputs. Concurrent tasks cannot depend on one another. Each task.objective must instruct its worker to perform this capability and deliver its outputs, not to plan dispatch, enter a stage or declare pipeline completion. Success criteria must assess delivered results, not readiness to start. Set responsibilityBindings explicitly: use [] for local work; set responsibilityTransfers to [] unless an independently reviewed exact handoff is necessary. Legacy handoff candidates, including sourceTaskId, sourceContractHash, sourceIndex, exactCriterion, and exactly one nodeId or issueId, are listed in research-summary.json transferableResponsibilities. Transfer only a listed item and set destinationStageId to the current stage, destinationPhase to synthesis, and a rationale. If one source requirement has both a node and issue candidate, include both exact identities. The host rejects text matching, unbound strings, wrong source fingerprints and duplicates. Keep every unlisted source requirement inherited. Synthesis must carry transferred responsibilities and bind exact unresolved objection nodeIds from research-summary.json that it will resolve. Never assign by similar wording. Only you are planning: do not execute these assignments yourself, and do not copy that restriction into worker objectives. Workers must perform the work and verification permitted by their capability contract.`,
+					`Design actionable worker assignments for the active capability ${stageId} in mode ${requestedMode}. ${obligation ? `Resolve obligation ${obligation.id} with one complete repair task. Read its source review and all open requirements for the same evidence lineage from the indexed state; do not copy historical ID wrappers into criteria.` : requestedMode === "search" ? `Create diverse independent candidates within searchPolicy bounds. This is bounded search round ${searchRound}/${maxSearchRounds}. Inspect the previously executed batch ${previousSearch?.id ?? "none"} and its evaluations before continuing a search.` : "Create one focused task, or two independently useful tasks."} Stage and synthesis tasks must include every requiredOutputFields field from the capability contract. Accepted local inputs awaiting synthesis: ${JSON.stringify(job.unsynthesizedLocalEvidence(stageId).map((evidence) => evidence.id))}. Read relevant previous plan reviews by their IDs in research-summary.json; their full criteria and findings are in research-context.json. Use exact existing artifact/evidence IDs as inputs. Concurrent tasks cannot depend on one another. Each task.objective must instruct its worker to perform this capability and deliver its outputs, not to plan dispatch, enter a stage or declare pipeline completion. Success criteria must assess delivered results, not readiness to start. Set responsibilityBindings explicitly: use [] for local work; set responsibilityTransfers to [] unless an independently reviewed exact handoff is necessary. Legacy handoff candidates, including sourceTaskId, sourceContractHash, sourceIndex, exactCriterion, and exactly one nodeId or issueId, are listed in research-summary.json transferableResponsibilities. Transfer only a listed item and set destinationStageId to the current stage, destinationPhase to synthesis, and a rationale. If one source requirement has both a node and issue candidate, include both exact identities. The host rejects text matching, unbound strings, wrong source fingerprints and duplicates. Keep every unlisted source requirement inherited. Synthesis must carry transferred responsibilities and bind exact unresolved objection nodeIds from research-summary.json that it will resolve. Never assign by similar wording. Only you are planning: do not execute these assignments yourself, and do not copy that restriction into worker objectives. Workers must perform the work and verification permitted by their capability contract.`,
 					async (result) => {
 						const value: StagePlanManifest = {
 							...result.output,

@@ -1065,7 +1065,10 @@ it.each(["workspace", "task", "resources", "sessions"] as const)(
 			sessionFile: files[3],
 			updatedAt: new Date().toISOString(),
 		});
+		expect(await cleanupTaskFiles(f.job.state, [task.id])).toEqual([]);
+		await f.job.setTaskStatus(task.id, "failed");
 		const captured = await cleanupTaskFiles(f.job.state, [task.id]);
+		expect(captured).toHaveLength(1);
 		expect(
 			[
 				captured[0].workspaceHash,
@@ -1092,7 +1095,11 @@ it.each([false, true])(
 		await mkdir(source, { recursive: true });
 		await writeFile(join(source, "a"), "A");
 		await writeFile(join(source, "b"), "B");
+		expect(await cleanupTaskFiles(f.job.state, [task.id])).toEqual([]);
+		await f.job.setTaskStatus(task.id, "failed");
 		const intent = await cleanupTaskFiles(f.job.state, [task.id]);
+		expect(intent).toHaveLength(1);
+		expect(intent[0].workspaceHash).toBeTruthy();
 		const target = join(f.root, ".astra", "jobs", task.jobId, "archive", "tasks", task.id, "workspace");
 		await mkdir(join(target, ".."), { recursive: true });
 		await cp(source, target, { recursive: true });

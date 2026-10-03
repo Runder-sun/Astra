@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const root = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
 const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root }).toString().trim();
 const packagePath = join(root, "packages/astra/package.json");
 if (!lstatSync(packagePath).isFile()) throw new Error("Non-regular file requires review: packages/astra/package.json");
@@ -12,17 +12,34 @@ const packageBytes = readFileSync(packagePath);
 const { version } = JSON.parse(packageBytes.toString("utf8"));
 const target = resolve(process.argv[2] ?? join(root, `.artifacts/astra-v${version}/source`));
 const stagingParent = dirname(target);
-const targetRelative = relative(root, target);
-if (target === root || root.startsWith(`${target}${sep}`) || /^(?:packages|scripts|docs|\.github)(?:\/|$)/.test(targetRelative))
-	throw new Error("Export destination overlaps selected source paths");
-if (existsSync(target)) throw new Error("Export destination must not exist");
 const rootFiles = new Set([
 	".gitattributes", ".gitignore", ".npmrc", "AGENTS.md", "CONTRIBUTING.md", "LICENSE", "README.md", "README.en.md",
 	"RELEASE_NOTES.md", "RELEASE_VALIDATION.md", "SECURITY.md", "biome.json", "package-lock.json", "package.json",
 	"pi-test.bat", "pi-test.ps1", "pi-test.sh", "test.sh", "tsconfig.base.json", "tsconfig.json", "vitest.base.ts",
 ]);
 const selected = (path) => rootFiles.has(path) || /^(?:packages|scripts|docs|\.github)\//.test(path);
-if (rootFiles.has(targetRelative)) throw new Error("Export destination overlaps selected source paths");
+function physicalTarget(path) {
+	let current = path;
+	const suffix = [];
+	for (;;) {
+		try { return resolve(realpathSync(current), ...suffix); }
+		catch (error) {
+			if (error.code !== "ENOENT") throw error;
+			suffix.unshift(basename(current));
+			current = dirname(current);
+		}
+	}
+}
+function checkDestination() {
+	const physical = physicalTarget(target);
+	const local = relative(root, physical).split(sep).join("/");
+	if (physical === root || root.startsWith(`${physical}${sep}`) ||
+		/^(?:packages|scripts|docs|\.github)(?:\/|$)/.test(local) || rootFiles.has(local))
+		throw new Error("Export destination overlaps selected source paths");
+	if (existsSync(target)) throw new Error("Export destination must not exist");
+	return physical;
+}
+const destination = checkDestination();
 const objectFormat = execFileSync("git", ["rev-parse", "--show-object-format"], { cwd: root }).toString().trim();
 const commitFiles = new Map(execFileSync("git", ["ls-tree", "-rz", baseCommit], { cwd: root }).toString()
 	.split("\0").filter(Boolean).map((entry) => {
@@ -72,7 +89,7 @@ try {
 	}, null, 2)}\n`);
 	if (execFileSync("git", ["rev-parse", "HEAD"], { cwd: root }).toString().trim() !== baseCommit)
 		throw new Error("Source HEAD changed during export; retry against a stable commit");
-	if (existsSync(target)) throw new Error("Export destination must not exist");
+	if (checkDestination() !== destination) throw new Error("Export destination changed during preparation");
 	renameSync(staging, target);
 } finally {
 	rmSync(staging, { recursive: true, force: true });

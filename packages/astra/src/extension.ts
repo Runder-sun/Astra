@@ -12,6 +12,8 @@ import {
 	writeStagePlanManifest,
 	writeWorkerOutputManifest,
 } from "./contracts.ts";
+import { previousExecutedSearchBatch } from "./effective-contract.ts";
+import { applyPendingGuidance, requestResearchGuidance } from "./guidance-control.ts";
 import { compactLiteratureSearch, type Fetcher } from "./literature.ts";
 import { searchLiterature } from "./literature-search.ts";
 import { type AuxiliaryDiagnostic, appendJobMemory, loadStageSkills, readJobMemory } from "./memory.ts";
@@ -26,7 +28,7 @@ import {
 	runResearchControl,
 } from "./research-control.ts";
 import { ReviewAssessmentError } from "./review-validation.ts";
-import { JsonlAstraStore } from "./store.ts";
+import { JsonlAstraStore, ResearchJobBusyError } from "./store.ts";
 import { readVersionedFile, taskRecoveryMaterials } from "./task-workspace.ts";
 import type {
 	AutomationLevel,
@@ -916,9 +918,13 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 						) as AgentToolResult<unknown>;
 					}
 					const previousBatchId = process.env.ASTRA_SEARCH_PREVIOUS_BATCH_ID;
-					if (previousBatchId) {
-						const previousBatch = job.state.searchBatches[previousBatchId];
-						if (!previousBatch || previousBatch.stageId !== stageId || previousBatch.status !== "exhausted") {
+					const previousBatch = previousExecutedSearchBatch(job.state, stageId);
+					if (previousBatchId || previousBatch) {
+						if (
+							!previousBatch ||
+							previousBatch.id !== previousBatchId ||
+							previousBatch.round >= previousBatch.maxRounds
+						) {
 							return result(
 								"Search plan rejected: previous search batch does not match this round",
 							) as AgentToolResult<unknown>;
@@ -1247,29 +1253,33 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 				const current = getState(ctx);
 				const job = await loadJob(current, projectRoot(ctx));
 				if (!job) return result("No active Astra research job");
-				const stageId = job.state.frame.activeStageId;
-				const task = await job.dispatchTask({
-					stageId,
-					stageExecutionId: job.state.stages[stageId].executionId ?? `stage_exec_${stageId}`,
-					agentId: `${params.role}_${Date.now()}`,
-					role: params.role,
-					objective: params.objective,
-					inputArtifactRefs: params.inputArtifactRefs ?? [],
-					requiredCanonicalArtifacts: [],
-					requiredOutputType: params.requiredOutputType,
-					requiredOutputFields: ["content", "outputRefs"],
-					acceptanceChecks: job.definitions[stageId]?.acceptanceChecks ?? [],
-					failureSignals: ["missing output manifest", "empty evidence refs"],
-					dependencies: [],
-					scope: { workspaceRoot: projectRoot(ctx), allowedPaths: ["."] },
-					allowedTools: job.state.frame.permissions.allowedTools,
-					writeAuthority: params.role === "worker" ? "workspace-write" : "none",
-					budget: { maxTurns: 8, maxToolCalls: 16, maxRuntimeMs: 300_000 },
-					reviewGateRequired: true,
-					resumePolicy: "resume-session",
-					successCriteria: job.definitions[stageId]?.acceptanceChecks ?? [],
+				return current.store.withJobLock(job.state.frame.jobId, `interactive_${process.pid}`, async () => {
+					const latest = await ResearchJob.open(current.store, job.state.frame.jobId);
+					if (!latest) throw new Error("active Astra research job disappeared");
+					const stageId = latest.state.frame.activeStageId;
+					const task = await latest.dispatchTask({
+						stageId,
+						stageExecutionId: latest.state.stages[stageId].executionId ?? `stage_exec_${stageId}`,
+						agentId: `${params.role}_${Date.now()}`,
+						role: params.role,
+						objective: params.objective,
+						inputArtifactRefs: params.inputArtifactRefs ?? [],
+						requiredCanonicalArtifacts: [],
+						requiredOutputType: params.requiredOutputType,
+						requiredOutputFields: ["content", "outputRefs"],
+						acceptanceChecks: latest.definitions[stageId]?.acceptanceChecks ?? [],
+						failureSignals: ["missing output manifest", "empty evidence refs"],
+						dependencies: [],
+						scope: { workspaceRoot: projectRoot(ctx), allowedPaths: ["."] },
+						allowedTools: latest.state.frame.permissions.allowedTools,
+						writeAuthority: params.role === "worker" ? "workspace-write" : "none",
+						budget: { maxTurns: 8, maxToolCalls: 16, maxRuntimeMs: 300_000 },
+						reviewGateRequired: true,
+						resumePolicy: "resume-session",
+						successCriteria: latest.definitions[stageId]?.acceptanceChecks ?? [],
+					});
+					return result(JSON.stringify(task, null, 2), task);
 				});
-				return result(JSON.stringify(task, null, 2), task);
 			},
 		});
 
@@ -1287,14 +1297,18 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 				const current = getState(ctx);
 				const job = await loadJob(current, projectRoot(ctx));
 				if (!job) return result("No active Astra research job");
-				const evidence = await job.recordEvidence({
-					taskId: params.taskId,
-					stageId: job.state.frame.activeStageId,
-					type: params.type,
-					content: params.content,
-					refs: params.refs,
+				return current.store.withJobLock(job.state.frame.jobId, `interactive_${process.pid}`, async () => {
+					const latest = await ResearchJob.open(current.store, job.state.frame.jobId);
+					if (!latest) throw new Error("active Astra research job disappeared");
+					const evidence = await latest.recordEvidence({
+						taskId: params.taskId,
+						stageId: latest.state.frame.activeStageId,
+						type: params.type,
+						content: params.content,
+						refs: params.refs,
+					});
+					return result(`Recorded evidence candidate ${evidence.id}`, evidence);
 				});
-				return result(`Recorded evidence candidate ${evidence.id}`, evidence);
 			},
 		});
 
@@ -1311,11 +1325,15 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 				const current = getState(ctx);
 				const job = await loadJob(current, projectRoot(ctx));
 				if (!job) return result("No active Astra research job");
-				await job.decideEvidence(params.evidenceId, params.accepted, params.decisionRef);
-				return result(
-					`${params.accepted ? "Accepted" : "Rejected"} evidence ${params.evidenceId}`,
-					job.state.evidence[params.evidenceId],
-				);
+				return current.store.withJobLock(job.state.frame.jobId, `interactive_${process.pid}`, async () => {
+					const latest = await ResearchJob.open(current.store, job.state.frame.jobId);
+					if (!latest) throw new Error("active Astra research job disappeared");
+					await latest.decideEvidence(params.evidenceId, params.accepted, params.decisionRef);
+					return result(
+						`${params.accepted ? "Accepted" : "Rejected"} evidence ${params.evidenceId}`,
+						latest.state.evidence[params.evidenceId],
+					);
+				});
 			},
 		});
 
@@ -1332,16 +1350,20 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 				const current = getState(ctx);
 				const job = await loadJob(current, projectRoot(ctx));
 				if (!job) return result("No active Astra research job");
-				const review = await job.recordReview({
-					evidenceId: params.evidenceId,
-					verdict: params.verdict as ReviewVerdict,
-					findings: params.findings,
-					score: params.score,
-					criteria: params.criteria,
-					verifiedRefs: params.verifiedRefs,
-					targetVersionHash: params.targetVersionHash,
+				return current.store.withJobLock(job.state.frame.jobId, `interactive_${process.pid}`, async () => {
+					const latest = await ResearchJob.open(current.store, job.state.frame.jobId);
+					if (!latest) throw new Error("active Astra research job disappeared");
+					const review = await latest.recordReview({
+						evidenceId: params.evidenceId,
+						verdict: params.verdict as ReviewVerdict,
+						findings: params.findings,
+						score: params.score,
+						criteria: params.criteria,
+						verifiedRefs: params.verifiedRefs,
+						targetVersionHash: params.targetVersionHash,
+					});
+					return result(`Recorded ${review.verdict} review ${review.id}`, review);
 				});
-				return result(`Recorded ${review.verdict} review ${review.id}`, review);
 			},
 		});
 
@@ -1355,8 +1377,12 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 				const current = getState(ctx);
 				const job = await loadJob(current, projectRoot(ctx));
 				if (!job) return result("No active Astra research job");
-				const artifact = await job.adoptEvidence(params.evidenceId, params.replacementOf);
-				return result(`Adopted canonical artifact ${artifact.id}`, artifact);
+				return current.store.withJobLock(job.state.frame.jobId, `interactive_${process.pid}`, async () => {
+					const latest = await ResearchJob.open(current.store, job.state.frame.jobId);
+					if (!latest) throw new Error("active Astra research job disappeared");
+					const artifact = await latest.adoptEvidence(params.evidenceId, params.replacementOf);
+					return result(`Adopted canonical artifact ${artifact.id}`, artifact);
+				});
 			},
 		});
 
@@ -1378,13 +1404,44 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 		pi.registerCommand("research-guide", {
 			description: "Add user guidance to the canonical research graph",
 			handler: async (guidance, ctx) => {
-				const job = await loadJob(getState(ctx), projectRoot(ctx));
+				const current = getState(ctx);
+				const root = projectRoot(ctx);
+				const store = current.store;
+				const signal = ctx.signal;
+				const job = await loadJob(current, root);
 				if (!job) {
 					ctx.ui.notify("No active Astra research job");
 					return;
 				}
-				await job.recordUserGuidance(guidance);
-				ctx.ui.notify(formatResearchBoard(buildResearchBoard(job.state)));
+				const jobId = job.state.frame.jobId;
+				const request = await requestResearchGuidance(root, jobId, guidance);
+				ctx.ui.notify(`Guidance accepted for ${jobId}; request ${request.requestId} is waiting for application`);
+				try {
+					for (;;) {
+						if (signal?.aborted) throw new Error("research guidance waiting was cancelled");
+						let entered = false;
+						try {
+							await store.withJobLock(jobId, `guidance_${process.pid}`, async () => {
+								entered = true;
+								const latest = await ResearchJob.open(store, jobId);
+								if (!latest) throw new Error(`research guidance job not found: ${jobId}`);
+								await applyPendingGuidance(latest, request.requestId);
+								ctx.ui.notify(
+									`Guidance applied for ${jobId}; request ${request.requestId}\n${formatResearchBoard(buildResearchBoard(latest.state))}`,
+								);
+							});
+							return;
+						} catch (error) {
+							if (entered || !(error instanceof ResearchJobBusyError)) throw error;
+							await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+						}
+					}
+				} catch (error) {
+					ctx.ui.notify(
+						`Guidance application unconfirmed for ${jobId}; persisted request ${request.requestId} is retained`,
+					);
+					throw error;
+				}
 			},
 		});
 		pi.registerCommand("research-route", {

@@ -21,7 +21,21 @@ try {
 	// Replace only the model-facing runner; the compiled server must resolve it itself.
 	await writeFile(
 		join(root, "dist/workbench-runner.js"),
-		'import { writeFile } from "node:fs/promises"; let body = ""; for await (const chunk of process.stdin) body += chunk; await writeFile("request.json", body);\n',
+		`import { writeFile } from "node:fs/promises";
+import { ResearchJob } from "./research.js";
+import { JsonlAstraStore } from "./store.js";
+let body = "";
+for await (const chunk of process.stdin) body += chunk;
+await writeFile("request.json", body);
+const request = JSON.parse(body);
+const store = new JsonlAstraStore(process.cwd());
+const job = await ResearchJob.create(store, { objective: request.objective, workspaceRoot: process.cwd(), maxTasks: request.maxTasks });
+await store.withExecutionLock(job.state.frame.jobId, "package-smoke", async () => {
+ await writeFile(".astra/active-job.json", JSON.stringify({ jobId: job.state.frame.jobId }));
+ await new Promise((resolve, reject) => process.send({ type: "astra/job-published", jobId: job.state.frame.jobId }, (error) => error ? reject(error) : resolve()));
+});
+if (process.connected) process.disconnect();
+`,
 	);
 	await symlink(join(root, "dist/workbench.js"), join(root, "astra-workbench"));
 	child = spawn(process.execPath, [join(root, "astra-workbench"), "--root", join(root, "runs"), "--port", "0"], {

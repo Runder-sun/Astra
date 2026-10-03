@@ -571,6 +571,35 @@ async function auditFixture() {
 	return { workspace, jobRoot, snapshot, path, receipt, save, audit };
 }
 
+for (const owner of ["active", "candidate", "reviewer"]) {
+	test(`audits a receipted source task still owned by ${owner}`, async () => {
+		const fixture = await auditFixture();
+		try {
+			const source = { id: "task_current", jobId: "job_integrity", role: "worker", status: "succeeded",
+				stageId: "validation", stageRevision: 1, attempt: 1, replayKey: "stage-plan:shared:source",
+				objective: "shared source", inputArtifactRefs: [] };
+			fixture.snapshot.stages.validation = { status: "running", revision: 1 };
+			fixture.snapshot.tasks[source.id] = source;
+			fixture.snapshot.stagePlans.shared = { id: "shared", stageId: "validation", tasks: [{ key: "source", objective: source.objective }] };
+			fixture.snapshot.discardedEvidence = { historical: { evidenceId: "historical", taskId: source.id } };
+			if (owner !== "active") {
+				fixture.snapshot.canonical = {};
+				fixture.snapshot.canonicalRoute.stageArtifactIds = {};
+				fixture.snapshot.evidence.evidence_current.status = "candidate";
+			}
+			if (owner === "reviewer") {
+				fixture.snapshot.tasks.reviewer = { ...source, id: "reviewer", role: "reviewer", status: "ready",
+					replayKey: "review:current:1", inputArtifactRefs: ["evidence_current"] };
+			}
+			// Other receipt collections are intentionally absent, as allowed by the audit input contract.
+			await fixture.save();
+			const report = fixture.audit();
+			assert.deepEqual(report.workspaces.missingTaskIds, [source.id]);
+			assert.equal(report.contractChecks.workerContextsValid, false);
+		} finally { await rm(fixture.workspace, { recursive: true, force: true }); }
+	});
+}
+
 test("canonical receipts bind actual bytes, schema, identity, path, and content", async () => {
 	const fixture = await auditFixture();
 	try {

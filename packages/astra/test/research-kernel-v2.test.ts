@@ -329,6 +329,7 @@ describe("Research Kernel v2", () => {
 				effectiveContractHash: semanticContractHash(contract),
 				replayKey: `stage-plan:${searchPlan.id}:${candidate.key}`,
 			});
+			await job.markSearchExecutionStarted(task.id);
 			await job.setTaskStatus(task.id, "succeeded");
 			const evidence = await job.recordEvidence({
 				taskId: task.id,

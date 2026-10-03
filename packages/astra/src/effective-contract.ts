@@ -478,6 +478,22 @@ export function buildEffectiveTaskContractFromSnapshot(
 	};
 }
 
+export function previousExecutedSearchBatch(snapshot: JobSnapshot, stageId: string): SearchBatch | undefined {
+	const latest = Object.values(snapshot.searchBatches)
+		.filter(
+			(batch) =>
+				batch.stageId === stageId &&
+				(batch.stageRevision ?? 1) === (snapshot.stages[stageId].revision ?? 1) &&
+				(batch.executionStartedAt !== undefined ||
+					(batch.executionTracking !== "start-commit" &&
+						Object.values(snapshot.tasks).some(
+							(task) => task.role === "worker" && task.searchBatchId === batch.id,
+						))),
+		)
+		.sort((left, right) => right.round - left.round || right.updatedAt.localeCompare(left.updatedAt))[0];
+	return latest && ["exhausted", "superseded"].includes(latest.status) ? latest : undefined;
+}
+
 export function searchBatchForPlan(
 	snapshot: JobSnapshot,
 	definition: StageDefinition,
@@ -491,20 +507,14 @@ export function searchBatchForPlan(
 		maxCandidates: 4,
 		criteria: definition.acceptanceChecks,
 	};
-	const latest = Object.values(snapshot.searchBatches)
-		.filter(
-			(batch) =>
-				batch.stageId === plan.stageId &&
-				(batch.stageRevision ?? 1) === (snapshot.stages[plan.stageId].revision ?? 1),
-		)
-		.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
-	const previous = latest && ["exhausted", "superseded"].includes(latest.status) ? latest : undefined;
+	const previous = previousExecutedSearchBatch(snapshot, plan.stageId);
 	const maxRounds = previous?.maxRounds ?? policy.maxRounds ?? 2;
 	const round = previous ? previous.round + 1 : 1;
 	if (!Number.isInteger(maxRounds) || maxRounds <= 0) throw new Error("search maxRounds must be a positive integer");
 	if (round > maxRounds) throw new Error(`search round ${round} exceeds the maximum of ${maxRounds}`);
 	const id = `search_${semanticContractHash({ jobId: plan.jobId, planId: plan.id }).slice(0, 24)}`;
 	return {
+		executionTracking: "start-commit",
 		id,
 		stageId: plan.stageId,
 		planId: plan.id,

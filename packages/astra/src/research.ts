@@ -1230,6 +1230,30 @@ export class ResearchJob {
 		return { batch, nodes, edges };
 	}
 
+	async markSearchExecutionStarted(taskId: string): Promise<void> {
+		return this.exclusive(async () => {
+			const task = this.snapshot.tasks[taskId];
+			if (!task || task.role !== "worker") throw new Error("search execution requires a worker task");
+			if (!task.searchBatchId) return;
+			const batch = this.snapshot.searchBatches[task.searchBatchId];
+			if (
+				!batch ||
+				batch.status === "superseded" ||
+				batch.stageId !== task.stageId ||
+				batch.candidates[task.searchCandidateId ?? ""]?.taskId !== taskId
+			) {
+				throw new Error("search execution task no longer belongs to its current batch");
+			}
+			if (batch.executionStartedAt) return;
+			await this.appendEvent({
+				type: "search_batch_execution_started",
+				batchId: batch.id,
+				taskId,
+				startedAt: new Date().toISOString(),
+			});
+		});
+	}
+
 	private pendingSearchContinuation(stageId: string): SearchBatch | undefined {
 		const latest = Object.values(this.snapshot.searchBatches)
 			.filter((batch) => batch.stageId === stageId && batch.status !== "superseded")
@@ -1241,15 +1265,25 @@ export class ResearchJob {
 		return value.trim().toLocaleLowerCase().replace(/\s+/g, " ");
 	}
 
-	async recordUserGuidance(guidance: string, resume = false): Promise<ResearchNode> {
+	async recordUserGuidance(guidance: string, resume = false, requestId?: string): Promise<ResearchNode> {
 		return this.exclusive(async () => {
 			const statement = guidance.trim();
 			if (!statement) throw new Error("research guidance cannot be empty");
+			const domainRef = requestId ? `guidance-request:${requestId}` : undefined;
+			const applied = domainRef
+				? Object.values(this.snapshot.graph.nodes).find((node) => node.domainRef === domainRef)
+				: undefined;
+			if (applied) {
+				if (applied.statement !== `User guidance: ${statement}`)
+					throw new Error("research guidance request identity already has different content");
+				return applied;
+			}
 			if (resume && this.snapshot.frame.userGate && this.snapshot.frame.userGate.kind !== "research")
 				throw new Error("guided resume cannot bypass a stage or budget gate");
 			const stageId = this.snapshot.frame.activeStageId;
 			const node = createResearchNode({
 				kind: "decision",
+				...(domainRef ? { domainRef } : {}),
 				statement: `User guidance: ${statement}`,
 				status: "accepted",
 				stageId,
@@ -4610,6 +4644,7 @@ export class ResearchJob {
 	}
 
 	async resume(): Promise<void> {
+		if (this.snapshot.frame.status === "completed") return;
 		await this.recoverLegacyProviderCapacityFailure();
 		return this.exclusive(async () => {
 			const gate = this.snapshot.frame.userGate;
@@ -4644,6 +4679,7 @@ export class ResearchJob {
 	}
 
 	async resumeWithGuidance(guidance: string): Promise<void> {
+		if (this.snapshot.frame.status === "completed") return;
 		if (this.snapshot.frame.userGate && this.snapshot.frame.userGate.kind !== "research") {
 			throw new Error("guided resume cannot bypass a stage or budget gate");
 		}
@@ -5253,6 +5289,12 @@ export class ResearchJob {
 				batch.exhaustionRationale = event.rationale;
 				batch.updatedAt = timestamp;
 				this.snapshot.frame.nextAction = `search ${event.batchId} exhausted; decide next route`;
+				return;
+			}
+			case "search_batch_execution_started": {
+				const batch = this.snapshot.searchBatches[event.batchId];
+				batch.executionStartedAt = event.startedAt;
+				batch.executionStartedTaskId = event.taskId;
 				return;
 			}
 			case "candidate_evaluation_recorded":

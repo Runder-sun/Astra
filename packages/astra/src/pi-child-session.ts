@@ -17,7 +17,7 @@ import {
 	writeReviewTrace,
 	writeTaskPacket,
 } from "./contracts.ts";
-import { transferableResponsibilityCandidatesFromSnapshot } from "./effective-contract.ts";
+import { previousExecutedSearchBatch, transferableResponsibilityCandidatesFromSnapshot } from "./effective-contract.ts";
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
 import type { ResearchJob } from "./research.ts";
 import { checksum } from "./research.ts";
@@ -960,6 +960,9 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 		const snapshot = job.state;
 		const stageId = snapshot.frame.activeStageId;
 		const definition = job.definitions[stageId];
+		const latestSearchBatch = previousExecutedSearchBatch(snapshot, stageId);
+		if (requestedMode === "search" && latestSearchBatch && latestSearchBatch.round >= latestSearchBatch.maxRounds)
+			throw new NonRetryableResearchError("search execution round budget is exhausted");
 		const decisionRef = `stage-plan-${stageId}-${snapshot.eventSeq + 1}-${Date.now()}`;
 		const planId = `plan_${decisionRef}`;
 		const sessionId = resumableMainSessionId(job);
@@ -984,12 +987,9 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 						task: snapshot.tasks[evidence.taskId],
 					}))
 			: [];
-		const latestSearchBatch = Object.values(snapshot.searchBatches)
-			.filter((batch) => batch.stageId === stageId && batch.status !== "superseded")
-			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
 		const continuationBatch =
 			requestedMode === "search" &&
-			latestSearchBatch?.status === "exhausted" &&
+			latestSearchBatch !== undefined &&
 			latestSearchBatch.round < latestSearchBatch.maxRounds
 				? latestSearchBatch
 				: undefined;

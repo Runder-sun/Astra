@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { CodexResearchAdapters } from "./codex-adapters.ts";
 import { CodexAppServerRunner } from "./codex-app-server.ts";
 import { assertAstraId, atomicWriteJson } from "./contracts.ts";
+import { applyPendingGuidance } from "./guidance-control.ts";
 import { migratePmcli } from "./migration.ts";
 import { applyPendingPauses, requestResearchPause } from "./pause-control.ts";
 import { PiChildSessionRunner, PiMainAgentAdapter, PiReviewerAdapter, PiWorkerAdapter } from "./pi-child-session.ts";
@@ -270,6 +271,7 @@ async function driveToCompletion(
 		await store.withJobLock(job.state.frame.jobId, `control_${process.pid}`, async () => {
 			await job.reload();
 			await applyPendingPauses(job);
+			await applyPendingGuidance(job);
 		});
 		if (job.state.paused) return;
 		const retryAt = job.state.providerBackoff?.retryAt;
@@ -332,11 +334,13 @@ export async function runResearchControl(
 			maxCostUsd: request.unlimitedCost ? undefined : request.maxCostUsd,
 			requiredArtifactTypes: request.requirePaper ? ["paper-write", "paper-compile"] : undefined,
 		});
-		await atomicWriteJson(join(cwd, ".astra", "jobs", job.state.frame.jobId, "backend.json"), { backend });
-		await bindActiveJob(cwd, job.state.frame.jobId);
-		onJobPublished?.(job.state.frame.jobId);
-		await driveToCompletion(job, store, cwd, backend);
-		return { action: request.action, ...accounting, jobId: job.state.frame.jobId, status: job.status() };
+		return store.withExecutionLock(job.state.frame.jobId, `control_${process.pid}`, async () => {
+			await atomicWriteJson(join(cwd, ".astra", "jobs", job.state.frame.jobId, "backend.json"), { backend });
+			await bindActiveJob(cwd, job.state.frame.jobId);
+			onJobPublished?.(job.state.frame.jobId);
+			await driveToCompletion(job, store, cwd, backend);
+			return { action: request.action, ...accounting, jobId: job.state.frame.jobId, status: job.status() };
+		});
 	}
 
 	const jobId = request.jobId;
@@ -355,23 +359,33 @@ export async function runResearchControl(
 		return { action: request.action, ...accounting, jobId, status: job.status() };
 	}
 	if (request.action === "resume") {
-		job = await mutateLatestJob(store, jobId, async (latest) => {
-			await applyPendingPauses(latest);
-			if (request.automation !== undefined && request.automation !== latest.state.frame.automation) {
-				await latest.setAutomation(request.automation);
-			}
-			const budget: Partial<MissionFrame["budget"]> = {};
-			if (request.maxTasks !== undefined) budget.maxTasks = request.maxTasks;
-			if (request.maxTurns !== undefined) budget.maxTurns = request.maxTurns;
-			if (request.maxCostUsd !== undefined) budget.maxCostUsd = request.maxCostUsd;
-			if (request.unlimitedCost) budget.maxCostUsd = undefined;
-			if (Object.keys(budget).length > 0) await latest.updateBudget(budget);
-			if (request.guidance) await latest.resumeWithGuidance(request.guidance);
-			else await latest.resume();
+		return store.withExecutionLock(jobId, `control_${process.pid}`, async () => {
+			onJobPublished?.(jobId);
+			job = await mutateLatestJob(store, jobId, async (latest) => {
+				if (latest.state.frame.status === "completed") return;
+				await applyPendingPauses(latest);
+				if (request.automation !== undefined && request.automation !== latest.state.frame.automation) {
+					await latest.setAutomation(request.automation);
+				}
+				const budget: Partial<MissionFrame["budget"]> = {};
+				if (request.maxTasks !== undefined) budget.maxTasks = request.maxTasks;
+				if (request.maxTurns !== undefined) budget.maxTurns = request.maxTurns;
+				if (request.maxCostUsd !== undefined) budget.maxCostUsd = request.maxCostUsd;
+				if (request.unlimitedCost) budget.maxCostUsd = undefined;
+				if (Object.keys(budget).length > 0) await latest.updateBudget(budget);
+				if (request.guidance) await latest.resumeWithGuidance(request.guidance);
+				else await latest.resume();
+			});
+			if (job.state.frame.status === "completed")
+				return { action: request.action, ...accounting, jobId, status: job.status() };
+			await driveToCompletion(job, store, cwd, backend);
+			return { action: request.action, ...accounting, jobId, status: job.status() };
 		});
-		await driveToCompletion(job, store, cwd, backend);
-		return { action: request.action, ...accounting, jobId, status: job.status() };
 	}
-	const control = await createSupervisor(job, store, cwd, backend).tick();
-	return { action: request.action, ...accounting, jobId, status: job.status(), control };
+	const tickJob = job;
+	return store.withExecutionLock(jobId, `control_${process.pid}`, async () => {
+		onJobPublished?.(jobId);
+		const control = await createSupervisor(tickJob, store, cwd, backend).tick();
+		return { action: request.action, ...accounting, jobId, status: tickJob.status(), control };
+	});
 }

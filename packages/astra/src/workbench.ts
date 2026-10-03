@@ -3,7 +3,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -27,22 +27,44 @@ interface RunState {
 	error?: string;
 	pauseRequested?: boolean;
 	jobId?: string;
+	published?: boolean;
+	flush?: Promise<void>;
 }
 
 export async function startWorkbench(options: { root: string; watch?: string[]; port?: number; runnerPath?: string }) {
-	const root = resolve(options.root);
-	await mkdir(root, { recursive: true });
+	await mkdir(resolve(options.root), { recursive: true });
+	const root = await realpath(resolve(options.root));
 	const entries = new Map<string, Entry>();
+	const aliases = new Map<string, string>();
 	const running = new Map<string, RunState>();
+	const logWrites = new Map<string, Promise<void>>();
 	const token = randomUUID();
 	const webRoot = fileURLToPath(new URL("../web/", import.meta.url));
 	function register(path: string, readonly: boolean) {
 		const id = createHash("sha256").update(path).digest("hex").slice(0, 20);
-		const entry = { id, root: path, readonly };
+		const entry = entries.get(id) ?? { id, root: path, readonly };
+		entry.readonly ||= readonly;
 		entries.set(id, entry);
 		return entry;
 	}
-	for (const path of options.watch ?? []) register(resolve(path), true);
+	async function refreshWatchEntries() {
+		for (const path of options.watch ?? []) {
+			const lexical = resolve(path);
+			let physical = lexical;
+			try {
+				physical = await realpath(lexical);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			const entry = register(physical, true);
+			const oldId = createHash("sha256").update(lexical).digest("hex").slice(0, 20);
+			if (oldId !== entry.id) {
+				aliases.set(oldId, entry.id);
+				entries.delete(oldId);
+			}
+		}
+	}
+	await refreshWatchEntries();
 	for (const directory of await readdir(root, { withFileTypes: true })) {
 		if (directory.isDirectory() && directory.name.startsWith("run-")) register(join(root, directory.name), false);
 	}
@@ -66,7 +88,62 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 		const execution = running.get(entry.id);
 		return state && execution?.jobId && execution.jobId !== state.frame.jobId ? undefined : execution;
 	}
-	function launch(entry: Entry, request: ResearchControlRequest) {
+	function persistLog(entry: Entry, state: RunState): Promise<void> {
+		if (!state.published || !state.jobId) return Promise.resolve();
+		const path = join(entry.root, ".astra/jobs", state.jobId, "workbench-output.log");
+		const output = state.output;
+		const write = (logWrites.get(path) ?? Promise.resolve())
+			.then(() => writeFile(path, output))
+			.catch((error: unknown) => {
+				state.error = `运行输出保存失败：${error instanceof Error ? error.message : String(error)}`;
+			});
+		logWrites.set(path, write);
+		return write;
+	}
+	async function readLog(entry: Entry, jobId: string | undefined): Promise<string> {
+		if (!jobId) return "";
+		let file: FileHandle;
+		try {
+			file = await open(join(entry.root, ".astra/jobs", jobId, "workbench-output.log"), "r");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+			throw error;
+		}
+		try {
+			const size = (await file.stat()).size;
+			const bytes = Buffer.alloc(Math.min(size, 64_000));
+			await file.read(bytes, 0, bytes.length, Math.max(0, size - bytes.length));
+			return bytes.toString().slice(-16000);
+		} finally {
+			await file.close();
+		}
+	}
+	async function pauseChild(entry: Entry, execution: RunState, deferred = false) {
+		if (!execution.published || !execution.jobId) return;
+		const owner = await new JsonlAstraStore(entry.root).readExecutionOwner(execution.jobId);
+		if (!owner && deferred) return;
+		if (!execution.child || owner?.pid !== execution.child.pid || owner?.jobId !== execution.jobId)
+			throw new Error("执行归属已变化，不能暂停该进程");
+		execution.child.kill("SIGINT");
+	}
+	async function executionDetails(entry: Entry, state: JobSnapshot | undefined) {
+		const execution = displayedRun(entry, state);
+		const owner = state ? await new JsonlAstraStore(entry.root).readExecutionOwner(state.frame.jobId) : undefined;
+		return {
+			running: Boolean(owner || execution?.child),
+			canPause:
+				!entry.readonly &&
+				Boolean(
+					execution?.child &&
+						(!execution.published || (owner?.pid === execution.child.pid && owner?.jobId === state?.frame.jobId)),
+				),
+			error: execution?.error,
+		};
+	}
+	async function launch(entry: Entry, request: ResearchControlRequest) {
+		await running.get(entry.id)?.flush;
+		if (request.jobId && (await new JsonlAstraStore(entry.root).readExecutionOwner(request.jobId)))
+			throw new Error("当前研究已有执行进程，请勿重复启动");
 		if (running.get(entry.id)?.child) throw new Error("当前任务已有执行进程，请勿重复启动");
 		const env: NodeJS.ProcessEnv = { ...process.env, ASTRA_CODEX_MODEL: "gpt-5.6-luna" };
 		delete env.ASTRA_FIXTURE_PROVIDER;
@@ -82,6 +159,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 		running.set(entry.id, state);
 		const collect = (chunk: Buffer) => {
 			state.output = (state.output + chunk.toString()).slice(-16000);
+			state.flush = persistLog(entry, state);
 		};
 		child.stdout?.on("data", collect);
 		child.stderr?.on("data", collect);
@@ -99,7 +177,12 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				assertAstraId(message.jobId, "job id");
 				if (state.jobId && state.jobId !== message.jobId) throw new Error("执行进程发布的研究身份不一致");
 				state.jobId = message.jobId;
-				if (state.pauseRequested) state.child?.kill("SIGINT");
+				state.published = true;
+				state.flush = persistLog(entry, state);
+				if (state.pauseRequested)
+					void pauseChild(entry, state, true).catch((error: unknown) => {
+						state.error = String(error);
+					});
 			} catch (error) {
 				state.error = error instanceof Error ? error.message : String(error);
 			}
@@ -109,14 +192,20 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 		});
 		child.on("close", (code, signal) => {
 			state.child = undefined;
-			if (!state.jobId)
+			if (!state.published)
 				state.error = `${state.error ? `${state.error}\n` : ""}执行进程退出前没有发布研究身份，无法确认控制目标`;
 			if (code !== 0) state.error ??= `执行进程退出（${signal ?? code}），请查看运行输出与任务状态`;
-			void writeFile(join(entry.root, "workbench-output.log"), state.output).catch((error) => {
-				state.error = String(error);
-			});
-			if (state.pauseRequested && state.jobId)
-				launch(entry, { action: "pause", jobId: state.jobId, reason: "用户从工作台暂停" });
+			state.flush = persistLog(entry, state)
+				.then(() => writeFile(join(entry.root, "workbench-output.log"), state.output))
+				.catch((error: unknown) => {
+					state.error = String(error);
+				});
+			if (state.pauseRequested && state.published && state.jobId)
+				void state.flush
+					.then(() => launch(entry, { action: "pause", jobId: state.jobId, reason: "用户从工作台暂停" }))
+					.catch((error: unknown) => {
+						state.error = String(error);
+					});
 		});
 		child.stdin?.on("error", (error) => {
 			state.error = error.message;
@@ -130,6 +219,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 			res.end(JSON.stringify(value));
 		};
 		try {
+			await refreshWatchEntries();
 			if (
 				!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/.test(req.headers.host ?? "") ||
 				(req.headers.origin && req.headers.origin !== origin)
@@ -168,24 +258,30 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 					[...entries.values()].map(async (entry) => {
 						try {
 							const state = await snapshot(entry);
-							const execution = displayedRun(entry, state);
+							const execution = await executionDetails(entry, state);
 							return {
 								...entry,
 								frame: state?.frame,
 								paused: state?.paused,
 								updatedAt: state?.updatedAt,
-								running: Boolean(execution?.child),
-								error: execution?.error,
+								...execution,
 							};
 						} catch (error) {
 							return { ...entry, error: String(error) };
 						}
 					}),
 				);
-				json(200, { jobs, token, model: "gpt-5.6-luna", stages: DEFAULT_STAGES });
+				json(200, {
+					jobs,
+					aliases: Object.fromEntries(aliases),
+					token,
+					model: "gpt-5.6-luna",
+					stages: DEFAULT_STAGES,
+				});
 				return;
 			}
-			const entry = entries.get(url.searchParams.get("id") ?? "");
+			const requestedId = url.searchParams.get("id") ?? "";
+			const entry = entries.get(aliases.get(requestedId) ?? requestedId);
 			if (req.method === "GET" && url.pathname === "/api/job" && entry) {
 				const state = await snapshot(entry);
 				const execution = displayedRun(entry, state);
@@ -193,9 +289,8 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 					...entry,
 					snapshot: state,
 					milestones: state ? researchMilestones(state) : [],
-					running: Boolean(execution?.child),
-					output: execution?.output ?? "",
-					error: execution?.error,
+					...(await executionDetails(entry, state)),
+					output: execution?.output ?? (await readLog(entry, state?.frame.jobId)),
 				});
 				return;
 			}
@@ -259,7 +354,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				const directory = join(root, `run-${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`);
 				await mkdir(directory);
 				const created = register(directory, false);
-				launch(created, {
+				await launch(created, {
 					action: "run",
 					backend: "codex",
 					objective: input.objective.trim(),
@@ -277,8 +372,8 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				if (!processState?.child) throw new Error("工作台没有正在执行的进程");
 				if (processState.jobId ? input.jobId !== processState.jobId : input.jobId !== undefined)
 					throw new Error("页面研究目标已变化，请刷新后操作");
+				if (processState.published) await pauseChild(entry, processState);
 				processState.pauseRequested = true;
-				if (processState.jobId) processState.child.kill("SIGINT");
 				json(202, { id: entry.id });
 				return;
 			}
@@ -286,7 +381,8 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				const state = await snapshot(entry);
 				if (!state || state.frame.status === "completed") throw new Error("当前任务不存在或已经完成");
 				if (input.jobId !== state.frame.jobId) throw new Error("页面研究目标已变化，请刷新后操作");
-				if (!state.paused) throw new Error("仅可继续已暂停的任务");
+				if (await new JsonlAstraStore(entry.root).readExecutionOwner(state.frame.jobId))
+					throw new Error("当前研究已有执行进程，请勿重复启动");
 				if (input.guidance !== undefined && (typeof input.guidance !== "string" || input.guidance.length > 10000))
 					throw new Error("补充说明格式不正确");
 				if (
@@ -297,7 +393,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 						input.maxTasks > 144)
 				)
 					throw new Error("预算不能小于已创建的任务数或超过 144");
-				launch(entry, {
+				await launch(entry, {
 					action: "resume",
 					jobId: state.frame.jobId,
 					backend: "codex",

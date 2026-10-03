@@ -9,6 +9,8 @@ let stages = [];
 let current;
 let creating = false;
 let fetching = false;
+let pendingRefresh = false;
+let selectionGeneration = 0;
 let renderedVersion = "";
 let renderedJobId = "";
 function node(tag, text, className) { const item = document.createElement(tag); if (text !== undefined) item.textContent = text; if (className) item.className = className; return item; }
@@ -89,10 +91,15 @@ function renderDetails() {
 		const details = node("details"); details.append(node("summary", "查看成果内容与编号"), node("p", artifact.id), node("pre", JSON.stringify(artifact.content, null, 2))); panel.append(details);
 	}
 }
+function invalidateSelection() {
+	selectionGeneration++; for (const id of ["start", "resume", "pause"]) el(id).disabled = false; current = undefined; renderedVersion = ""; stageId = ""; evidenceId = "";
+	el("continue").hidden = true; el("pause").hidden = true; el("stage-detail").replaceChildren(); el("research").hidden = true;
+}
+function renderOutput() { el("output").textContent = current.error ? `${current.error}\n${current.output || ""}` : current.output || "尚无进程输出；执行详情以阶段状态和审阅记录为准。"; }
 function renderJob() {
 	const state = current.snapshot;
 	el("research").hidden = creating;
-	if (!state) { el("title").textContent = current.error ? "研究未能启动" : "正在创建研究任务…"; for (const id of ["stage-detail", "stages", "full-objective", "next-action", "usage", "directory"]) el(id).replaceChildren(); for (const id of ["execution", "outcome", "coverage"]) el(id).textContent = "等待初始化"; el("continue").hidden = true; el("pause").hidden = current.readonly || !current.running; el("output").textContent = current.output || ""; if (current.error) error(current.error); return; }
+	if (!state) { el("title").textContent = current.error ? "研究未能启动" : "正在创建研究任务…"; for (const id of ["stage-detail", "stages", "full-objective", "next-action", "usage", "directory"]) el(id).replaceChildren(); for (const id of ["execution", "outcome", "coverage"]) el(id).textContent = "等待初始化"; el("continue").hidden = true; el("pause").hidden = !current.canPause; el("output").textContent = current.output || ""; if (current.error) error(current.error); return; }
 	el("title").textContent = state.frame.objective.length > 120 ? `${state.frame.objective.slice(0,120)}…` : state.frame.objective;
 	el("full-objective").textContent = state.frame.objective;
 	el("job-label").textContent = current.readonly ? "已有研究 · 只读查看" : "本机研究";
@@ -102,10 +109,10 @@ function renderJob() {
 	const active = Object.values(state.sessions).filter(session => session.status === "running").at(-1);
 	el("next-action").textContent = state.paused ? state.frame.userGate?.question || state.frame.userGate?.reason || state.frame.nextAction : active ? `${names[state.frame.activeStageId]}：${active.role === "reviewer" ? "正在独立审阅证据" : active.role === "worker" ? "正在执行任务" : "正在规划下一步"}` : state.frame.nextAction;
 	el("usage").textContent = `已创建 ${Object.keys(state.tasks).length} / ${state.frame.budget.maxTasks} 个任务 · 已用 ${state.budgetUsage?.turnsUsed || 0} / ${state.frame.budget.maxTurns} 轮 · ${state.frame.openObligationIds.reduce((count,id) => count + (state.obligations[id]?.items?.filter(item => item.status === "open").length ?? 1), 0)} 项待修复问题`;
-	el("continue").hidden = current.readonly || !state.paused || current.running;
-	el("pause").hidden = current.readonly || !current.running;
+	el("continue").hidden = current.readonly || state.frame.status === "completed" || current.running;
+	el("pause").hidden = !current.canPause;
 	el("directory").textContent = current.root;
-	el("output").textContent = current.error ? `${current.error}\n${current.output}` : current.output || "尚无进程输出；执行详情以阶段状态和审阅记录为准。";
+	renderOutput();
 	if (!stageId) stageId = state.frame.activeStageId;
 	el("stages").replaceChildren();
 	for (const definition of stages) {
@@ -118,28 +125,44 @@ function renderJob() {
 	renderDetails();
 }
 async function refresh() {
-	if (fetching) return; fetching = true;
+	if (fetching) { pendingRefresh = true; return; } fetching = true;
+	const generation = selectionGeneration;
 	try {
 		const data = await api("/api/jobs"); token = data.token; stages = data.stages;
+		if (generation !== selectionGeneration) { pendingRefresh = true; return; }
+		if (data.aliases?.[selected]) { selected = data.aliases[selected]; invalidateSelection(); pendingRefresh = true; return; }
 		el("jobs").replaceChildren();
 		if (!selected && data.jobs.length) selected = data.jobs[0].id;
 		for (const job of data.jobs) {
 			const button = node("button", undefined, selected === job.id && !creating ? "active" : ""); button.type = "button";
 			const title = job.frame?.objective || "新研究 · 正在初始化";
 			button.append(node("span", title.length > 50 ? `${title.slice(0,50)}…` : title), node("small", status(job)));
-			button.onclick = () => { selected = job.id; stageId = ""; creating = false; el("create").hidden = true; void refresh(); }; el("jobs").append(button);
+			button.onclick = () => { invalidateSelection(); selected = job.id; creating = false; el("create").hidden = true; void refresh(); }; el("jobs").append(button);
 		}
 		if (!data.jobs.length) { el("jobs").append(node("p", "还没有研究任务", "muted")); creating = true; el("create").hidden = false; }
-		if (selected && !creating) { current = await api(`/api/job?id=${selected}`); const jobId = current.snapshot?.frame.jobId || ""; if (jobId !== renderedJobId) { stageId = ""; evidenceId = ""; renderedJobId = jobId; } const version = `${selected}:${jobId}:${current.snapshot?.eventSeq}:${current.running}:${current.error}`; if (version !== renderedVersion || el("research").hidden) { renderJob(); renderedVersion = version; } }
+		if (selected && !creating) {
+			const target = selected;
+			const detail = await api(`/api/job?id=${target}`);
+			if (generation !== selectionGeneration || selected !== target || creating) { pendingRefresh = true; return; }
+			const expectedJobId = data.jobs.find(job => job.id === target)?.frame?.jobId;
+			const actualJobId = detail.snapshot?.frame.jobId;
+			if (detail.id !== target || (detail.jobId !== undefined && detail.jobId !== actualJobId) || (expectedJobId && expectedJobId !== actualJobId)) { invalidateSelection(); pendingRefresh = true; return; }
+			current = detail;
+			const jobId = current.snapshot?.frame.jobId || "";
+			if (jobId !== renderedJobId) { stageId = ""; evidenceId = ""; renderedJobId = jobId; }
+			const version = `${selected}:${jobId}:${current.snapshot?.eventSeq}:${current.running}:${current.canPause}:${current.readonly}:${current.error}`;
+			if (version !== renderedVersion || el("research").hidden) { renderJob(); renderedVersion = version; }
+			renderOutput();
+		}
 		el("connection").textContent = `已同步 ${new Date().toLocaleTimeString("zh-CN")}`;
-	} catch (err) { error(err.message); el("connection").textContent = "连接中断 · 保留上次数据"; }
-	finally { fetching = false; }
+	} catch (err) { if (generation !== selectionGeneration) { pendingRefresh = true; return; } error(err.message); el("connection").textContent = "连接中断 · 保留上次数据"; }
+	finally { fetching = false; if (pendingRefresh) { pendingRefresh = false; void refresh(); } }
 }
-el("new").onclick = () => { creating = true; el("create").hidden = false; el("research").hidden = true; el("objective").focus(); };
+el("new").onclick = () => { invalidateSelection(); creating = true; el("create").hidden = false; el("research").hidden = true; el("objective").focus(); };
 el("example").onclick = () => { el("objective").value = "做一个固定范围的小规模复现实验：比较样本均值、中位数与两端各截去 10 个值的截尾均值估计真实位置 0 的误差。样本量 101，标准正态数据，污染比例 0、0.1、0.2，将前 floor(101×污染比例) 个值加 10，每种条件重复 100 次。使用固定种子并记录精确协议，仅用 Python 标准库和本机 CPU。保留可执行代码、行为测试、逐次数据、MAE 与蒙特卡洛标准误、命令和失败日志，并独立核对结果。检索至少三条可追溯文献。只作固定协议下的描述性结论，不声称创新或普遍优越；最后给出经过审阅的研究报告。"; };
-el("create-form").onsubmit = async event => { event.preventDefault(); error(""); el("start").disabled = true; try { const data = await api("/api/run", { objective: el("objective").value, maxTasks: Number(el("budget").value), requirePaper: el("paper").checked }); selected = data.id; stageId = ""; creating = false; el("create").hidden = true; await refresh(); } catch (err) { error(err.message); } finally { el("start").disabled = false; } };
-el("resume").onclick = async () => { error(""); el("resume").disabled = true; try { await api(`/api/resume?id=${selected}`, { jobId: current?.snapshot?.frame.jobId, guidance: el("guidance").value, ...(el("resume-budget").value ? { maxTasks: Number(el("resume-budget").value) } : {}) }); el("guidance").value = ""; await refresh(); } catch (err) { error(err.message); } finally { el("resume").disabled = false; } };
-el("pause").onclick = async () => { el("pause").disabled = true; try { await api(`/api/pause?id=${selected}`, { jobId: current?.snapshot?.frame.jobId }); el("next-action").textContent = "已请求暂停，正在保存任务状态…"; } catch (err) { error(err.message); } finally { el("pause").disabled = false; } };
+el("create-form").onsubmit = async event => { event.preventDefault(); const generation = selectionGeneration; error(""); el("start").disabled = true; try { const data = await api("/api/run", { objective: el("objective").value, maxTasks: Number(el("budget").value), requirePaper: el("paper").checked }); if (generation !== selectionGeneration || !creating) { await refresh(); return; } invalidateSelection(); selected = data.id; creating = false; el("create").hidden = true; await refresh(); } catch (err) { if (generation === selectionGeneration) error(err.message); } finally { if (generation === selectionGeneration) el("start").disabled = false; } };
+el("resume").onclick = async () => { if (!current?.snapshot || current.readonly || current.running) return; const target = selected; const jobId = current.snapshot.frame.jobId; const generation = selectionGeneration; error(""); el("resume").disabled = true; try { await api(`/api/resume?id=${target}`, { jobId, guidance: el("guidance").value, ...(el("resume-budget").value ? { maxTasks: Number(el("resume-budget").value) } : {}) }); if (generation === selectionGeneration) el("guidance").value = ""; await refresh(); } catch (err) { if (generation === selectionGeneration) error(err.message); } finally { if (generation === selectionGeneration) el("resume").disabled = false; } };
+el("pause").onclick = async () => { if (!current?.canPause) return; const target = selected; const jobId = current.snapshot?.frame.jobId; const generation = selectionGeneration; el("pause").disabled = true; try { await api(`/api/pause?id=${target}`, { jobId }); if (generation === selectionGeneration) el("next-action").textContent = "已请求暂停，正在保存任务状态…"; } catch (err) { if (generation === selectionGeneration) error(err.message); } finally { if (generation === selectionGeneration) el("pause").disabled = false; } };
 el("refresh").onclick = refresh;
 el("theme").onclick = () => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; };
 void refresh();

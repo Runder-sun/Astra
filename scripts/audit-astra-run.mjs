@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { taskHasRetainedOwner } from "../packages/astra/src/task-ownership.ts";
 
 const inputFailures = [];
 function readJson(path) {
@@ -92,7 +93,10 @@ const discardedTaskIds = new Set(
 		.concat(retiredArtifacts.map((receipt) => receipt.taskId))
 		.filter(Boolean),
 );
-const auditedWorkerTasks = workerTasks.filter((task) => !discardedTaskIds.has(task.id));
+const ownershipSnapshot = { ...snapshot, discardedCandidates: snapshot.discardedCandidates ?? {},
+	discardedEvidence: snapshot.discardedEvidence ?? {}, retiredArtifacts: snapshot.retiredArtifacts ?? {} };
+const auditedWorkerTasks = workerTasks.filter((task) =>
+	!discardedTaskIds.has(task.id) || taskHasRetainedOwner(ownershipSnapshot, task.id));
 const plannedTasks = new Map(
 	stagePlans.flatMap((plan) =>
 		plan.tasks.map((task) => [`stage-plan:${plan.id}:${task.key}`, { plan, task }]),

@@ -18,6 +18,15 @@ import { join } from "node:path";
 import type { AstraEvent, JobSnapshot, StoredEvent } from "./types.ts";
 
 export class ResearchJobLockedError extends Error {}
+export class ResearchJobBusyError extends ResearchJobLockedError {}
+
+export interface ResearchExecutionOwner {
+	jobId: string;
+	owner: string;
+	pid: number;
+	token: string;
+	createdAt: string;
+}
 
 export interface AstraStore {
 	loadSnapshot(jobId: string): Promise<JobSnapshot | undefined>;
@@ -28,9 +37,12 @@ export interface AstraStore {
 	readEventSeq(jobId: string): Promise<number>;
 	withJobLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T>;
 	withWriteLock<T>(jobId: string, operation: () => Promise<T>): Promise<T>;
+	withExecutionLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T>;
+	readExecutionOwner(jobId: string): Promise<ResearchExecutionOwner | undefined>;
 }
 
 interface JobLockRecord {
+	jobId?: string;
 	owner: string;
 	pid: number;
 	token: string;
@@ -85,21 +97,27 @@ export class JsonlAstraStore implements AstraStore {
 	async withJobLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T> {
 		const legacy = join(this.jobDir(jobId), "supervisor.lock");
 		return this.withDirectoryLock(jobId, `${legacy}.d`, "supervisor", owner, async () => {
-			try {
-				if (!(await lstat(legacy)).isFile())
-					throw new ResearchJobLockedError("research supervisor legacy lock is not a file");
-				const holder: unknown = JSON.parse(await readFile(legacy, "utf8"));
-				if (!isJobLockRecord(holder))
-					throw new ResearchJobLockedError("research supervisor legacy owner is invalid");
-				if (processIsAlive(holder.pid))
-					throw new ResearchJobLockedError(`research supervisor lock held by ${holder.owner} (pid ${holder.pid})`);
-			} catch (error) {
-				if (error instanceof SyntaxError)
-					throw new ResearchJobLockedError("research supervisor legacy owner is invalid");
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
+			await this.assertLegacySupervisorAvailable(jobId);
 			return operation();
 		});
+	}
+
+	private async assertLegacySupervisorAvailable(jobId: string): Promise<void> {
+		const legacy = join(this.jobDir(jobId), "supervisor.lock");
+		try {
+			if (!(await lstat(legacy)).isFile())
+				throw new ResearchJobLockedError("research supervisor legacy lock is not a file");
+			const holder: unknown = JSON.parse(await readFile(legacy, "utf8"));
+			if (!isJobLockRecord(holder)) throw new ResearchJobLockedError("research supervisor legacy owner is invalid");
+			if (holder.jobId !== undefined && holder.jobId !== jobId)
+				throw new ResearchJobLockedError("research supervisor owner job identity is invalid");
+			if (processIsAlive(holder.pid))
+				throw new ResearchJobBusyError(`research supervisor lock held by ${holder.owner} (pid ${holder.pid})`);
+		} catch (error) {
+			if (error instanceof SyntaxError)
+				throw new ResearchJobLockedError("research supervisor legacy owner is invalid");
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	}
 
 	async withWriteLock<T>(jobId: string, operation: () => Promise<T>): Promise<T> {
@@ -115,16 +133,57 @@ export class JsonlAstraStore implements AstraStore {
 		);
 	}
 
+	async withExecutionLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T> {
+		return this.withDirectoryLock(jobId, join(this.jobDir(jobId), "execution.lock"), "execution", owner, async () => {
+			await this.withJobLock(jobId, owner, async () => {});
+			return operation();
+		});
+	}
+
+	async readExecutionOwner(jobId: string): Promise<ResearchExecutionOwner | undefined> {
+		let holder: JobLockRecord | undefined;
+		try {
+			holder = await this.readJournalLock(join(this.jobDir(jobId), "execution.lock"), "execution");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (holder && holder.jobId !== jobId)
+			throw new ResearchJobLockedError("research execution owner job identity is invalid");
+		if (holder && processIsAlive(holder.pid)) return { ...holder, jobId };
+		await this.assertLegacySupervisorAvailable(jobId);
+		try {
+			const supervisor = await this.readJournalLock(join(this.jobDir(jobId), "supervisor.lock.d"), "supervisor");
+			if (supervisor && processIsAlive(supervisor.pid))
+				throw new ResearchJobLockedError(
+					`research supervisor lock held by ${supervisor.owner} (pid ${supervisor.pid})`,
+				);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		return undefined;
+	}
+
+	async withGuidanceLock<T>(jobId: string, operation: () => Promise<T>): Promise<T> {
+		return this.withDirectoryLock(
+			jobId,
+			join(this.jobDir(jobId), "guidance.lock"),
+			"guidance",
+			"guidance inbox",
+			operation,
+		);
+	}
+
 	private async withDirectoryLock<T>(
 		jobId: string,
 		path: string,
-		kind: "journal" | "supervisor",
+		kind: "journal" | "supervisor" | "execution" | "guidance",
 		owner: string,
 		operation: () => Promise<T>,
 	): Promise<T> {
 		await mkdir(this.jobDir(jobId), { recursive: true });
 		const temp = await mkdtemp(`${path}.tmp-`);
 		const lock: JobLockRecord = {
+			jobId,
 			owner,
 			pid: process.pid,
 			token: randomUUID(),
@@ -150,8 +209,12 @@ export class JsonlAstraStore implements AstraStore {
 					}
 					try {
 						const holder = await this.readJournalLock(path, kind);
+						if (kind === "execution" && holder && holder.jobId !== jobId)
+							throw new ResearchJobLockedError("research execution owner job identity is invalid");
+						if (kind === "supervisor" && holder?.jobId !== undefined && holder.jobId !== jobId)
+							throw new ResearchJobLockedError("research supervisor owner job identity is invalid");
 						if (holder && processIsAlive(holder.pid))
-							throw new ResearchJobLockedError(
+							throw new (kind === "supervisor" ? ResearchJobBusyError : ResearchJobLockedError)(
 								`research ${kind} lock held by ${holder.owner} (pid ${holder.pid})`,
 							);
 						await this.removeJournalOwner(path, holder?.token);
@@ -173,7 +236,7 @@ export class JsonlAstraStore implements AstraStore {
 
 	private async readJournalLock(
 		path: string,
-		kind: "journal" | "supervisor" = "journal",
+		kind: "journal" | "supervisor" | "execution" | "guidance" = "journal",
 	): Promise<JobLockRecord | undefined> {
 		if (!(await lstat(path)).isDirectory())
 			throw new ResearchJobLockedError(`research ${kind} lock is not a directory`);
@@ -413,6 +476,30 @@ export class JsonlAstraStore implements AstraStore {
 }
 
 export class MemoryAstraStore implements AstraStore {
+	private readonly executionOwners = new Map<string, ResearchExecutionOwner>();
+
+	async withExecutionLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T> {
+		if (this.executionOwners.has(jobId)) throw new ResearchJobLockedError("research execution lock held");
+		this.executionOwners.set(jobId, {
+			jobId,
+			owner,
+			pid: process.pid,
+			token: randomUUID(),
+			createdAt: new Date().toISOString(),
+		});
+		try {
+			await this.withJobLock(jobId, owner, async () => {});
+			return await operation();
+		} finally {
+			this.executionOwners.delete(jobId);
+		}
+	}
+
+	async readExecutionOwner(jobId: string): Promise<ResearchExecutionOwner | undefined> {
+		const holder = this.executionOwners.get(jobId);
+		if (!holder && this.jobLocks.has(jobId)) throw new ResearchJobLockedError("research supervisor lock held");
+		return holder ? { ...holder } : undefined;
+	}
 	private readonly snapshots = new Map<string, JobSnapshot>();
 	private readonly events = new Map<string, StoredEvent[]>();
 	private readonly jobLocks = new Map<string, string>();
@@ -430,7 +517,7 @@ export class MemoryAstraStore implements AstraStore {
 
 	async withJobLock<T>(jobId: string, owner: string, operation: () => Promise<T>): Promise<T> {
 		const holder = this.jobLocks.get(jobId);
-		if (holder) throw new ResearchJobLockedError(`research supervisor lock held by ${holder}`);
+		if (holder) throw new ResearchJobBusyError(`research supervisor lock held by ${holder}`);
 		this.jobLocks.set(jobId, owner);
 		try {
 			return await operation();

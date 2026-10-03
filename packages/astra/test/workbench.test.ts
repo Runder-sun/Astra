@@ -133,7 +133,10 @@ it.each([true, false])("C4 page resets job selections on rebound (same sequence=
 	expect(get("title").textContent).toBe("new objective");
 	expect(runInContext("stageId", context)).toBe(b.state.frame.activeStageId);
 	expect(runInContext("evidenceId", context)).toBe("");
-	runInContext("current = { readonly: false, running: true, snapshot: undefined }; renderJob()", context);
+	runInContext(
+		"current = { readonly: false, running: true, canPause: true, snapshot: undefined }; renderJob()",
+		context,
+	);
 	expect(get("pause").hidden).toBe(false);
 });
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -185,4 +185,23 @@ fs.readFileSync = (path, ...args) => { if (path === root + "/packages/astra/pack
 		assert.match(repeated.stderr, /overlap/i);
 		assert.equal(existsSync(overlap), false);
 	} finally { fixture.close(); }
+});
+
+test("source export rejects physical source overlap through existing parent aliases and missing suffixes", () => {
+	const fixture = exportFixture();
+	const external = mkdtempSync(join(tmpdir(), "astra-export-parent-"));
+	try {
+		mkdirSync(join(fixture.root, "docs"));
+		symlinkSync(join(fixture.root, "docs"), join(external, "docs-alias"), "dir");
+		symlinkSync(fixture.root, join(external, "root-alias"), "dir");
+		for (const target of [join(external, "docs-alias", "missing", "export"), join(external, "root-alias", "scripts", "new-export"), join(external, "root-alias", "README.md")]) {
+			const result = fixture.run(undefined, target);
+			assert.notEqual(result.status, 0, target);
+			assert.match(result.stderr, /overlap/i);
+			if (!target.endsWith("README.md")) assert.equal(existsSync(target), false);
+		}
+		const allowed = join(external, "missing", "safe", "export");
+		assert.equal(fixture.run(undefined, allowed).status, 0);
+		assert.equal(existsSync(join(allowed, "SOURCE_MANIFEST.json")), true);
+	} finally { fixture.close(); rmSync(external, { recursive: true, force: true }); }
 });

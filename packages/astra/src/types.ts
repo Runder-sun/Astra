@@ -540,6 +540,9 @@ export interface SearchCandidate {
 }
 
 export interface SearchBatch {
+	executionTracking?: "start-commit";
+	executionStartedAt?: string;
+	executionStartedTaskId?: string;
 	acceptanceCompleted?: boolean;
 	stageRevision?: number;
 	stageExecutionId?: string;
@@ -825,6 +828,7 @@ export type AstraEvent =
 	| { type: "search_candidate_updated"; batchId: string; candidate: SearchCandidate }
 	| { type: "candidate_evaluation_recorded"; evaluation: CandidateEvaluation }
 	| { type: "search_batch_exhausted"; batchId: string; rationale: string }
+	| { type: "search_batch_execution_started"; batchId: string; taskId: string; startedAt: string }
 	| { type: "search_batch_continued"; batchId: string; decisionRef: string; rationale: string }
 	| {
 			type: "search_batch_decided";
