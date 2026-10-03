@@ -192,7 +192,7 @@ it("rejects a retained predecessor manifest submitted as the current retry resul
 });
 
 it("reuses a real Pi session file instead of replacing it with a fallback log", async () => {
-	const { root, job, prior } = await recoveryFixture();
+	const { root, job, retry: prior } = await recoveryFixture();
 	const sessionId = `astra-${prior.jobId}-${prior.id}-${prior.attempt}`;
 	const sessionDir = join(root, ".astra", "jobs", prior.jobId, "sessions");
 	await mkdir(sessionDir, { recursive: true });

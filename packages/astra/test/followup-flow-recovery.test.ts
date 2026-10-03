@@ -8,6 +8,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { CodexResearchAdapters } from "../src/codex-adapters.ts";
 import { CodexAppServerRunner } from "../src/codex-app-server.ts";
 import { buildEffectiveTaskContract, semanticContractHash } from "../src/effective-contract.ts";
+import { writeSourceReceipt } from "../src/literature.ts";
 import { preparePlanEvidence } from "../src/plan-review.ts";
 import { researchMilestones } from "../src/progress.ts";
 import { ResearchJob } from "../src/research.ts";
@@ -202,6 +203,17 @@ it.each([
 			taskId = other.id;
 		}
 		const changedVersion = mode === "changed-current-version" || mode === "changed-pruned-version";
+		if (changedVersion)
+			await writeSourceReceipt(
+				{ workspaceRoot: root, jobId: job.state.frame.jobId, query: "changed reference", limit: 1 },
+				{
+					sourceRef: "https://example.invalid/changed-reference",
+					title: "Changed offline comparison",
+					authors: [],
+				},
+				"offline",
+				"2026-10-02T00:00:00Z",
+			);
 		const changed = await job.recordEvidence({
 			id: old.id,
 			taskId,

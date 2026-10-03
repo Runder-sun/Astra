@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
 import { assertAstraId, atomicWriteJson, sha256 } from "./contracts.ts";
 
@@ -101,20 +101,44 @@ export async function readSourceRecord(
 	jobId: string,
 	sourceRef: string,
 ): Promise<LiteratureRecord | undefined> {
+	return (await readSourceReceipt(workspaceRoot, jobId, sourceRef))?.record;
+}
+
+/** Return the exact bytes whose internal receipt and source identity were verified. */
+export async function readSourceReceipt(
+	workspaceRoot: string,
+	jobId: string,
+	sourceRef: string,
+	frozenSha256?: string,
+): Promise<{ content: Buffer; record: LiteratureRecord; sha256: string } | undefined> {
 	assertAstraId(jobId, "job id");
 	const filename = sourceReceiptFilename(sourceRef);
 	if (!filename) return undefined;
+	if (frozenSha256 && !/^[a-f0-9]{64}$/.test(frozenSha256)) throw new Error("invalid source snapshot digest");
+	const project = resolve(workspaceRoot);
+	const root = join(project, ".astra", "jobs", jobId);
+	const path = frozenSha256 ? join(root, "versions", "files", frozenSha256) : join(root, "sources", filename);
 	try {
-		const { sha256: digest, ...receipt } = JSON.parse(
-			await readFile(join(workspaceRoot, ".astra", "jobs", jobId, "sources", filename), "utf8"),
-		) as { sha256?: string; sourceRef?: string; record?: LiteratureRecord };
+		for (let parent = path; parent !== dirname(project); parent = dirname(parent)) {
+			const metadata = await lstat(parent);
+			if (metadata.isSymbolicLink() || (parent === path ? !metadata.isFile() : !metadata.isDirectory()))
+				throw new Error(`source receipt path is unsafe: ${parent}`);
+		}
+		const content = await readFile(path);
+		const hash = sha256(content);
+		if (frozenSha256 && hash !== frozenSha256) throw new Error(`source snapshot integrity failure: ${sourceRef}`);
+		const { sha256: digest, ...receipt } = JSON.parse(content.toString("utf8")) as {
+			sha256?: string;
+			sourceRef?: string;
+			record?: LiteratureRecord;
+		};
 		if (
 			digest !== sha256(JSON.stringify(receipt)) ||
 			receipt.sourceRef !== sourceRef ||
 			receipt.record?.sourceRef !== sourceRef
 		)
 			return undefined;
-		return receipt.record;
+		return { content, record: receipt.record, sha256: hash };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
 		throw error;

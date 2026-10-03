@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { access, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
 	assertAstraId,
 	atomicWriteJson,
 	canonicalArtifactPath,
+	publishImmutableFile,
 	readJson,
 	taskDir,
 	taskStageContract,
@@ -12,11 +13,12 @@ import {
 	writeTaskPacket,
 } from "./contracts.ts";
 import { sourceTaskContractHash } from "./effective-contract.ts";
-import { sourceReceiptFilename } from "./literature.ts";
+import { readSourceReceipt, sourceReceiptFilename } from "./literature.ts";
 import type { ResearchJob } from "./research.ts";
 import type {
 	Evidence,
 	EvidenceFileVersion,
+	OutputRef,
 	TaskPacket,
 	TaskRecoveryMaterials,
 	WorkerOutputManifest,
@@ -252,7 +254,11 @@ function evidenceFileSource(projectRoot: string, workspace: string, ref: string)
 	return resolve(ref.startsWith(".astra/") ? projectRoot : workspace, ref);
 }
 
-export async function freezeEvidenceFiles(task: TaskPacket, refs: string[]): Promise<EvidenceFileVersion[]> {
+export async function freezeEvidenceFiles(
+	task: TaskPacket,
+	refs: string[],
+	boundSources?: OutputRef[],
+): Promise<EvidenceFileVersion[]> {
 	const projectRoot = resolve(task.scope.workspaceRoot);
 	let manifest: WorkerOutputManifest | undefined;
 	if (task.version) {
@@ -265,14 +271,25 @@ export async function freezeEvidenceFiles(task: TaskPacket, refs: string[]): Pro
 	const files: EvidenceFileVersion[] = [];
 	for (const sourceRef of new Set(refs)) {
 		const receipt = sourceReceiptFilename(sourceRef);
-		if (!receipt && (isAbsolute(sourceRef) || /^[a-z][a-z0-9+.-]*:/i.test(sourceRef))) continue;
+		if (receipt) {
+			const binding = boundSources?.find((ref) => ref.kind === "source" && ref.ref === sourceRef);
+			if (binding && !binding.sha256) throw new Error(`source snapshot binding is missing: ${sourceRef}`);
+			const snapshot = await readSourceReceipt(projectRoot, task.jobId, sourceRef, binding?.sha256);
+			if (!snapshot) throw new Error(`source requires an intact retrieval receipt: ${sourceRef}`);
+			const sha256 = await publishImmutableFile(
+				join(projectRoot, ".astra", "jobs", task.jobId, "versions", "files"),
+				snapshot.content,
+			);
+			files.push({ sourceRef, sha256 });
+			continue;
+		}
+		if (isAbsolute(sourceRef) || /^[a-z][a-z0-9+.-]*:/i.test(sourceRef)) continue;
 		const workspace = taskWorkspacePath(projectRoot, task.jobId, task.id);
-		const allowedRoot = receipt ? join(projectRoot, ".astra", "jobs", task.jobId, "sources") : workspace;
-		const source = receipt ? join(allowedRoot, receipt) : evidenceFileSource(projectRoot, workspace, sourceRef);
+		const source = evidenceFileSource(projectRoot, workspace, sourceRef);
 		if (!source) continue;
-		const content = await readEvidenceFile(source, allowedRoot);
+		const content = await readEvidenceFile(source, workspace);
 		if (!content) {
-			if (task.version && !receipt) throw new Error(`submitted evidence file is missing: ${sourceRef}`);
+			if (task.version) throw new Error(`submitted evidence file is missing: ${sourceRef}`);
 			continue;
 		}
 		const sha256 = createHash("sha256").update(content).digest("hex");
@@ -281,7 +298,7 @@ export async function freezeEvidenceFiles(task: TaskPacket, refs: string[]): Pro
 		);
 		if (declared?.sha256 && declared.sha256 !== sha256)
 			throw new Error(`submitted evidence changed after validation: ${sourceRef}`);
-		await writeEvidenceFile(join(projectRoot, ".astra", "jobs", task.jobId, "versions", "files"), sha256, content);
+		await publishImmutableFile(join(projectRoot, ".astra", "jobs", task.jobId, "versions", "files"), content);
 		files.push({ sourceRef, sha256 });
 	}
 	return files;
@@ -319,8 +336,15 @@ async function writeEvidenceFile(root: string, path: string, content: Buffer): P
 		if ((await lstat(parent)).isSymbolicLink())
 			throw new Error(`evidence destination may not use symbolic links: ${parent}`);
 	}
-	await rm(destination, { force: true });
-	await writeFile(destination, content, { mode: 0o444 });
+	const temp = `${destination}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+	const handle = await open(temp, "wx", 0o444);
+	try {
+		await handle.writeFile(content);
+		await rename(temp, destination);
+	} finally {
+		await handle.close();
+		await rm(temp, { force: true });
+	}
 }
 
 async function observedExecutionFiles(task: TaskPacket | undefined, prefix = "") {
@@ -539,10 +563,12 @@ export async function prepareTaskWorkspace(task: TaskPacket, job: ResearchJob): 
 	}
 	const reviewSummaryPath = task.stageId === "research-review" ? "review-summary.json" : undefined;
 	if (reviewSummaryPath) {
-		await writeFile(
-			join(workspace, reviewSummaryPath),
-			`${JSON.stringify({ schemaVersion: "astra.research_review_summary.v1", artifacts: reviewSummaries })}\n`,
-			{ encoding: "utf8", mode: 0o444 },
+		await writeEvidenceFile(
+			workspace,
+			reviewSummaryPath,
+			Buffer.from(
+				`${JSON.stringify({ schemaVersion: "astra.research_review_summary.v1", artifacts: reviewSummaries })}\n`,
+			),
 		);
 	}
 	const evidence: Array<Evidence & { contentPath: string }> = [];

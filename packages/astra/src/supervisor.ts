@@ -15,6 +15,7 @@ import {
 	planReviewStatus,
 	planReviewStatusFromSnapshot,
 	preparePlanEvidence,
+	taskIsCurrentFromSnapshot,
 } from "./plan-review.ts";
 import { checksum, MAX_TASK_ATTEMPTS, type ResearchJob, ResearchTaskBudgetError } from "./research.ts";
 import type { AstraStore } from "./store.ts";
@@ -161,15 +162,12 @@ export class ResearchSupervisor {
 		const dispatchedTaskIds: string[] = [];
 		if (await this.gateOnExhaustedContinue(initialStageId))
 			return this.result(initialStageId, dispatchedTaskIds, false);
-		if (await this.gateOnBudget(initialStageId)) return this.result(initialStageId, dispatchedTaskIds, false);
-
 		for (const task of Object.values(this.job.state.tasks)) {
 			if (
 				task.stageId === initialStageId &&
 				task.role === "worker" &&
-				task.planId &&
 				["ready", "running"].includes(task.status) &&
-				(planReviewStatus(this.job, task.planId) !== "passed" || !this.taskMatchesFrozenPlan(task))
+				!this.taskMatchesFrozenPlan(task)
 			) {
 				await this.job.setTaskStatus(task.id, "blocked");
 				continue;
@@ -179,6 +177,7 @@ export class ResearchSupervisor {
 				this.recovered = true;
 			}
 		}
+		if (await this.gateOnBudget(initialStageId)) return this.result(initialStageId, dispatchedTaskIds, false);
 
 		const readyTasks = Object.values(this.job.state.tasks)
 			.filter((task) => task.stageId === initialStageId && task.role === "worker" && task.status === "ready")
@@ -331,7 +330,11 @@ export class ResearchSupervisor {
 		if (this.activeSearch(stageId)) return false;
 		if (
 			Object.values(this.job.state.tasks).some(
-				(task) => task.stageId === stageId && task.role === "worker" && ["ready", "running"].includes(task.status),
+				(task) =>
+					task.stageId === stageId &&
+					task.role === "worker" &&
+					["ready", "running"].includes(task.status) &&
+					this.taskMatchesFrozenPlan(task),
 			)
 		) {
 			return false;
@@ -363,7 +366,10 @@ export class ResearchSupervisor {
 		if (this.shouldYield() || state.frame.userGate || this.openStageObligation(stageId)) return false;
 		if (
 			Object.values(state.tasks).some(
-				(task) => task.stageId === stageId && ["ready", "running"].includes(task.status),
+				(task) =>
+					task.stageId === stageId &&
+					["ready", "running"].includes(task.status) &&
+					taskIsCurrentFromSnapshot(state, task),
 			)
 		)
 			return false;
@@ -413,6 +419,7 @@ export class ResearchSupervisor {
 	}
 
 	private taskMatchesFrozenPlan(task: TaskPacket): boolean {
+		if (!taskIsCurrentFromSnapshot(this.job.state, task)) return false;
 		if (!task.planId) return true;
 		if (!hasFrozenPlanContract(this.job, task.planId)) return false;
 		const plan = this.job.state.stagePlans[task.planId];
@@ -458,6 +465,7 @@ export class ResearchSupervisor {
 		const state = this.job.state;
 		const transferredIssueIds = new Set(
 			Object.values(state.evidence).flatMap((evidence) => {
+				if (!evidenceHasCurrentPlanApprovalFromSnapshot(state, evidence)) return [];
 				const task = state.tasks[evidence.taskId];
 				return evidence.stageId === stageId && evidence.status === "accepted" && task?.deliveryKind === "local"
 					? (task.responsibilityTransfers ?? []).flatMap((transfer) =>
@@ -540,7 +548,7 @@ export class ResearchSupervisor {
 			if (["ready", "running"].includes(task.status)) dispatchedTaskIds.push(task.id);
 		}
 		const runnable = plannedTasks
-			.filter((task) => ["ready", "running"].includes(task.status))
+			.filter((task) => ["ready", "running"].includes(task.status) && this.taskMatchesFrozenPlan(task))
 			.slice(0, this.maxParallel);
 		if (runnable.length === 0) return;
 		if (await this.gateOnBudget(plan.stageId, { turns: runnable.length })) return;
@@ -799,12 +807,18 @@ export class ResearchSupervisor {
 		if (ids.length) {
 			try {
 				const recovered = await this.job.recoverMainAgentDeliveries(ids);
-				if (recovered.length) result = recovered.at(-1) as T;
+				const delivered = result
+					? recovered.find((manifest) => manifest.decisionRef === result!.decisionRef)
+					: recovered.at(-1);
+				if (delivered) result = delivered as T;
 			} catch (error) {
 				// An appended domain event may already authorize its unfinished tail.
 				try {
 					const recovered = await this.job.recoverMainAgentDeliveries(ids);
-					if (recovered.length) result = recovered.at(-1) as T;
+					const delivered = result
+						? recovered.find((manifest) => manifest.decisionRef === result!.decisionRef)
+						: recovered.at(-1);
+					if (delivered) result = delivered as T;
 				} catch {
 					this.mainDeliveryPending = true;
 					throw new ResearchPausedError(
@@ -814,6 +828,10 @@ export class ResearchSupervisor {
 			}
 			if (!result) for (const id of ids) await this.job.abandonMainAgentCall(id);
 		}
+		if (result && this.job.state.mainAgentCalls?.[result.decisionRef]?.abandoned)
+			throw new ResearchPausedError(
+				"old main-agent delivery abandoned; continue with current work on the next tick",
+			);
 		if (this.job.modelControl().paused && !ids.some((id) => this.job.state.mainAgentCalls?.[id]?.applied))
 			throw new ResearchPausedError("research paused during main-agent call; saved delivery awaits permission");
 		if (result) return result;

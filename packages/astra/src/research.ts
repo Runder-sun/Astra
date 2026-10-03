@@ -26,10 +26,14 @@ import {
 	sourceTaskContractHash,
 	taskContractMatches,
 } from "./effective-contract.ts";
+import { sourceReceiptFilename } from "./literature.ts";
 import {
 	evidenceHasCurrentPlanApprovalFromSnapshot,
+	evidenceMatchesHistoricalPlanFromSnapshot,
 	planEvidence as planReviewEvidence,
 	planReviewStatus,
+	taskHasBoundRepairAncestor,
+	taskIsCurrentFromSnapshot,
 } from "./plan-review.ts";
 import { captureGitVersion } from "./project-version.ts";
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
@@ -67,6 +71,7 @@ import type {
 	MissionCoverage,
 	MissionFrame,
 	Obligation,
+	OutputRef,
 	ProviderBackoffState,
 	ResearchNode,
 	RetiredArtifactReceipt,
@@ -699,6 +704,7 @@ export class ResearchJob {
 	): Promise<void> {
 		return this.exclusive(async () => {
 			if (this.snapshot.paused) throw new Error("main-agent call cannot begin while paused");
+			if (input.type === "evidence" || input.type === "adoption") this.assertEvidenceCurrent(input.evidenceId!);
 			const stageId = this.snapshot.frame.activeStageId;
 			const stage = this.snapshot.stages[stageId];
 			if (input.type === "route" && input.obligationId) {
@@ -797,30 +803,50 @@ export class ResearchJob {
 					recovered.push(manifest);
 					continue;
 				}
-				if (this.mainAgentBasis(this.snapshot) !== call.basisHash)
-					throw new StaleResearchInputError(`saved main-agent basis is stale: ${callId}`);
-				if ("tasks" in manifest) await this.recordStagePlan(manifest, await this.originalMainAgentBasis(call));
-				else if (call.type === "evidence") {
-					if (manifest.decision === "defer")
-						await this.commit({
-							type: "job_paused",
-							decisionRef: callId,
-							reason: `evidence ${call.evidenceId} deferred by ${callId}: ${manifest.rationale}; resume with guidance to replan`,
-						});
-					else await this.decideEvidence(call.evidenceId!, manifest.decision === "accept", callId);
-				} else if (call.type === "adoption") {
-					if (!manifest.adopt)
-						await this.commit({
-							type: "job_paused",
-							decisionRef: callId,
-							reason: `evidence ${call.evidenceId} not adopted by ${callId}: ${manifest.rationale}; resume with guidance to replan`,
-						});
-					else await this.adoptEvidence(call.evidenceId!, manifest.replacementOf, callId);
-				} else if (call.type === "search-selection") {
-					if (manifest.selectedCandidateId)
-						await this.selectSearchCandidate(call.searchBatchId!, manifest.selectedCandidateId, callId);
-					else await this.continueSearchBatch(call.searchBatchId!, callId, manifest.rationale);
-				} else await this.applyRouteDecision(manifest);
+				if (this.mainAgentBasis(this.snapshot) !== call.basisHash) {
+					await this.originalMainAgentBasis(call);
+					await this.exclusive(async () => {
+						const current = this.snapshot.mainAgentCalls![callId];
+						if (
+							!current.applied &&
+							!current.completed &&
+							!current.abandoned &&
+							!this.snapshot.paused &&
+							this.mainAgentBasis(this.snapshot) !== current.basisHash
+						)
+							await this.appendEvent({ type: "main_agent_call_finished", callId, abandoned: true });
+					});
+					call = this.snapshot.mainAgentCalls![callId];
+					if (call.abandoned || call.completed) continue;
+					if (!call.applied && this.snapshot.paused) {
+						recovered.push(manifest);
+						continue;
+					}
+				}
+				if (!call.applied) {
+					if ("tasks" in manifest) await this.recordStagePlan(manifest, await this.originalMainAgentBasis(call));
+					else if (call.type === "evidence") {
+						if (manifest.decision === "defer")
+							await this.commit({
+								type: "job_paused",
+								decisionRef: callId,
+								reason: `evidence ${call.evidenceId} deferred by ${callId}: ${manifest.rationale}; resume with guidance to replan`,
+							});
+						else await this.decideEvidence(call.evidenceId!, manifest.decision === "accept", callId);
+					} else if (call.type === "adoption") {
+						if (!manifest.adopt)
+							await this.commit({
+								type: "job_paused",
+								decisionRef: callId,
+								reason: `evidence ${call.evidenceId} not adopted by ${callId}: ${manifest.rationale}; resume with guidance to replan`,
+							});
+						else await this.adoptEvidence(call.evidenceId!, manifest.replacementOf, callId);
+					} else if (call.type === "search-selection") {
+						if (manifest.selectedCandidateId)
+							await this.selectSearchCandidate(call.searchBatchId!, manifest.selectedCandidateId, callId);
+						else await this.continueSearchBatch(call.searchBatchId!, callId, manifest.rationale);
+					} else await this.applyRouteDecision(manifest);
+				}
 			}
 			await this.recoverPendingOperations();
 			await this.commit({ type: "main_agent_call_finished", callId });
@@ -1373,7 +1399,7 @@ export class ResearchJob {
 			)
 				return false;
 			try {
-				this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+				this.assertEvidenceCurrent(evidence.id);
 				return true;
 			} catch (error) {
 				if (error instanceof StaleResearchInputError || error instanceof EffectiveContractUnavailableError)
@@ -1428,6 +1454,7 @@ export class ResearchJob {
 					task.stageId === stageId &&
 					task.deliveryKind === "local" &&
 					(task.stageRevision ?? 1) === (this.snapshot.stages[stageId]?.revision ?? 1) &&
+					taskIsCurrentFromSnapshot(this.snapshot, task) &&
 					(["ready", "running"].includes(task.status) ||
 						(task.status === "succeeded" &&
 							!Object.values(this.snapshot.evidence).some(
@@ -1463,7 +1490,51 @@ export class ResearchJob {
 		return resolveRepairInputFromSnapshot(this.snapshot, ref);
 	}
 
-	private assertCurrentInputs(refs: string[], repairOfEvidenceId?: string, checked = new Set<string>()): void {
+	assertTaskCurrent(taskId: string, packet?: TaskPacket): void {
+		const task = this.snapshot.tasks[taskId];
+		if (!task) throw new Error(`unknown task ${taskId}`);
+		if (packet) {
+			const { status: _status, version: _version, ...binding } = packet;
+			const { status: _currentStatus, version: _currentVersion, ...current } = task;
+			if (
+				checksum(binding) !== checksum(current) ||
+				(packet.version && checksum(packet.version) !== checksum(task.version))
+			)
+				throw new StaleResearchInputError(`task packet differs from its registered identity: ${taskId}`);
+		}
+		if (!taskIsCurrentFromSnapshot(this.snapshot, task))
+			throw new StaleResearchInputError(`task identity, inputs or approved plan is stale: ${taskId}`);
+		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId, new Set(), task);
+	}
+
+	assertEvidenceCurrent(evidenceId: string, supplied?: Evidence): void {
+		const evidence = this.snapshot.evidence[evidenceId];
+		if (!evidence) throw new Error(`unknown evidence ${evidenceId}`);
+		if (supplied) {
+			const immutable = (value: Evidence) => {
+				const {
+					status: _status,
+					acceptanceAuthority: _authority,
+					mainAgentDecisionRef: _decision,
+					supersededByTaskId: _superseded,
+					...binding
+				} = value;
+				return JSON.parse(JSON.stringify(binding)) as unknown;
+			};
+			if (checksum(immutable(supplied)) !== checksum(immutable(evidence)))
+				throw new StaleResearchInputError(`evidence differs from its registered identity: ${evidenceId}`);
+		}
+		if (!evidenceHasCurrentPlanApprovalFromSnapshot(this.snapshot, evidence))
+			throw new StaleResearchInputError(`evidence identity, inputs or approved plan is stale: ${evidenceId}`);
+		this.assertTaskCurrent(evidence.taskId);
+	}
+
+	private assertCurrentInputs(
+		refs: string[],
+		repairOfEvidenceId?: string,
+		checked = new Set<string>(),
+		comparisonTask?: TaskPacket,
+	): void {
 		for (const ref of refs) {
 			if (
 				ref === repairOfEvidenceId &&
@@ -1496,7 +1567,15 @@ export class ResearchJob {
 				(artifact) => artifact.evidenceId === ref && artifact.status === "stale",
 			);
 			if (retiredEvidence || staleEvidence) throw new StaleResearchInputError(`task input version is stale: ${ref}`);
-			const evidence = this.snapshot.evidence[ref];
+			if (comparisonTask && taskHasBoundRepairAncestor(this.snapshot, comparisonTask, ref)) continue;
+			const evidence = this.snapshot.evidence[this.snapshot.canonical[ref]?.evidenceId ?? ref];
+			if (
+				evidence &&
+				(evidence.status === "rejected" ||
+					evidence.supersededByTaskId ||
+					!evidenceHasCurrentPlanApprovalFromSnapshot(this.snapshot, evidence))
+			)
+				throw new StaleResearchInputError(`task input evidence is stale: ${ref}`);
 			if (
 				evidence &&
 				!Object.values(this.snapshot.canonical).some(
@@ -1507,6 +1586,7 @@ export class ResearchJob {
 					this.snapshot.tasks[evidence.taskId].inputArtifactRefs,
 					this.snapshot.tasks[evidence.taskId].repairOfEvidenceId,
 					checked,
+					this.snapshot.tasks[evidence.taskId],
 				);
 		}
 	}
@@ -1539,7 +1619,7 @@ export class ResearchJob {
 	async captureTaskVersion(taskId: string): Promise<TaskVersion> {
 		const task = this.snapshot.tasks[taskId];
 		if (!task) throw new Error(`unknown task ${taskId}`);
-		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId, new Set(), task);
 		const git = await captureGitVersion(
 			task.scope.workspaceRoot,
 			join(task.scope.workspaceRoot, ".astra", "jobs", task.jobId, "versions", "git"),
@@ -1644,9 +1724,12 @@ export class ResearchJob {
 		const task = this.snapshot.tasks[input.taskId];
 		if (!task) throw new Error(`unknown evidence task ${input.taskId}`);
 		if (!completeWorker && task.status !== "succeeded") throw new Error("evidence requires a succeeded task");
-		if (task.deliveryKind && (input.type !== task.requiredOutputType || input.stageId !== task.stageId))
+		if (input.type !== task.requiredOutputType || input.stageId !== task.stageId)
 			throw new Error("evidence does not match task delivery contract");
-		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+		if (task.role !== "worker" && !(task.role === "main-agent" && input.type === "stage-plan"))
+			throw new Error("evidence source task has the wrong role");
+		this.assertTaskCurrent(task.id);
+		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId, new Set(), task);
 		if (input.incrementalRevision) {
 			const revision = input.incrementalRevision;
 			const base = this.snapshot.evidence[revision.baseEvidenceId];
@@ -1661,7 +1744,11 @@ export class ResearchJob {
 			)
 				throw new Error("incremental evidence no longer matches its declared base or merged content");
 		}
-		const files = await freezeEvidenceFiles(task, input.refs);
+		const boundSources =
+			task.version && input.refs.some((ref) => sourceReceiptFilename(ref))
+				? (await this.recoverWorkerManifest(task))?.sourceRefs
+				: undefined;
+		const files = await freezeEvidenceFiles(task, input.refs, boundSources);
 		const evidence: Evidence = {
 			...input,
 			files,
@@ -1741,6 +1828,8 @@ export class ResearchJob {
 			| "task-packet.json"
 			| "review-packet.json"
 			| "review-target-snapshot.json"
+			| "review-criteria.json"
+			| "review-target-evidence.json"
 			| "review-manifest.json",
 	): Promise<string | undefined> {
 		const project = resolve(task.scope.workspaceRoot);
@@ -1787,7 +1876,7 @@ export class ResearchJob {
 			(task.stageRevision ?? 1) !== (this.snapshot.stages[task.stageId]?.revision ?? 1)
 		)
 			throw new StaleResearchInputError(`completion task identity, attempt or stage is stale: ${task.id}`);
-		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId);
+		this.assertCurrentInputs(task.inputArtifactRefs, task.repairOfEvidenceId, new Set(), task);
 		if (
 			task.planId &&
 			!evidenceHasCurrentPlanApprovalFromSnapshot(
@@ -1963,7 +2052,6 @@ export class ResearchJob {
 		return this.exclusive(async () => {
 			const evidence = await this.completeWorkerTaskInternal(taskId);
 			if (evidence) {
-				this.assertCompletionTask(this.snapshot.tasks[taskId], evidence);
 				await this.persist();
 			}
 			return evidence;
@@ -1976,6 +2064,7 @@ export class ResearchJob {
 				content: unknown;
 				refs: string[];
 				incrementalRevision?: Evidence["incrementalRevision"];
+				sourceRefs: OutputRef[];
 		  }
 		| undefined
 	> {
@@ -2021,6 +2110,7 @@ export class ResearchJob {
 				sessionRef: manifest.sessionRef,
 				minSourceRefs: taskStageContract(this.definitions[task.stageId], task).minSourceRefs,
 				job: this,
+				sourceRecoveryRefs: manifest.outputRefs.filter((ref) => ref.kind === "source"),
 			},
 		);
 		if (
@@ -2042,6 +2132,7 @@ export class ResearchJob {
 			artifactType: manifest.artifactType,
 			content: validated.content,
 			refs: manifest.outputRefs.map((ref) => ref.ref),
+			sourceRefs: manifest.outputRefs.filter((ref) => ref.kind === "source"),
 			...(validated.incrementalRevision ? { incrementalRevision: validated.incrementalRevision } : {}),
 		};
 	}
@@ -2053,7 +2144,7 @@ export class ResearchJob {
 		const candidates = Object.values(this.snapshot.tasks).filter((task) => {
 			if (task.role !== "worker" || task.status === "blocked") return false;
 			const evidence = evidenceByTask.get(task.id);
-			if (!evidence) return true;
+			if (!evidence) return taskIsCurrentFromSnapshot(this.snapshot, task);
 			if (!this.snapshot.evidence[evidence.id])
 				throw new StaleResearchInputError(`completion evidence identity is stale: ${evidence.id}`);
 			if (
@@ -2136,6 +2227,7 @@ export class ResearchJob {
 	private async recordReviewInternal(input: Omit<Review, "id" | "createdAt"> & { id?: string }): Promise<Review> {
 		const evidence = this.snapshot.evidence[input.evidenceId];
 		if (!evidence) throw new Error(`unknown evidence ${input.evidenceId}`);
+		this.assertEvidenceCurrent(evidence.id);
 		if (input.targetVersionHash && input.targetVersionHash !== evidence.versionHash)
 			throw new Error("review target version does not match evidence");
 		const definition = this.definitions[evidence.stageId];
@@ -2148,6 +2240,69 @@ export class ResearchJob {
 			]),
 		];
 		validateReviewAssessment(input, expectedCriteria);
+		const allowedRefs = new Set([
+			evidence.id,
+			`evidence:${evidence.id}`,
+			...evidence.refs,
+			...sourceTask.inputArtifactRefs,
+			...sourceTask.inputArtifactRefs.flatMap(
+				(ref) => this.snapshot.evidence[this.snapshot.canonical[ref]?.evidenceId ?? ref]?.refs ?? [],
+			),
+		]);
+		const reviewer = input.reviewerTaskId ? this.snapshot.tasks[input.reviewerTaskId] : undefined;
+		if (reviewer) {
+			const [packetBytes, snapshotBytes] = await Promise.all([
+				this.readTaskCompletionFile(reviewer, "review-packet.json"),
+				this.readTaskCompletionFile(reviewer, "review-target-snapshot.json"),
+			]);
+			if (packetBytes || snapshotBytes) {
+				if (!packetBytes || !snapshotBytes) throw new Error("review reference binding has missing frozen packages");
+				const packet = JSON.parse(packetBytes) as ReviewPacket;
+				const frozen = JSON.parse(snapshotBytes) as {
+					evidence: Evidence;
+					reviewCriteria?: Array<{ criterion: string }>;
+					resolvedEvidenceRefs: ReviewPacket["resolvedEvidenceRefs"];
+					resources?: Array<{ artifactId: string }>;
+				};
+				if (
+					reviewer.role !== "reviewer" ||
+					reviewer.jobId !== this.snapshot.frame.jobId ||
+					reviewer.stageId !== evidence.stageId ||
+					packet.schemaVersion !== "astra.review_packet.v1" ||
+					packet.jobId !== reviewer.jobId ||
+					packet.taskId !== reviewer.id ||
+					packet.evidenceId !== evidence.id ||
+					packet.reviewerRole !== "reviewer" ||
+					checksum(packet.inputRefs) !== checksum(reviewer.inputArtifactRefs) ||
+					!reviewer.inputArtifactRefs.includes(evidence.id) ||
+					packet.targetSnapshotRef !==
+						reviewSnapshotPath(reviewer.scope.workspaceRoot, reviewer.jobId, reviewer.id) ||
+					packet.targetSnapshotHash !== evidence.versionHash ||
+					frozen.evidence.id !== evidence.id ||
+					frozen.evidence.versionHash !== evidence.versionHash ||
+					checksum(JSON.parse(JSON.stringify(frozen.evidence.content))) !==
+						checksum(JSON.parse(JSON.stringify(evidence.content))) ||
+					checksum(frozen.evidence.refs) !== checksum(evidence.refs) ||
+					checksum(packet.resolvedEvidenceRefs) !== checksum(frozen.resolvedEvidenceRefs)
+				)
+					throw new Error("review reference binding does not match its frozen target");
+				this.assertTaskCurrent(reviewer.id);
+				for (const ref of [
+					"review-packet.json",
+					"review-target-snapshot.json",
+					...(await this.boundReviewAuxiliaryRefs(reviewer, frozen)),
+					...(frozen.resources ?? []).map((resource) => resource.artifactId),
+					...packet.resolvedEvidenceRefs.flatMap((ref) => [ref.sourceRef, ref.path]),
+				])
+					allowedRefs.add(ref);
+			}
+		}
+		if (
+			[...input.verifiedRefs!, ...input.criteria!.flatMap((item) => item.evidenceRefs)].some(
+				(ref) => !allowedRefs.has(ref),
+			)
+		)
+			throw new Error("review cites references outside its declared evidence or bound packet");
 		if (
 			input.reviewerTaskId &&
 			Object.values(this.snapshot.reviews).some(
@@ -2163,6 +2318,22 @@ export class ResearchJob {
 		};
 		await this.appendEvent({ type: "review_recorded", review, consequences: this.reviewConsequences(review) });
 		return review;
+	}
+
+	private async boundReviewAuxiliaryRefs(
+		task: TaskPacket,
+		frozen: { evidence: Evidence; reviewCriteria?: Array<{ criterion: string }> },
+	): Promise<string[]> {
+		const refs: string[] = [];
+		for (const [filename, expected] of [
+			["review-criteria.json", frozen.reviewCriteria?.map((group) => group.criterion)],
+			["review-target-evidence.json", frozen.reviewCriteria ? frozen.evidence : undefined],
+		] as const) {
+			const bytes = await this.readTaskCompletionFile(task, filename);
+			if (bytes && expected && checksum(JSON.parse(bytes)) === checksum(JSON.parse(JSON.stringify(expected))))
+				refs.push(filename);
+		}
+		return refs;
 	}
 
 	/** Finish the registered reviewer's own delivery before any further execution or error classification. */
@@ -2209,6 +2380,7 @@ export class ResearchJob {
 				const planId = this.snapshot.tasks[evidence.taskId]?.planId;
 				if (!planId || planReviewStatus(this, planId) === "stale") continue;
 			} else if (!evidenceHasCurrentPlanApprovalFromSnapshot(this.snapshot, evidence)) continue;
+			if (!taskIsCurrentFromSnapshot(this.snapshot, task)) continue;
 			const bytes = await this.readTaskCompletionFile(task, "review-manifest.json");
 			if (bytes === undefined) {
 				if (
@@ -2260,6 +2432,7 @@ export class ResearchJob {
 			const packet = JSON.parse(packetBytes) as ReviewPacket;
 			const snapshot = JSON.parse(snapshotBytes) as {
 				evidence: Evidence;
+				reviewCriteria?: Array<{ criterion: string }>;
 				resolvedEvidenceRefs: ReviewPacket["resolvedEvidenceRefs"];
 				resources?: Array<{ artifactId: string }>;
 			};
@@ -2339,7 +2512,7 @@ export class ResearchJob {
 					})
 			)
 				throw new Error("review completion identity, frozen target or contract mismatch");
-			this.assertCurrentInputs(source.inputArtifactRefs, source.repairOfEvidenceId);
+			this.assertCurrentInputs(source.inputArtifactRefs, source.repairOfEvidenceId, new Set(), source);
 			validateReviewAssessment(manifest, [
 				...source.acceptanceChecks,
 				...source.successCriteria,
@@ -2348,8 +2521,7 @@ export class ResearchJob {
 			const allowedRefs = new Set([
 				"review-packet.json",
 				"review-target-snapshot.json",
-				"review-criteria.json",
-				"review-target-evidence.json",
+				...(await this.boundReviewAuxiliaryRefs(task, snapshot)),
 				`evidence:${evidence.id}`,
 				evidence.id,
 				...evidence.refs,
@@ -2534,6 +2706,7 @@ export class ResearchJob {
 				throw new StaleResearchInputError("historical adoption is no longer the current route");
 		}
 		const deliveryTask = this.snapshot.tasks[evidence.taskId];
+		if (!existing) this.assertEvidenceCurrent(evidence.id);
 		if (evidence.type === "stage-plan") throw new Error("a reviewed plan is not a research result");
 		if (deliveryTask?.deliveryKind === "local")
 			throw new Error("local evidence requires synthesis before canonical adoption");
@@ -2559,7 +2732,8 @@ export class ResearchJob {
 					(ref === ownRetirement.artifactId || ref === ownRetirement.evidenceId)
 				),
 		);
-		this.assertCurrentInputs(refs, sourceTask.repairOfEvidenceId);
+		if (!existing || !sourceTask.planId)
+			this.assertCurrentInputs(refs, sourceTask.repairOfEvidenceId, new Set(), sourceTask);
 		if (sourceTask.planId && !existing && !evidenceHasCurrentPlanApprovalFromSnapshot(this.snapshot, evidence))
 			throw new Error("adoption requires the frozen approved plan");
 		if (sourceTask.planId && existing) {
@@ -2700,7 +2874,7 @@ export class ResearchJob {
 				}
 				if (Object.keys(comparisons).length) basis = { ...basis, evidence: { ...basis.evidence, ...comparisons } };
 			}
-			if (!evidenceHasCurrentPlanApprovalFromSnapshot(basis, evidence))
+			if (!evidenceMatchesHistoricalPlanFromSnapshot(basis, evidence))
 				throw new Error("pending adoption plan is stale");
 		}
 		if (sourceTask?.searchBatchId && sourceTask.searchCandidateId) {
@@ -3171,10 +3345,13 @@ export class ResearchJob {
 			if (!evidence) throw new Error(`unknown evidence ${evidenceId}`);
 			if (evidence.mainAgentDecisionRef === decisionRef && evidence.status === (accepted ? "accepted" : "rejected"))
 				return;
+			this.assertEvidenceCurrent(evidence.id);
 			if (accepted)
 				this.assertCurrentInputs(
 					this.snapshot.tasks[evidence.taskId].inputArtifactRefs,
 					this.snapshot.tasks[evidence.taskId].repairOfEvidenceId,
+					new Set(),
+					this.snapshot.tasks[evidence.taskId],
 				);
 			const consequences = accepted ? this.acceptanceConsequences(evidence, decisionRef) : undefined;
 			await this.appendEvent({ type: "evidence_decided", evidenceId, accepted, decisionRef, consequences });
@@ -3470,6 +3647,8 @@ export class ResearchJob {
 			this.assertCurrentInputs(
 				this.snapshot.tasks[evidence.taskId].inputArtifactRefs,
 				this.snapshot.tasks[evidence.taskId].repairOfEvidenceId,
+				new Set(),
+				this.snapshot.tasks[evidence.taskId],
 			);
 			const consequences = this.acceptanceConsequences(evidence, decisionRef);
 			await this.appendEvent({

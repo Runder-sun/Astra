@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
-import { readSourceRecord } from "./literature.ts";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { publishImmutableFile } from "./contracts.ts";
+import { readSourceReceipt } from "./literature.ts";
 import { validatePaperDelivery } from "./paper-delivery.ts";
 import type { ResearchJob } from "./research.ts";
 import { scientificAssessment, validateClaimAssessments } from "./research.ts";
-import type { IncrementalRevision, OutputRef, TaskPacket } from "./types.ts";
+import type { EvidenceFileVersion, IncrementalRevision, OutputRef, TaskPacket } from "./types.ts";
 
 const MAX_REFERENCED_FILE_BYTES = 32 * 1024 * 1024;
 const SOURCE_REF_PATTERN = /^(?:https:\/\/|openalex:|doi:|arxiv:)/;
@@ -23,6 +24,7 @@ export interface IncrementalBaseEvidence {
 	currentEvidenceSetId?: string;
 	content: unknown;
 	refs?: string[];
+	files?: EvidenceFileVersion[];
 }
 
 export function incrementalContentHash(content: unknown): string {
@@ -274,6 +276,8 @@ export interface WorkerSubmissionOptions {
 	sessionRef: string;
 	minSourceRefs?: number;
 	job?: ResearchJob;
+	/** Only the kernel's identity-checked fixed manifest recovery may supply these bindings. */
+	sourceRecoveryRefs?: OutputRef[];
 }
 
 function declaredIncrementalBase(
@@ -293,6 +297,7 @@ function declaredIncrementalBase(
 		currentEvidenceSetId: base.currentEvidenceSetId,
 		content: base.content,
 		refs: base.refs,
+		files: base.files,
 	};
 }
 
@@ -417,15 +422,31 @@ export async function validateWorkerSubmission(
 		throw new Error(`worker output requires at least ${options.minSourceRefs} source refs; received ${sourceCount}`);
 	}
 	for (const ref of outputRefs.filter((ref) => ref.kind === "source")) {
-		if (!(await readSourceRecord(packet.scope.workspaceRoot, packet.jobId, ref.ref)))
-			throw new Error(`source requires an intact retrieval receipt: ${ref.ref}`);
+		const inherited =
+			incrementalBase &&
+			!submission.refs.some((submitted) => submitted.kind === "source" && submitted.ref === ref.ref);
+		const binding = options.sourceRecoveryRefs
+			? options.sourceRecoveryRefs.find((saved) => saved.kind === "source" && saved.ref === ref.ref)?.sha256
+			: inherited
+				? incrementalBase.files?.find((file) => file.sourceRef === ref.ref)?.sha256
+				: undefined;
+		if ((options.sourceRecoveryRefs || inherited) && !binding)
+			throw new Error(`source snapshot binding is missing: ${ref.ref}`);
+		const receipt = await readSourceReceipt(packet.scope.workspaceRoot, packet.jobId, ref.ref, binding);
+		if (!receipt) throw new Error(`source requires an intact retrieval receipt: ${ref.ref}`);
+		if (ref.sha256 && ref.sha256 !== receipt.sha256)
+			throw new Error(`source digest does not match validated snapshot: ${ref.ref}`);
+		ref.sha256 = await publishImmutableFile(
+			join(packet.scope.workspaceRoot, ".astra", "jobs", packet.jobId, "versions", "files"),
+			receipt.content,
+		);
 	}
 	if (applied) {
 		for (const { path, values } of namedSourceArrays(submittedContent)) {
 			const key = path.at(-1)!;
 			for (const value of values) {
 				const sourceRef = (value as Record<string, unknown>).sourceRef as string;
-				if (!(await readSourceRecord(packet.scope.workspaceRoot, packet.jobId, sourceRef)))
+				if (!outputRefs.some((ref) => ref.kind === "source" && ref.ref === sourceRef))
 					throw new Error(`incremental ${key} source requires an intact retrieval receipt: ${sourceRef}`);
 			}
 		}

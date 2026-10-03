@@ -4,11 +4,12 @@ import {
 	EffectiveContractUnavailableError,
 	type EffectiveTaskContract,
 	repairContext,
+	resolveRepairInputFromSnapshot,
 	semanticContractHash,
 	taskContractMatches,
 } from "./effective-contract.ts";
 import type { ResearchJob } from "./research.ts";
-import type { Evidence, JobSnapshot, StageDefinition, StagePlanManifest } from "./types.ts";
+import type { Evidence, JobSnapshot, StageDefinition, StagePlanManifest, TaskPacket } from "./types.ts";
 
 export const PLAN_REVIEW_CHECKS = [
 	"The plan advances the mission within its boundaries and addresses the current stage purpose",
@@ -76,7 +77,7 @@ export function hasFrozenPlanContractFromSnapshot(snapshot: JobSnapshot, planId:
 	return Array.isArray((evidence?.content as { effectiveContracts?: unknown } | undefined)?.effectiveContracts);
 }
 
-function currentPlanBasis(snapshot: JobSnapshot, planId: string, evidence: Evidence): boolean {
+function planBasisUnchanged(snapshot: JobSnapshot, planId: string, evidence: Evidence): boolean {
 	const task = snapshot.tasks[evidence.taskId];
 	const context = evidence.content as {
 		plan: StagePlanManifest;
@@ -97,33 +98,129 @@ function currentPlanBasis(snapshot: JobSnapshot, planId: string, evidence: Evide
 	);
 }
 
+function currentPlanBasis(snapshot: JobSnapshot, planId: string, evidence: Evidence): boolean {
+	return (
+		evidence.status !== "rejected" &&
+		!snapshot.discardedEvidence[evidence.id] &&
+		!Object.values(snapshot.discardedCandidates).some(
+			(receipt) => receipt.evidenceId === evidence.id || receipt.taskId === evidence.taskId,
+		) &&
+		taskIdentityIsCurrent(snapshot, snapshot.tasks[evidence.taskId]) &&
+		planBasisUnchanged(snapshot, planId, evidence)
+	);
+}
+
+function repairAncestors(snapshot: JobSnapshot, contract: EffectiveTaskContract, workerTaskId?: string): Set<string> {
+	const workerEvidence = workerTaskId
+		? Object.values(snapshot.evidence).find((entry) => entry.taskId === workerTaskId)
+		: undefined;
+	const ancestors = new Set<string>();
+	let ancestorId = contract.repairOfEvidenceId;
+	while (ancestorId && !ancestors.has(ancestorId)) {
+		const ancestor = snapshot.evidence[ancestorId];
+		const source = ancestor ? snapshot.tasks[ancestor.taskId] : undefined;
+		if (
+			!ancestor ||
+			!source ||
+			source.jobId !== snapshot.frame.jobId ||
+			source.stageId !== contract.stageId ||
+			ancestor.stageId !== contract.stageId ||
+			(workerTaskId && ancestor.currentEvidenceSetId !== workerEvidence?.currentEvidenceSetId)
+		)
+			break;
+		ancestors.add(ancestorId);
+		ancestorId = source.repairOfEvidenceId;
+	}
+	return ancestors;
+}
+
 function planInputsUnchanged(snapshot: JobSnapshot, evidence: Evidence, workerTaskId?: string): boolean {
 	if (!Array.isArray((evidence.content as { effectiveContracts?: unknown }).effectiveContracts)) return true;
 	const context = evidence.content as { effectiveContracts: Array<{ contract: EffectiveTaskContract }> };
 	for (const frozen of context.effectiveContracts) {
-		const workerEvidence = workerTaskId
-			? Object.values(snapshot.evidence).find((entry) => entry.taskId === workerTaskId)
-			: undefined;
-		const repairAncestors = new Set<string>();
-		let ancestorId = frozen.contract.repairOfEvidenceId;
-		while (ancestorId && !repairAncestors.has(ancestorId)) {
-			const ancestor = snapshot.evidence[ancestorId];
-			const source = ancestor ? snapshot.tasks[ancestor.taskId] : undefined;
-			if (
-				!ancestor ||
-				!source ||
-				source.jobId !== snapshot.frame.jobId ||
-				source.stageId !== frozen.contract.stageId ||
-				ancestor.stageId !== frozen.contract.stageId ||
-				(workerTaskId && ancestor.currentEvidenceSetId !== workerEvidence?.currentEvidenceSetId)
-			)
-				break;
-			repairAncestors.add(ancestorId);
-			ancestorId = source.repairOfEvidenceId;
-		}
+		const ancestors = repairAncestors(snapshot, frozen.contract, workerTaskId);
 		for (const input of frozen.contract.inputVersions) {
 			const canonical = snapshot.canonical[input.inputRef];
 			const currentEvidence = snapshot.evidence[canonical?.evidenceId ?? input.inputRef];
+			if (
+				!currentEvidence &&
+				!canonical &&
+				!input.canonical &&
+				workerTaskId &&
+				input.versionHash &&
+				input.evidenceId === input.inputRef
+			) {
+				const worker = snapshot.tasks[workerTaskId];
+				const winner = Object.values(snapshot.evidence).find((entry) => entry.taskId === workerTaskId);
+				const adopted = winner
+					? snapshot.canonical[snapshot.canonicalRoute.stageArtifactIds[winner.stageId]]
+					: undefined;
+				const receipt = snapshot.discardedEvidence[input.inputRef];
+				const cleanup = snapshot.cleanupIntents?.[`evidence:${input.inputRef}`];
+				const obligation = Object.values(snapshot.obligations).find(
+					(item) => item.evidenceId === input.inputRef && item.targetVersionHash === input.versionHash,
+				);
+				const chain = new Set<string>();
+				let ancestorId = worker.repairOfEvidenceId;
+				while (ancestorId && !chain.has(ancestorId)) {
+					const ancestor = snapshot.evidence[ancestorId];
+					const sourceId = ancestor?.taskId ?? snapshot.discardedEvidence[ancestorId]?.taskId;
+					const source = sourceId ? snapshot.tasks[sourceId] : undefined;
+					if (
+						!source ||
+						source.jobId !== worker.jobId ||
+						source.stageId !== worker.stageId ||
+						(ancestor &&
+							(ancestor.stageId !== worker.stageId ||
+								ancestor.currentEvidenceSetId !== winner?.currentEvidenceSetId))
+					)
+						break;
+					chain.add(ancestorId);
+					ancestorId = source.repairOfEvidenceId;
+				}
+				// The original obligation proves the deleted version; the receipt alone cannot reconstruct its bytes.
+				if (
+					winner?.status === "accepted" &&
+					adopted?.status === "active" &&
+					adopted.adoptionCompletedAt &&
+					adopted.evidenceId === winner.id &&
+					adopted.type === winner.type &&
+					adopted.checksum === winner.checksum &&
+					adopted.sourceSha256 === winner.checksum &&
+					taskContractMatches(worker, frozen.contract) &&
+					chain.has(input.inputRef) &&
+					!snapshot.retiredArtifacts[input.inputRef] &&
+					!Object.values(snapshot.retiredArtifacts).some((entry) => entry.evidenceId === input.inputRef) &&
+					!Object.values(snapshot.canonical).some((entry) => entry.evidenceId === input.inputRef) &&
+					receipt?.evidenceId === input.inputRef &&
+					receipt.reason === "superseded-repair" &&
+					receipt.cleanupStatus === "completed" &&
+					cleanup?.kind === "evidence" &&
+					cleanup.status === "completed" &&
+					cleanup.receipt.evidenceId === receipt.evidenceId &&
+					cleanup.receipt.taskId === receipt.taskId &&
+					cleanup.receipt.checksum === receipt.checksum &&
+					obligation?.status === "resolved" &&
+					receipt.reviewIds.includes(obligation.sourceReviewId) &&
+					obligation.items?.length &&
+					obligation.items.every((item) => {
+						const review = item.reviewId ? snapshot.reviews[item.reviewId] : undefined;
+						const criterion = frozen.contract.repairChecks.find((check) => check.issueId === item.id)?.criterion;
+						return (
+							item.status === "resolved" &&
+							item.evidenceId === winner.id &&
+							review?.evidenceId === winner.id &&
+							review.targetVersionHash === winner.versionHash &&
+							review.verdict === "pass" &&
+							(review.score ?? 0) >= 0.8 &&
+							Boolean(
+								criterion && review.criteria?.some((check) => check.criterion === criterion && check.passed),
+							)
+						);
+					})
+				)
+					continue;
+			}
 			if (input.evidenceId !== (currentEvidence?.id ?? null)) return false;
 			if (input.versionHash !== (currentEvidence?.versionHash ?? canonical?.evidenceSnapshotHash ?? null))
 				return false;
@@ -139,7 +236,7 @@ function planInputsUnchanged(snapshot: JobSnapshot, evidence: Evidence, workerTa
 						!canonical &&
 						workerTaskId &&
 						input.versionHash !== null &&
-						repairAncestors.has(input.inputRef) &&
+						ancestors.has(input.inputRef) &&
 						currentEvidence.supersededByTaskId === workerTaskId
 					)) ||
 				canonical?.status === "stale"
@@ -165,10 +262,153 @@ export function evidenceHasCurrentPlanApproval(job: ResearchJob, evidence: Evide
 
 export function evidenceHasCurrentPlanApprovalFromSnapshot(snapshot: JobSnapshot, evidence: Evidence): boolean {
 	const worker = snapshot.tasks[evidence.taskId];
+	if (
+		!worker ||
+		evidence.stageId !== worker.stageId ||
+		evidence.type !== worker.requiredOutputType ||
+		(worker.role !== "worker" && !(worker.role === "main-agent" && evidence.type === "stage-plan")) ||
+		!taskIdentityIsCurrent(snapshot, worker)
+	)
+		return false;
+	if (evidence.type === "stage-plan")
+		return Boolean(
+			worker.planId &&
+				currentPlanBasis(snapshot, worker.planId, evidence) &&
+				planInputsUnchanged(snapshot, evidence),
+		);
+	return taskIsCurrentFromSnapshot(snapshot, worker);
+}
+
+function taskIdentityIsCurrent(snapshot: JobSnapshot, task: TaskPacket): boolean {
+	if (
+		!task ||
+		task.jobId !== snapshot.frame.jobId ||
+		!snapshot.stages[task.stageId] ||
+		task.status === "blocked" ||
+		(task.stageRevision ?? 1) !== (snapshot.stages[task.stageId].revision ?? 1) ||
+		Object.values(snapshot.tasks).some(
+			(next) =>
+				next.supersedesTaskId === task.id || (next.replayKey === task.replayKey && next.attempt > task.attempt),
+		) ||
+		[
+			...Object.values(snapshot.retiredArtifacts),
+			...Object.values(snapshot.discardedEvidence),
+			...Object.values(snapshot.discardedCandidates),
+		].some((receipt) => receipt.taskId === task.id)
+	)
+		return false;
+	return true;
+}
+
+/** The original frozen input and exact winner, not a shared lineage label, authorize a repair comparison. */
+export function taskHasBoundRepairAncestor(snapshot: JobSnapshot, task: TaskPacket, ref: string): boolean {
+	const input = snapshot.evidence[ref];
+	if (
+		!task.planId ||
+		!input ||
+		input.status !== "rejected" ||
+		input.supersededByTaskId !== task.id ||
+		snapshot.canonical[ref] ||
+		Object.values(snapshot.canonical).some((artifact) => artifact.evidenceId === ref) ||
+		snapshot.retiredArtifacts[ref] ||
+		Object.values(snapshot.retiredArtifacts).some((receipt) => receipt.evidenceId === ref)
+	)
+		return false;
+	const plan = planEvidenceFromSnapshot(snapshot, task.planId);
+	if (!plan || !matchesApprovedWorkerContract(snapshot, task, plan)) return false;
+	const frozen = (
+		plan.content as { effectiveContracts: Array<{ hash: string; contract: EffectiveTaskContract }> }
+	).effectiveContracts.find((entry) => entry.hash === task.effectiveContractHash)!;
+	return (
+		repairAncestors(snapshot, frozen.contract, task.id).has(ref) &&
+		frozen.contract.inputVersions.some(
+			(version) =>
+				version.inputRef === ref && version.evidenceId === input.id && version.versionHash === input.versionHash,
+		)
+	);
+}
+
+/** Current work and ordinary inputs share one identity rule; historical repair targets stay comparisons. */
+export function taskIsCurrentFromSnapshot(
+	snapshot: JobSnapshot,
+	task: TaskPacket,
+	checked = new Set<string>(),
+): boolean {
+	if (!taskIdentityIsCurrent(snapshot, task)) return false;
+	if (checked.has(task.id)) return true;
+	checked.add(task.id);
+	for (const ref of task.inputArtifactRefs) {
+		if (
+			ref === task.repairOfEvidenceId &&
+			Object.values(snapshot.obligations).some(
+				(issue) => issue.evidenceId === ref || snapshot.reviews[issue.sourceReviewId]?.evidenceId === ref,
+			)
+		) {
+			const historical = snapshot.evidence[ref];
+			if (historical) {
+				try {
+					if (
+						snapshot.tasks[historical.taskId].inputArtifactRefs.some(
+							(oldRef) => !task.inputArtifactRefs.includes(resolveRepairInputFromSnapshot(snapshot, oldRef)),
+						)
+					)
+						return false;
+				} catch (error) {
+					if (error instanceof EffectiveContractUnavailableError) return false;
+					throw error;
+				}
+				continue;
+			}
+		}
+		if (
+			snapshot.retiredArtifacts[ref] ||
+			snapshot.canonical[ref]?.status === "stale" ||
+			Object.values(snapshot.retiredArtifacts).some((receipt) => receipt.evidenceId === ref) ||
+			Object.values(snapshot.canonical).some(
+				(artifact) => artifact.evidenceId === ref && artifact.status === "stale",
+			)
+		)
+			return false;
+		if (taskHasBoundRepairAncestor(snapshot, task, ref)) continue;
+		const evidence = snapshot.evidence[snapshot.canonical[ref]?.evidenceId ?? ref];
+		if (
+			evidence &&
+			(evidence.status === "rejected" ||
+				evidence.supersededByTaskId ||
+				!taskIsCurrentFromSnapshot(snapshot, snapshot.tasks[evidence.taskId], checked) ||
+				!taskHasApprovedPlanFromSnapshot(snapshot, snapshot.tasks[evidence.taskId]))
+		)
+			return false;
+	}
+	return task.role !== "worker" || taskHasApprovedPlanFromSnapshot(snapshot, task);
+}
+
+function taskHasApprovedPlanFromSnapshot(snapshot: JobSnapshot, worker: TaskPacket): boolean {
+	if (worker.role !== "worker") return true;
 	const planId = worker?.planId;
 	if (!planId) return true;
 	const planEvidenceValue = planEvidenceFromSnapshot(snapshot, planId);
 	if (!planEvidenceValue || !currentPlanBasis(snapshot, planId, planEvidenceValue)) return false;
+	return matchesApprovedWorkerContract(snapshot, worker, planEvidenceValue);
+}
+
+/** Only for an already applied adoption whose original comparisons were proved from the journal. */
+export function evidenceMatchesHistoricalPlanFromSnapshot(snapshot: JobSnapshot, evidence: Evidence): boolean {
+	const worker = snapshot.tasks[evidence.taskId];
+	if (!worker?.planId) return true;
+	const plan = planEvidenceFromSnapshot(snapshot, worker.planId);
+	return Boolean(
+		plan &&
+			planBasisUnchanged(snapshot, worker.planId, plan) &&
+			matchesApprovedWorkerContract(snapshot, worker, plan),
+	);
+}
+
+function matchesApprovedWorkerContract(
+	snapshot: JobSnapshot,
+	worker: TaskPacket,
+	planEvidenceValue: Evidence,
+): boolean {
 	const planReviews = Object.values(snapshot.reviews).filter(
 		(review) =>
 			review.evidenceId === planEvidenceValue.id && review.targetVersionHash === planEvidenceValue.versionHash,
@@ -196,11 +436,29 @@ export function planReviewStatusFromSnapshot(
 	planId: string,
 ): "pending" | "passed" | "failed" | "stale" {
 	const evidence = planEvidenceFromSnapshot(snapshot, planId);
-	if (!evidence) return "pending";
+	if (!evidence) {
+		const source = Object.values(snapshot.tasks).find(
+			(task) => task.planId === planId && task.requiredOutputType === "stage-plan" && task.role === "main-agent",
+		);
+		if (
+			source &&
+			(!taskIsCurrentFromSnapshot(snapshot, source) ||
+				[...Object.values(snapshot.discardedEvidence), ...Object.values(snapshot.discardedCandidates)].some(
+					(receipt) => receipt.taskId === source.id,
+				))
+		)
+			return "stale";
+		return "pending";
+	}
 	const context = evidence.content as {
 		effectiveContracts?: Array<{ hash: string; contract: EffectiveTaskContract }>;
 	};
-	if (!currentPlanBasis(snapshot, planId, evidence) || !planInputsUnchanged(snapshot, evidence)) return "stale";
+	if (
+		!currentPlanBasis(snapshot, planId, evidence) ||
+		!taskIsCurrentFromSnapshot(snapshot, snapshot.tasks[evidence.taskId]) ||
+		!planInputsUnchanged(snapshot, evidence)
+	)
+		return "stale";
 	const repairs = repairContext(snapshot);
 	try {
 		if (
@@ -227,6 +485,7 @@ export function planReviewStatusFromSnapshot(
 }
 
 export async function preparePlanEvidence(job: ResearchJob, plan: StagePlanManifest): Promise<Evidence> {
+	if (planReviewStatus(job, plan.id) === "stale") throw new Error("stage plan evidence is stale or was discarded");
 	const existing = planEvidence(job, plan.id);
 	if (existing) return existing;
 	const snapshot = job.state;

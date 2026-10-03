@@ -410,9 +410,9 @@ it.each(["pi", "codex"] as const)(
 		expect(f.job.state.stages.validation.executionId).not.toBe(original.executionId);
 		await f.job.resume();
 		f.job = (await ResearchJob.open(f.store, f.job.state.frame.jobId))!;
-		await expect(f.job.recoverMainAgentDeliveries()).rejects.toThrow(/stale/);
+		await f.job.recoverMainAgentDeliveries();
 		expect(Object.keys(f.job.state.stagePlans)).toHaveLength(0);
-		expect(Object.values(f.job.state.mainAgentCalls!)[0]).toEqual(call);
+		expect(Object.values(f.job.state.mainAgentCalls!)[0]).toEqual({ ...call, abandoned: true, completed: false });
 		expect(control.calls).toBe(1);
 	},
 );
@@ -468,8 +468,11 @@ it.each(
 	f.job = (await ResearchJob.open(f.store, f.job.state.frame.jobId))!;
 	if (when === "unapplied") {
 		const before = f.job.state;
-		await expect(f.job.recoverMainAgentDeliveries()).rejects.toThrow(/stale/);
-		expect(f.job.state).toEqual(before);
+		await f.job.recoverMainAgentDeliveries();
+		expect(Object.values(f.job.state.mainAgentCalls!)[0]).toMatchObject({ abandoned: true, completed: false });
+		expect(f.job.state.obligations).toEqual(before.obligations);
+		expect(f.job.state.evidence).toEqual(before.evidence);
+		expect(f.job.state.canonical).toEqual(before.canonical);
 		expect(Object.keys(f.job.state.routeDecisions)).toHaveLength(0);
 	} else {
 		await f.job.recoverMainAgentDeliveries();
@@ -529,7 +532,12 @@ it.each(
 	f.job = (await ResearchJob.open(f.store, before.frame.jobId))!;
 	if (change === "guidance") {
 		await f.job.resumeWithGuidance("Change the scientific planning direction");
-		await expect(f.job.recoverMainAgentDeliveries()).rejects.toThrow(/stale/);
+		await f.job.recoverMainAgentDeliveries();
+		expect(f.job.state.mainAgentCalls![originalCall.id]).toEqual({
+			...originalCall,
+			abandoned: true,
+			completed: false,
+		});
 		expect(f.job.state.stagePlans[plan.id]).toBeUndefined();
 		expect(control.calls).toBe(1);
 		return;
@@ -923,7 +931,7 @@ it.each(["id", "mode", "obligationId", "stageId", "tasks"] as const)(
 	},
 );
 
-it("M1 rejects changed bytes after digest registration and guidance-stale saved output", async () => {
+it("M1 rejects changed delivery bytes and durably abandons guidance-stale saved output", async () => {
 	for (const change of ["bytes", "guidance"] as const) {
 		const f = await setup("plan");
 		const control: RunnerControl = { calls: 0, pause: () => f.job.pause("Original pause") };
@@ -937,9 +945,22 @@ it("M1 rejects changed bytes after digest registration and guidance-stale saved 
 		} else await f.job.recordUserGuidance("Change the scientific scope");
 		await f.job.resume();
 		f.job = (await ResearchJob.open(f.store, f.job.state.frame.jobId))!;
-		await expect(tick()).rejects.toThrow(change === "bytes" ? /digest/ : /stale/);
-		expect(Object.values(f.job.state.stagePlans)).toHaveLength(0);
-		expect(control.calls).toBe(1);
+		if (change === "bytes") {
+			await expect(tick()).rejects.toThrow(/digest/);
+			expect(f.job.state.mainAgentCalls![call.id].abandoned).not.toBe(true);
+			expect(Object.values(f.job.state.stagePlans)).toHaveLength(0);
+			expect(control.calls).toBe(1);
+		} else {
+			await f.job.recoverMainAgentDeliveries();
+			expect(f.job.state.mainAgentCalls![call.id]).toMatchObject({ abandoned: true, completed: false });
+			expect(f.job.state.stagePlans[call.planId!]).toBeUndefined();
+			control.pause = undefined;
+			await f.job.updateBudget({ maxTurns: 2 });
+			await tick();
+			expect(control.calls).toBe(2);
+			expect(Object.values(f.job.state.stagePlans)).toHaveLength(1);
+			expect(f.job.state.stagePlans[call.planId!]).toBeUndefined();
+		}
 	}
 });
 it("B5 persistent completion failure stops with delivery pending and no refund", async () => {

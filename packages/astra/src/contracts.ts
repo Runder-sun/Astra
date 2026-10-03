@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { link, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type {
 	MainAgentCall,
@@ -115,11 +116,59 @@ export async function atomicWriteJson(path: string, value: unknown): Promise<voi
 	await rename(temp, path);
 }
 
+/** Publish complete content once; existing shared bytes must never be replaced. */
+export async function publishImmutableFile(root: string, content: Buffer | string, mode = 0o444): Promise<string> {
+	root = resolve(root);
+	await mkdir(root, { recursive: true });
+	for (let parent = root; ; parent = dirname(parent)) {
+		const metadata = await lstat(parent);
+		if (!metadata.isDirectory() || metadata.isSymbolicLink())
+			throw new Error(`immutable content directory is unsafe: ${parent}`);
+		if (parent === dirname(parent)) break;
+	}
+	const hash = createHash("sha256").update(content).digest("hex");
+	const destination = join(root, hash);
+	const exists = async (): Promise<boolean> => {
+		let metadata: Stats;
+		try {
+			metadata = await lstat(destination);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		if (
+			!metadata.isFile() ||
+			metadata.isSymbolicLink() ||
+			createHash("sha256")
+				.update(await readFile(destination))
+				.digest("hex") !== hash
+		)
+			throw new Error(`immutable content integrity failure: ${destination}`);
+		return true;
+	};
+	if (await exists()) return hash;
+	const temp = `${destination}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+	const handle = await open(temp, "wx", mode);
+	try {
+		await handle.writeFile(content);
+		try {
+			await link(temp, destination);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if (!(await exists())) throw new Error(`immutable content disappeared during publication: ${destination}`);
+		}
+	} finally {
+		await handle.close();
+		await rm(temp, { force: true });
+	}
+	return hash;
+}
+
 export async function readJson<T>(path: string): Promise<T> {
 	return JSON.parse(await readFile(path, "utf8")) as T;
 }
 
-export function sha256(value: string): string {
+export function sha256(value: string | Buffer): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 

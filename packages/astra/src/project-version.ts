@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { publishImmutableFile } from "./contracts.ts";
 import type { GitVersion } from "./types.ts";
 
 /** Observes Git only: never changes HEAD, the index, or the user's worktree. */
@@ -40,13 +41,11 @@ export async function captureGitVersion(projectRoot: string, snapshotRoot: strin
 	const untrackedArgs = ["ls-files", "--others", "--exclude-standard", "-z", ...paths];
 	const untrackedPaths = await git(...untrackedArgs);
 	const untracked: Array<{ path: string; sha256: string; mode: number }> = [];
-	await mkdir(snapshotRoot, { recursive: true });
 	for (const path of untrackedPaths.split("\0").filter(Boolean)) {
 		const metadata = await lstat(join(projectRoot, path));
 		if (!metadata.isFile()) throw new Error(`Git version cannot snapshot an untracked non-file: ${path}`);
 		const content = await readFile(join(projectRoot, path));
-		const sha256 = createHash("sha256").update(content).digest("hex");
-		await writeFile(join(snapshotRoot, sha256), content, { mode: 0o600 });
+		const sha256 = await publishImmutableFile(snapshotRoot, content, 0o600);
 		untracked.push({ path, sha256, mode: metadata.mode & 0o777 });
 	}
 	if (
@@ -65,10 +64,8 @@ export async function captureGitVersion(projectRoot: string, snapshotRoot: strin
 		)
 			throw new Error(`Git project changed during version capture: ${file.path}`);
 	}
-	const patchSha256 = createHash("sha256").update(patch).digest("hex");
-	const indexPatchSha256 = createHash("sha256").update(indexPatch).digest("hex");
-	await writeFile(join(snapshotRoot, patchSha256), patch, { mode: 0o600 });
-	await writeFile(join(snapshotRoot, indexPatchSha256), indexPatch, { mode: 0o600 });
+	const patchSha256 = await publishImmutableFile(snapshotRoot, patch, 0o600);
+	const indexPatchSha256 = await publishImmutableFile(snapshotRoot, indexPatch, 0o600);
 	return {
 		status: "captured",
 		root,

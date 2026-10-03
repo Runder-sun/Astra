@@ -537,6 +537,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 	}
 
 	async run(task: TaskPacket, job: ResearchJob): Promise<WorkerRunResult> {
+		job.assertTaskCurrent(task.id, task);
 		const sessionId = safeSessionId(task.jobId, task.id, task.attempt);
 		await job.recordChildSession({
 			sessionId,
@@ -556,6 +557,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 			task.writeAuthority === "workspace-write"
 				? taskResourcePath(task.scope.workspaceRoot, task.jobId, task.id)
 				: undefined;
+		job.assertTaskCurrent(task.id, task);
 		const result = await this.runner.runTask(
 			job.state.tasks[task.id],
 			"worker",
@@ -685,6 +687,7 @@ export class PiReviewerAdapter implements ResearchReviewerAdapter {
 	}
 
 	async review(evidence: Evidence, job: ResearchJob): Promise<ReviewerRunResult> {
+		job.assertEvidenceCurrent(evidence.id, evidence);
 		const baseDefinition = job.definitions[evidence.stageId];
 		const workerTask = job.state.tasks[evidence.taskId];
 		if (!baseDefinition) throw new Error(`stage definition not found for review: ${evidence.stageId}`);
@@ -1176,6 +1179,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 	}
 
 	decideEvidence(evidence: Evidence, job: ResearchJob): Promise<MainAgentDecisionManifest> {
+		job.assertEvidenceCurrent(evidence.id, evidence);
 		const reviewEvidenceGuidance =
 			evidence.stageId === "research-review"
 				? " A FAIL verdict is valid negative evidence when the review is complete, grounded, and explicit about required repairs; do not reject it merely because the assessment is negative. Evidence acceptance validates the review artifact, not the reviewed research."
@@ -1189,6 +1193,7 @@ export class PiMainAgentAdapter implements ResearchMainAgentAdapter {
 	}
 
 	decideAdoption(evidence: Evidence, job: ResearchJob): Promise<MainAgentDecisionManifest> {
+		job.assertEvidenceCurrent(evidence.id, evidence);
 		const replaceableArtifactIds = Object.values(job.state.canonical)
 			.filter((artifact) => artifact.status === "active" && artifact.type === evidence.type)
 			.map((artifact) => artifact.id);

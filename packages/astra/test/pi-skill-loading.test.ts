@@ -9,10 +9,36 @@ import { PiChildSessionRunner, PiMainAgentAdapter } from "../src/pi-child-sessio
 import { ResearchJob } from "../src/research.ts";
 import { DEFAULT_STAGES } from "../src/stages.ts";
 import { MemoryAstraStore } from "../src/store.ts";
-import type { Evidence, Obligation } from "../src/types.ts";
+import type { Obligation } from "../src/types.ts";
 import { reviewFixture } from "./review-fixture.ts";
 
 const skillsRoot = fileURLToPath(new URL("../skills/astra", import.meta.url));
+
+async function registeredEvidence(job: ResearchJob, stageId: string, content: unknown) {
+	const definition = job.definitions[stageId];
+	const task = await job.dispatchTask({
+		stageId,
+		stageExecutionId: stageId,
+		role: "worker",
+		objective: "Registered offline prompt target",
+		inputArtifactRefs: [],
+		requiredCanonicalArtifacts: [],
+		requiredOutputType: definition.outputArtifactType,
+		requiredOutputFields: definition.requiredOutputFields,
+		acceptanceChecks: definition.acceptanceChecks,
+		successCriteria: [],
+		failureSignals: definition.failureSignals,
+		dependencies: [],
+		scope: { workspaceRoot: job.state.frame.permissions.workspaceRoot, allowedPaths: ["."] },
+		allowedTools: ["read"],
+		writeAuthority: "none",
+		budget: { maxTurns: 1, maxToolCalls: 1, maxRuntimeMs: 1000 },
+		reviewGateRequired: true,
+		resumePolicy: "resume-session",
+	});
+	await job.setTaskStatus(task.id, "succeeded");
+	return job.recordEvidence({ taskId: task.id, stageId, type: task.requiredOutputType, content, refs: [] });
+}
 
 describe("Pi-native Astra skills", () => {
 	it("loads packaged Astra skills through Pi's skill loader", () => {
@@ -287,6 +313,7 @@ describe("Pi-native Astra skills", () => {
 			const job = await ResearchJob.create(new MemoryAstraStore(), {
 				jobId: "job_negative_review",
 				objective: "retain an honest final assessment",
+				definitions: [DEFAULT_STAGES.find((stage) => stage.id === "research-review")!],
 				workspaceRoot: root,
 				automation: "full",
 			});
@@ -314,23 +341,13 @@ describe("Pi-native Astra skills", () => {
 				);
 				return { exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 };
 			});
-			const evidence: Evidence = {
-				id: "evidence_negative_review",
-				taskId: "task_negative_review",
-				stageId: "research-review",
-				type: "research-review",
-				content: {
-					verdict: "FAIL",
-					strengths: [],
-					weaknesses: ["claim evidence is missing"],
-					claimAudit: [],
-					requiredRepairs: ["restore evidence refs"],
-				},
-				refs: ["pi-session:review-worker"],
-				checksum: "negative-review-checksum",
-				createdAt: new Date().toISOString(),
-				status: "candidate",
-			};
+			const evidence = await registeredEvidence(job, "research-review", {
+				verdict: "FAIL",
+				strengths: [],
+				weaknesses: ["claim evidence is missing"],
+				claimAudit: [],
+				requiredRepairs: ["restore evidence refs"],
+			});
 
 			await new PiMainAgentAdapter(runner, root).decideEvidence(evidence, job);
 
@@ -498,17 +515,7 @@ describe("Pi-native Astra skills", () => {
 			const runner = new PiChildSessionRunner({ sessionDir: join(root, "sessions") });
 			vi.spyOn(runner, "run").mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", jsonEvents: [], costUsd: 0 });
 			vi.spyOn(runner, "waitForManifest").mockRejectedValue(new Error("manifest missing"));
-			const evidence: Evidence = {
-				id: "evidence_missing_manifest",
-				taskId: "task_missing_manifest",
-				stageId: "validation",
-				type: "validation",
-				content: { researchQuestion: "bounded" },
-				refs: [],
-				checksum: "missing-manifest-checksum",
-				createdAt: new Date().toISOString(),
-				status: "candidate",
-			};
+			const evidence = await registeredEvidence(job, "validation", { researchQuestion: "bounded" });
 
 			await expect(new PiMainAgentAdapter(runner, root).decideEvidence(evidence, job)).rejects.toThrow("manifest");
 			const session = Object.values(job.state.sessions).find((entry) =>

@@ -726,7 +726,8 @@ it.each([
 		await store.writeSnapshot(snapshot);
 	}
 	const recovered = (await ResearchJob.open(store, task.jobId))!;
-	await expect(recovered.recoverPendingOperations()).rejects.toThrow();
+	if (change === "stale-stage") await recovered.recoverPendingOperations();
+	else await expect(recovered.recoverPendingOperations()).rejects.toThrow();
 	expect(Object.keys(recovered.state.evidence)).toHaveLength(0);
 	expect(recovered.state.tasks[task.id].status).toBe("running");
 	expect(run).toHaveBeenCalledOnce();
@@ -1165,7 +1166,8 @@ it.each(["registration-fails", "invalid", "stale"] as const)(
 		expect(Object.values(job.state.tasks).filter((task) => task.role === "worker")).toHaveLength(1);
 		expect(Object.values(job.state.evidence).filter((e) => e.type !== "stage-plan")).toHaveLength(0);
 		const turns = job.state.budgetUsage!.turnsUsed;
-		await expect(supervisor.tick()).rejects.toThrow();
+		if (fault === "stale") await supervisor.tick();
+		else await expect(supervisor.tick()).rejects.toThrow();
 		expect(run).toHaveBeenCalledOnce();
 		expect(job.state.budgetUsage!.turnsUsed).toBe(turns);
 		expect(Object.values(job.state.tasks).filter((task) => task.role === "worker")).toHaveLength(1);

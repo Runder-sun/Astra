@@ -39,6 +39,22 @@ import { validateWorkerSubmission } from "./worker-submission.ts";
 
 const ACTIVE_JOB_FILE = [".astra", "active-job.json"];
 const MAX_WORKER_DIRECT_READ_BYTES = 16 * 1024;
+const reviewAssessmentFields = {
+	verdict: Type.Union([Type.Literal("pass"), Type.Literal("fail"), Type.Literal("partial"), Type.Literal("blocked")]),
+	findings: Type.Array(Type.String()),
+	score: Type.Number({ minimum: 0, maximum: 1 }),
+	criteria: Type.Array(
+		Type.Object({
+			criterion: Type.String(),
+			passed: Type.Boolean(),
+			score: Type.Number({ minimum: 0, maximum: 1 }),
+			evidenceRefs: Type.Array(Type.String()),
+			rationale: Type.String(),
+		}),
+		{ minItems: 1 },
+	),
+	verifiedRefs: Type.Array(Type.String(), { minItems: 1 }),
+};
 
 interface AstraExtensionOptions {
 	role?: Exclude<Role, "supervisor">;
@@ -652,25 +668,7 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			executionMode: "sequential",
 			parameters: Type.Object({
 				evidenceId: Type.String(),
-				verdict: Type.Union([
-					Type.Literal("pass"),
-					Type.Literal("fail"),
-					Type.Literal("partial"),
-					Type.Literal("blocked"),
-				]),
-				findings: Type.Array(Type.String()),
-				score: Type.Number({ minimum: 0, maximum: 1 }),
-				criteria: Type.Array(
-					Type.Object({
-						criterion: Type.String(),
-						passed: Type.Boolean(),
-						score: Type.Number({ minimum: 0, maximum: 1 }),
-						evidenceRefs: Type.Array(Type.String()),
-						rationale: Type.String(),
-					}),
-					{ minItems: 1 },
-				),
-				verifiedRefs: Type.Array(Type.String(), { minItems: 1 }),
+				...reviewAssessmentFields,
 			}),
 			async execute(_id, params, _signal, _update, ctx): Promise<AgentToolResult<unknown>> {
 				const current = getState(ctx);
@@ -1293,13 +1291,8 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 			description: "Record an independent structured review; failed reviews become blocking obligations.",
 			parameters: Type.Object({
 				evidenceId: Type.String(),
-				verdict: Type.Union([
-					Type.Literal("pass"),
-					Type.Literal("fail"),
-					Type.Literal("partial"),
-					Type.Literal("blocked"),
-				]),
-				findings: Type.Array(Type.String()),
+				...reviewAssessmentFields,
+				targetVersionHash: Type.Optional(Type.String()),
 			}),
 			async execute(_id, params, _signal, _update, ctx) {
 				const current = getState(ctx);
@@ -1309,6 +1302,10 @@ export function createAstraExtension(options: AstraExtensionOptions = {}): Exten
 					evidenceId: params.evidenceId,
 					verdict: params.verdict as ReviewVerdict,
 					findings: params.findings,
+					score: params.score,
+					criteria: params.criteria,
+					verifiedRefs: params.verifiedRefs,
+					targetVersionHash: params.targetVersionHash,
 				});
 				return result(`Recorded ${review.verdict} review ${review.id}`, review);
 			},

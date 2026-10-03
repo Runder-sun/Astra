@@ -15,6 +15,7 @@ import { writeSourceReceipt } from "../src/literature.ts";
 import { preparePlanEvidence } from "../src/plan-review.ts";
 import { ResearchJob } from "../src/research.ts";
 import { parseResearchControlArgs, researchBackend, runResearchControl } from "../src/research-control.ts";
+import { DEFAULT_STAGES } from "../src/stages.ts";
 import { JsonlAstraStore } from "../src/store.ts";
 import { NonRetryableResearchError, ResearchSupervisor } from "../src/supervisor.ts";
 import { taskResourcePath } from "../src/task-workspace.ts";
@@ -335,12 +336,14 @@ describe("Codex research backend", () => {
 			const job = await ResearchJob.create(new JsonlAstraStore(root), {
 				objective: "Audit actual capabilities",
 				workspaceRoot: root,
+				definitions: [DEFAULT_STAGES.find((stage) => stage.id === stageId)!],
 			});
 			vi.stubEnv("ASTRA_FAKE_CODEX_MODE", "research");
 			const adapters = new CodexResearchAdapters(
 				new CodexAppServerRunner({ executable: process.execPath, prefixArgs: [fixture] }),
 			);
-			const plan = { ...(await adapters.planStage(job)), stageId };
+			const plan = await adapters.planStage(job);
+			await job.recordStagePlan(plan);
 			const evidence = await preparePlanEvidence(job, plan);
 			const review = await adapters.review(evidence, job);
 			const snapshot = JSON.parse(
@@ -1005,13 +1008,13 @@ describe("Codex research backend", () => {
 			requiredOutputType: "validation",
 			dependencies: [],
 			scope: { workspaceRoot: root, allowedPaths: ["."] },
-			allowedTools: ["read"],
+			allowedTools: ["read", "astra_search_papers"],
 			writeAuthority: "none",
 			budget: { maxTurns: 4, maxToolCalls: 8, maxRuntimeMs: 30000 },
 			reviewGateRequired: true,
 			resumePolicy: "resume-session",
 		});
-		const sourceTask = { ...task, allowedTools: [...task.allowedTools, "astra_search_papers"] };
+		const sourceTask = task;
 		vi.stubEnv("ASTRA_FAKE_CODEX_MODE", "literature-interrupt");
 		await expect(adapters.run(sourceTask, job)).rejects.toThrow("test provider refusal");
 		vi.stubEnv("ASTRA_FAKE_CODEX_MODE", "literature-resume");

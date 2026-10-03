@@ -114,6 +114,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 			`${taskId}-${attempt}.jsonl`,
 		);
 		try {
+			if (role !== "main-agent") job.assertTaskCurrent(taskId);
 			const result = await this.runner.run({
 				...options,
 				threadId: sessionId,
@@ -166,6 +167,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	}
 
 	async run(task: TaskPacket, job: ResearchJob): Promise<WorkerRunResult> {
+		job.assertTaskCurrent(task.id, task);
 		await writeTaskPacket(task);
 		const cwd = await prepareTaskWorkspace(task, job);
 		await atomicWriteJson(join(cwd, "worker-task.json"), task);
@@ -474,6 +476,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	}
 
 	async review(evidence: Evidence, job: ResearchJob): Promise<ReviewerRunResult> {
+		job.assertEvidenceCurrent(evidence.id, evidence);
 		const sourceTask = job.state.tasks[evidence.taskId];
 		const required = [
 			...new Set([
@@ -1041,6 +1044,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	}
 
 	decideEvidence(evidence: Evidence, job: ResearchJob): Promise<MainAgentDecisionManifest> {
+		job.assertEvidenceCurrent(evidence.id, evidence);
 		return this.decision(
 			job,
 			"evidence",
@@ -1052,6 +1056,7 @@ export class CodexResearchAdapters implements ResearchWorkerAdapter, ResearchRev
 	}
 
 	decideAdoption(evidence: Evidence, job: ResearchJob): Promise<MainAgentDecisionManifest> {
+		job.assertEvidenceCurrent(evidence.id, evidence);
 		return this.decision(
 			job,
 			"adoption",
