@@ -16,6 +16,7 @@ import { sourceTaskContractHash } from "./effective-contract.ts";
 import { readSourceReceipt, sourceReceiptFilename } from "./literature.ts";
 import { checksum, type ResearchJob } from "./research.ts";
 import type {
+	CanonicalArtifact,
 	Evidence,
 	EvidenceFileVersion,
 	OutputRef,
@@ -705,12 +706,28 @@ async function collectReviewEvidenceBundle(
 		path: string,
 		versionedEvidence?: Evidence,
 		originalRef = sourceRef,
+		canonical?: CanonicalArtifact,
 	): Promise<void> => {
 		const content = versionedEvidence
 			? await readVersionedFile(task, versionedEvidence, originalRef, source, allowedRoot)
 			: await readEvidenceFile(source, allowedRoot);
-		if (!content) return;
+		if (!content) {
+			if (canonical) throw new Error(`canonical input is missing: ${canonical.id}`);
+			return;
+		}
+		if (canonical && (await realpath(source)) !== join(await realpath(projectRoot), relative(projectRoot, source)))
+			throw new Error(`canonical input is outside its registered physical location: ${canonical.id}`);
 		const sha256 = createHash("sha256").update(content).digest("hex");
+		if (
+			canonical &&
+			(!canonical.targetSha256 ||
+				!/^[a-f0-9]{64}$/.test(canonical.targetSha256) ||
+				sha256 !== canonical.targetSha256 ||
+				createHash("sha256")
+					.update(`${JSON.stringify(canonical.content, null, 2)}\n`)
+					.digest("hex") !== canonical.targetSha256)
+		)
+			throw new Error(`canonical input integrity failure: ${canonical.id}`);
 		const copyKey = `${sourceRef}\0${sha256}`;
 		if (copiedSources.has(copyKey)) return;
 		if (sourceReceiptFilename(originalRef)) path = join("sources", sha256, basename(path));
@@ -759,13 +776,18 @@ async function collectReviewEvidenceBundle(
 				sha256: createHash("sha256").update(file.content).digest("hex"),
 			});
 		}
-		const artifact = job.state.canonical[inputRef];
+		const artifact =
+			job.state.canonical[inputRef] ??
+			Object.values(job.state.canonical).find((entry) => entry.evidenceId === inputRef);
 		if (artifact)
 			await copyIntoBundle(
 				canonicalArtifactPath(projectRoot, task.jobId, artifact.id),
 				canonicalRoot,
 				`canonical/${artifact.id}.json`,
 				`canonical/${artifact.id}.json`,
+				undefined,
+				`canonical/${artifact.id}.json`,
+				artifact,
 			);
 		const upstreamEvidence = job.state.evidence[artifact?.evidenceId ?? inputRef];
 		if (!upstreamEvidence) continue;

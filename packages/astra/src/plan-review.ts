@@ -3,6 +3,7 @@ import { taskBindingIsCurrent, taskHasRetainedOwner } from "./task-ownership.ts"
 export { taskHasRetainedOwner } from "./task-ownership.ts";
 
 import { join } from "node:path";
+import { canonicalArtifactPath, sha256 } from "./contracts.ts";
 import {
 	backtrackChecksFromSnapshot,
 	buildEffectiveTaskContractFromSnapshot,
@@ -13,7 +14,7 @@ import {
 	semanticContractHash,
 	taskContractMatches,
 } from "./effective-contract.ts";
-import type { ResearchJob } from "./research.ts";
+import { checksum, type ResearchJob } from "./research.ts";
 import type { Evidence, JobSnapshot, StageDefinition, StagePlanManifest, TaskPacket } from "./types.ts";
 
 export const PLAN_REVIEW_CHECKS = [
@@ -282,6 +283,83 @@ export function evidenceHasCurrentPlanApprovalFromSnapshot(snapshot: JobSnapshot
 	return taskIsCurrentFromSnapshot(snapshot, worker);
 }
 
+/** A completed adoption authorizes consumption of this fixed version, never execution of its old plan. */
+export function inputHasCompletedAdoptionFromSnapshot(snapshot: JobSnapshot, ref: string): boolean {
+	const artifact =
+		snapshot.canonical[ref] ?? Object.values(snapshot.canonical).find((entry) => entry.evidenceId === ref);
+	if (!artifact || artifact.status !== "active" || !artifact.adoptionCompletedAt) return false;
+	const evidence = snapshot.evidence[artifact.evidenceId];
+	const task = evidence ? snapshot.tasks[evidence.taskId] : undefined;
+	if (
+		!evidence ||
+		!task ||
+		task.role !== "worker" ||
+		task.status !== "succeeded" ||
+		!taskIdentityIsCurrent(snapshot, task) ||
+		evidence.stageId !== task.stageId ||
+		evidence.type !== task.requiredOutputType ||
+		artifact.type !== evidence.type ||
+		evidence.status !== "accepted" ||
+		evidence.supersededByTaskId ||
+		snapshot.canonicalRoute.stageArtifactIds[evidence.stageId] !== artifact.id ||
+		snapshot.retiredArtifacts[artifact.id] ||
+		snapshot.discardedEvidence[evidence.id] ||
+		Object.values(snapshot.retiredArtifacts).some((entry) => entry.evidenceId === evidence.id) ||
+		Object.values(snapshot.discardedCandidates).some((entry) => entry.evidenceId === evidence.id) ||
+		artifact.checksum !== evidence.checksum ||
+		artifact.sourceSha256 !== evidence.checksum ||
+		checksum(artifact.content) !== checksum(evidence.content) ||
+		evidence.checksum !==
+			checksum(
+				evidence.incrementalRevision
+					? { content: evidence.content, incrementalRevision: evidence.incrementalRevision }
+					: evidence.content,
+			) ||
+		artifact.targetSha256 !== sha256(`${JSON.stringify(artifact.content, null, 2)}\n`) ||
+		artifact.materializationRef !==
+			canonicalArtifactPath(snapshot.frame.permissions.workspaceRoot, snapshot.frame.jobId, artifact.id) ||
+		artifact.evidenceSnapshotHash !== checksum({ stageId: evidence.stageId, acceptedRevisionRefs: [evidence.id] }) ||
+		checksum({ version: task.version }) !== checksum({ version: evidence.taskVersion }) ||
+		evidence.versionHash !==
+			checksum({
+				content: evidence.content,
+				refs: evidence.refs,
+				files: evidence.files,
+				taskVersion: evidence.taskVersion,
+				...(evidence.incrementalRevision ? { incrementalRevision: evidence.incrementalRevision } : {}),
+			})
+	)
+		return false;
+	if (task.version) {
+		const { hash, ...version } = task.version;
+		if (checksum(version) !== hash) return false;
+	}
+	const policy = snapshot.stageDefinitions?.[evidence.stageId]?.qualityPolicy;
+	const reviews = Object.values(snapshot.reviews).filter((review) => review.evidenceId === evidence.id);
+	if (
+		reviews.some((review) => review.verdict !== "pass") ||
+		reviews.filter(
+			(review) =>
+				review.targetVersionHash === evidence.versionHash && (review.score ?? 0) >= (policy?.minScore ?? 0.8),
+		).length < (policy?.minPassingReviews ?? 1)
+	)
+		return false;
+	if (!task.planId) return true;
+	const plan = planEvidenceFromSnapshot(snapshot, task.planId);
+	return Boolean(
+		plan &&
+			plan.type === "stage-plan" &&
+			!snapshot.discardedEvidence[plan.id] &&
+			plan.status !== "rejected" &&
+			taskIdentityIsCurrent(snapshot, snapshot.tasks[plan.taskId]) &&
+			snapshot.tasks[plan.taskId]?.jobId === snapshot.frame.jobId &&
+			snapshot.tasks[plan.taskId]?.stageId === task.stageId &&
+			JSON.stringify((plan.content as { plan: StagePlanManifest }).plan) ===
+				JSON.stringify(snapshot.stagePlans[task.planId]) &&
+			matchesApprovedWorkerContract(snapshot, task, plan),
+	);
+}
+
 function taskIdentityIsCurrent(snapshot: JobSnapshot, task: TaskPacket): boolean {
 	return (
 		taskBindingIsCurrent(snapshot, task) &&
@@ -379,6 +457,7 @@ export function taskIsCurrentFromSnapshot(
 		)
 			return false;
 		if (taskHasBoundRepairAncestor(snapshot, task, ref)) continue;
+		if (inputHasCompletedAdoptionFromSnapshot(snapshot, ref)) continue;
 		const evidence = snapshot.evidence[snapshot.canonical[ref]?.evidenceId ?? ref];
 		if (
 			evidence &&

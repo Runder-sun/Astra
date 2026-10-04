@@ -31,6 +31,7 @@ import { sourceReceiptFilename } from "./literature.ts";
 import {
 	evidenceHasCurrentPlanApprovalFromSnapshot,
 	evidenceMatchesHistoricalPlanFromSnapshot,
+	inputHasCompletedAdoptionFromSnapshot,
 	planEvidence as planReviewEvidence,
 	planReviewStatus,
 	taskHasBoundRepairAncestor,
@@ -1800,6 +1801,7 @@ export class ResearchJob {
 			);
 			if (retiredEvidence || staleEvidence) throw new StaleResearchInputError(`task input version is stale: ${ref}`);
 			if (comparisonTask && taskHasBoundRepairAncestor(this.snapshot, comparisonTask, ref)) continue;
+			if (inputHasCompletedAdoptionFromSnapshot(this.snapshot, ref)) continue;
 			const evidence = this.snapshot.evidence[this.snapshot.canonical[ref]?.evidenceId ?? ref];
 			if (
 				evidence &&
