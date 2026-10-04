@@ -1982,7 +1982,12 @@ export class ResearchJob {
 			task.version && input.refs.some((ref) => sourceReceiptFilename(ref))
 				? (await this.recoverWorkerManifest(task))?.sourceRefs
 				: undefined;
-		const files = await freezeEvidenceFiles(task, input.refs, boundSources);
+		const files = await freezeEvidenceFiles(
+			task,
+			input.refs,
+			boundSources,
+			input.incrementalRevision ? this.snapshot.evidence[input.incrementalRevision.baseEvidenceId] : undefined,
+		);
 		const evidence: Evidence = {
 			...input,
 			files,

@@ -2,7 +2,8 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { readMainAgentDelivery, readReviewerOutputManifest, readWorkerOutputManifest } from "../packages/astra/src/contracts.ts";
 import { taskHasRetainedOwner } from "../packages/astra/src/task-ownership.ts";
 
 const inputFailures = [];
@@ -32,13 +33,49 @@ function readJsonIfPresent(path) {
 	return existsSync(path) ? readJson(path) : null;
 }
 
-function readJsonl(path) {
+const piFileReads = new Map();
+function readPiFile(path) {
+	const absolute = resolve(path);
+	if (!piFileReads.has(absolute)) {
+		const failures = [];
+		let bytes;
+		try {
+			for (let current = absolute; ; current = dirname(current)) {
+				const metadata = lstatSync(current);
+				if (metadata.isSymbolicLink() || (current === absolute ? !metadata.isFile() : !metadata.isDirectory()))
+					throw new Error(`Non-regular Pi audit path: ${current}`);
+				if (current === dirname(current)) break;
+			}
+			bytes = readFileSync(absolute);
+		} catch (error) { failures.push(`Cannot read ${absolute}: ${error.message}`); }
+		piFileReads.set(absolute, { bytes, failures });
+	}
+	return piFileReads.get(absolute);
+}
+
+function readJsonl(path, physical = false) {
 	if (!existsSync(path)) return [];
 	try {
-		return readFileSync(path, "utf8").split("\n").filter(Boolean).flatMap((line, index) => {
-			try { return [JSON.parse(line)]; }
-			catch (error) { inputFailures.push({ path, line: index + 1, reason: error.message }); return []; }
+		const file = physical ? readPiFile(path) : null;
+		if (file?.failures.length) throw new Error(file.failures.join("; "));
+		if (file?.entries) return file.entries;
+		if (file) file.jsonlFailures = [];
+		const entries = (file ? file.bytes.toString("utf8") : readFileSync(path, "utf8")).split("\n").flatMap((line, index) => {
+			if (!line.trim()) return [];
+			try {
+				const entry = JSON.parse(line);
+				if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("JSONL record must be an object");
+				return [entry];
+			}
+			catch (error) {
+				const failure = { path, line: index + 1, reason: error.message };
+				inputFailures.push(failure);
+				file?.jsonlFailures.push(failure);
+				return [];
+			}
 		});
+		if (file) file.entries = entries;
+		return entries;
 	} catch (error) { inputFailures.push({ path, reason: error.message }); return []; }
 }
 
@@ -309,7 +346,7 @@ const sessionFiles = existsSync(sessionsPath)
 	? readdirSync(sessionsPath).filter((name) => name.endsWith(".jsonl")).map((name) => join(sessionsPath, name))
 	: [];
 const failedSessions = sessionFiles.filter((path) =>
-	readJsonl(path).some(
+	readJsonl(path, backend === "pi").some(
 		(entry) =>
 			entry.status === "failed" ||
 			entry.data?.status === "failed" ||
@@ -332,6 +369,7 @@ const archivedTaskRoots = new Set(
 		.flatMap((receipt) => receipt.archiveRefs ?? []).filter((path) => existsSync(path)).map((path) => resolve(path)),
 );
 const completedSessionMoves = new Map();
+const piSessionMoves = new Map();
 for (const intent of Object.values(snapshot.cleanupIntents ?? {})) {
 	if (intent.status !== "completed") continue;
 	for (const task of intent.tasks) {
@@ -344,6 +382,12 @@ for (const intent of Object.values(snapshot.cleanupIntents ?? {})) {
 			if (!moved.present || resolve(moved.target) !== target || current?.taskId !== task.taskId ||
 				!current.sessionFile || resolve(current.sessionFile) !== target) continue;
 			completedSessionMoves.set(JSON.stringify([task.taskId, moved.sessionId, resolve(moved.source)]), target);
+			const registeredSource = events.findLast((entry) => entry.event?.type === "child_session_recorded" &&
+				entry.event.session.sessionId === moved.sessionId && entry.event.session.taskId === task.taskId &&
+				entry.event.session.sessionFile && resolve(entry.event.session.sessionFile) === resolve(moved.source))?.event.session;
+			if (isDigest(moved.expectedHash) && registeredSource && (intent.kind !== "retirement" ||
+				retiredReceiptParity.some((entry) => entry.artifactId === intent.receipt.artifactId && entry.receiptMatchesState)))
+				piSessionMoves.set(target, { ...moved, taskId: task.taskId, registeredSource });
 		}
 	}
 }
@@ -383,7 +427,7 @@ const untrackedCodexFiles = codexFiles.filter((path) => !sessionRecordsByFile.ha
 const codexSessionsVerified = codexSessionAudits.length > 0 && untrackedCodexFiles.length === 0 &&
 	codexSessionAudits.every((entry) => entry.recovered);
 const failedSessionAudits = failedSessions.map((path) => {
-	const entries = readJsonl(path);
+	const entries = readJsonl(path, backend === "pi");
 	const sessionId = entries.find((entry) => entry.type === "session")?.id;
 	const session = sessionRecordsByFile.get(resolve(path)) ?? sessionRecordsById.get(sessionId);
 	const task = session?.taskId ? snapshot.tasks[session.taskId] : undefined;
@@ -408,8 +452,96 @@ const failedSessionAudits = failedSessions.map((path) => {
 				(session.status === "completed" && succeededAfterFailure)),
 	};
 });
-const recoveredFailedSessions = failedSessionAudits.filter((entry) => entry.recovered);
-const unrecoveredFailedSessions = failedSessionAudits.filter((entry) => !entry.recovered);
+// Pi success comes from its registered manifest, not a Codex turn protocol.
+// Persistent main sessions share a file but each completed call remains auditable.
+const piRecords = backend === "pi" ? [...sessionRecords, ...events
+	.filter((entry) => entry.event?.type === "child_session_recorded" && entry.event.session.role === "main-agent" && entry.event.session.status === "completed")
+	.map((entry) => entry.event.session)] : [];
+const piRecordKeys = new Set();
+const piSessionAudits = await Promise.all(piRecords.filter((session) => {
+	const key = JSON.stringify([session.sessionId, session.taskId, session.role, session.attempt, session.status, session.sessionFile, session.manifestRef]);
+	if (piRecordKeys.has(key)) return false;
+	piRecordKeys.add(key);
+	return true;
+}).map(async (session) => {
+	const failures = [];
+	const task = snapshot.tasks[session.taskId];
+	const call = snapshot.mainAgentCalls?.[session.taskId];
+	const historicalFailure = ["failed", "aborted", "interrupted"].includes(session.status) || task?.status === "failed";
+	const unownedFailure = historicalFailure && session.status !== "completed" && !taskHasRetainedOwner(ownershipSnapshot, session.taskId);
+	if (session.role === "main-agent") {
+		if (!call || call.jobId !== jobId || session.attempt !== 1 || session.manifestRef && session.manifestRef !== call.manifestRef)
+			failures.push("Pi main call identity mismatch");
+	} else if (!task || task.jobId !== jobId || task.role !== session.role || task.attempt !== session.attempt) {
+		failures.push("Pi task/job/role/attempt identity mismatch");
+	}
+	const path = session.sessionFile ? resolve(session.sessionFile) : null;
+	const moved = path ? piSessionMoves.get(path) : undefined;
+	const archived = path?.startsWith(`${join(jobRoot, "archive", "tasks")}/`);
+	if (archived && (!moved || moved.taskId !== session.taskId || moved.sessionId !== session.sessionId))
+		failures.push("Pi archive lacks exact completed cleanup mapping");
+	const file = path ? readPiFile(path) : { failures: ["Pi session file is not registered"] };
+	// Failed attempts may have unavailable recovery material; never exempt a retained owner or a completed archive.
+	const unavailableFailure = unownedFailure && ["failed", "aborted", "interrupted"].includes(session.status) && !archived && (!path || file.failures.some((reason) => reason.includes("ENOENT")));
+	if (!unavailableFailure) {
+		failures.push(...file.failures);
+		for (const reason of file.failures) inputFailures.push({ path: path ?? `session:${session.sessionId}`, reason });
+	}
+	let entries = [];
+	if (file.bytes) {
+		if (moved && sha256(file.bytes) !== moved.expectedHash) failures.push("Pi archive expectedHash mismatch");
+		entries = readJsonl(path, true);
+		failures.push(...file.jsonlFailures.map((entry) => `Invalid Pi JSONL line ${entry.line}: ${entry.reason}`));
+		if (!entries.length) { failures.push("Pi session file is empty"); inputFailures.push({ path, reason: "Pi session file is empty" }); }
+		const fallback = historicalFailure && (moved ? resolve(moved.source) : path) === join(jobRoot, "tasks", session.taskId, "failure-log.json");
+		if (fallback) {
+			if (entries.length !== 1 || entries[0]?.taskId !== session.taskId || entries[0]?.attempt !== session.attempt || typeof entries[0]?.error !== "string")
+				failures.push("Pi failure fallback identity mismatch");
+		} else {
+			const header = entries[0];
+			const expectedCwd = session.role === "main-agent" ? workspace : session.role === "reviewer"
+				? join(jobRoot, "tasks", session.taskId) : join(jobRoot, "workspaces", session.taskId);
+			if (header?.type !== "session" || header.id !== session.sessionId || typeof header.cwd !== "string" || resolve(header.cwd) !== resolve(expectedCwd))
+				failures.push("Pi session header identity/cwd mismatch");
+		}
+	}
+	if (session.status === "completed") {
+		try {
+			if (session.role === "main-agent") {
+				if (!call || session.manifestRef !== call.manifestRef) throw new Error("main manifest registration mismatch");
+				const manifest = await readMainAgentDelivery(workspace, call);
+				if (manifest.sessionRef !== session.sessionId || call.deliveryHash && checksum(manifest) !== call.deliveryHash)
+					throw new Error("main manifest session/digest mismatch");
+			} else {
+				const name = session.role === "reviewer" ? "review-manifest.json" : "output-manifest.json";
+				const expected = join(jobRoot, "tasks", session.taskId, name);
+				const manifestRef = session.manifestRef ?? moved?.registeredSource.manifestRef;
+				if (!manifestRef || resolve(manifestRef) !== expected) throw new Error("task manifest registration mismatch");
+				const manifestPath = moved ? join(jobRoot, "archive", "tasks", session.taskId, "task", name) : expected;
+				const manifestFile = readPiFile(manifestPath);
+				if (manifestFile.failures.length) throw new Error(manifestFile.failures.join("; "));
+				const manifest = session.role === "reviewer" ? await readReviewerOutputManifest(manifestPath) : await readWorkerOutputManifest(manifestPath);
+				if (manifest.jobId !== jobId || manifest.taskId !== session.taskId || manifest.sessionRef !== session.sessionId ||
+					(session.role === "worker" && (manifest.agentId !== task?.agentId || manifest.artifactType !== task?.requiredOutputType)))
+					throw new Error("task manifest identity mismatch");
+				if (session.role === "reviewer" && (!Array.isArray(task?.inputArtifactRefs) || task.inputArtifactRefs.length !== 1 ||
+					typeof task.inputArtifactRefs[0] !== "string" || !task.inputArtifactRefs[0] || manifest.evidenceId !== task.inputArtifactRefs[0]))
+					throw new Error("reviewer manifest target identity mismatch");
+			}
+		} catch (error) { failures.push(`Pi successful delivery invalid: ${error.message}`); }
+	}
+	const lastFailure = entries.findLastIndex((entry) => entry?.status === "failed" || entry?.data?.status === "failed" ||
+		(entry?.message?.role === "assistant" && ["error", "aborted"].includes(entry.message.stopReason)));
+	const succeededAfterFailure = entries.some((entry, index) => index > lastFailure && entry?.message?.role === "assistant" && ["stop", "toolUse"].includes(entry.message.stopReason));
+	const failed = historicalFailure || lastFailure >= 0;
+	const latestMain = session.role === "main-agent" ? sessionRecordsById.get(session.sessionId) : null;
+	const sharedMainFailure = latestMain?.role === "main-agent" && ["failed", "aborted", "interrupted"].includes(latestMain.status);
+	const recovered = failures.length === 0 && (!failed || unownedFailure || sharedMainFailure || session.status === "completed" && succeededAfterFailure);
+	return { path, sessionId: session.sessionId, taskId: session.taskId, status: session.status, failed, recovered, failures };
+}));
+const piKnownFiles = new Set(piSessionAudits.map((entry) => entry.path).filter(Boolean));
+const unregisteredPiFailedAudits = failedSessionAudits.filter((entry) => !piKnownFiles.has(resolve(entry.path)));
+const piSessionsValid = piSessionAudits.every((entry) => entry.recovered) && unregisteredPiFailedAudits.every((entry) => entry.recovered);
 const parentSessionFiles = collectJsonlFiles(parentSessionRoot);
 const parentSessionAudits = parentSessionFiles.map((path) => {
 	const entries = readJsonl(path);
@@ -528,7 +660,7 @@ const runtimeIntegrity = {
 		(entry) => entry.receiptMatchesState && entry.materializedArtifactRemoved,
 	),
 	mainAgentSessionStable,
-	acceptedChildSessionsValid: backend === "codex" ? codexSessionsVerified : unrecoveredFailedSessions.length === 0,
+	acceptedChildSessionsValid: backend === "codex" ? codexSessionsVerified : piSessionsValid,
 	...(backend === "codex" ? { codexSessionsVerified } : {
 		parentControlRecorded: !parentSessionRoot || matchingParentSessions.length > 0,
 	}),
@@ -650,10 +782,12 @@ const report = {
 		untrackedFiles: untrackedCodexFiles,
 		prunedFiles: codexSessionAudits.filter((entry) => entry.pruned).map((entry) => entry.path),
 	} : {
-		files: sessionFiles.length,
-		failedFiles: failedSessions.length,
-		recoveredFailedFiles: recoveredFailedSessions.length,
-		unrecoveredFailedFiles: unrecoveredFailedSessions.length,
+		files: new Set([...sessionFiles.map((path) => resolve(path)), ...piKnownFiles]).size,
+		failedFiles: new Set([...piSessionAudits.filter((entry) => entry.failed).map((entry) => entry.path ?? entry.sessionId), ...unregisteredPiFailedAudits.map((entry) => entry.path)]).size,
+		recoveredFailedFiles: new Set([...piSessionAudits.filter((entry) => entry.failed && entry.recovered).map((entry) => entry.path ?? entry.sessionId), ...unregisteredPiFailedAudits.filter((entry) => entry.recovered).map((entry) => entry.path)]).size,
+		unrecoveredFailedFiles: new Set([...piSessionAudits.filter((entry) => entry.failed && !entry.recovered).map((entry) => entry.path ?? entry.sessionId), ...unregisteredPiFailedAudits.filter((entry) => !entry.recovered).map((entry) => entry.path)]).size,
+		invalidFiles: [...new Set(piSessionAudits.filter((entry) => !entry.recovered).map((entry) => entry.path ?? entry.sessionId))],
+		audits: piSessionAudits,
 	},
 	parentSessions: parentSessionRoot
 		? {

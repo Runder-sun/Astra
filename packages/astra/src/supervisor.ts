@@ -189,7 +189,10 @@ export class ResearchSupervisor {
 			.filter((task) => task.stageId === initialStageId && task.role === "worker" && task.status === "ready")
 			.slice(0, this.maxParallel);
 		if (readyTasks.length > 0) {
-			if (await this.gateOnBudget(initialStageId, { turns: readyTasks.length })) {
+			const budget = this.job.status().budget;
+			const remainingTurns = Math.max(0, budget.maxTurns - budget.turnsUsed);
+			readyTasks.splice(remainingTurns);
+			if (await this.gateOnBudget(initialStageId, { turns: Math.max(1, readyTasks.length) })) {
 				return this.result(initialStageId, dispatchedTaskIds, false);
 			}
 			await this.job.consumeTurns(readyTasks.length);
@@ -558,7 +561,10 @@ export class ResearchSupervisor {
 			.filter((task) => ["ready", "running"].includes(task.status) && this.taskMatchesFrozenPlan(task))
 			.slice(0, this.maxParallel);
 		if (runnable.length === 0) return;
-		if (await this.gateOnBudget(plan.stageId, { turns: runnable.length })) return;
+		const budget = this.job.status().budget;
+		const remainingTurns = Math.max(0, budget.maxTurns - budget.turnsUsed);
+		runnable.splice(remainingTurns);
+		if (await this.gateOnBudget(plan.stageId, { turns: Math.max(1, runnable.length) })) return;
 		await this.job.consumeTurns(runnable.length);
 		const results = await Promise.allSettled(runnable.map((task) => this.runWorker(task)));
 		await this.handleSettledErrors(results);

@@ -897,6 +897,7 @@ it.each(["pi", "codex"] as const)("S7 %s budget increase resumes original saved 
 				stageId: "validation",
 				limit: "maxTurns",
 				reason: "Original budget gate",
+				requiredMinimum: 2,
 			}),
 	};
 	const tick = supervisor(f, backend, control);

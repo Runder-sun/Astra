@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -13,6 +13,8 @@ test("source export omits archived/deleted files and includes current docs and A
 		put("package.json", '{"type":"module"}');
 		put("packages/astra/package.json", '{"version":"0.1.0-alpha.2"}');
 		put("packages/ai/scripts/check-model-data.ts", "// Model data validator stub for export selection only.\n");
+		put("packages/ai/scripts/model-data.ts", "// Export selection fixture.\n");
+		put("packages/ai/src/models.generated.ts", "// Export selection fixture.\n");
 		put("packages/ai/src/providers/data/example.json", "{}");
 		put("legacy/rust/Cargo.toml", "archive");
 		put("docs/deleted.md", "removed");
@@ -45,6 +47,60 @@ test("source export omits archived/deleted files and includes current docs and A
 	}
 });
 
+function realModelData(fixture) {
+	for (const path of ["packages/ai/scripts/check-model-data.ts", "packages/ai/scripts/model-data.ts"])
+		fixture.put(path, readFileSync(new URL(`../${path}`, import.meta.url)));
+	fixture.put("packages/ai/src/models.generated.ts", 'import { FIXTURE_MODELS } from "./providers/example.models.ts";\n');
+	fixture.put("packages/ai/src/providers/example.models.ts", "// offline fixture\n");
+	const content = JSON.stringify({ fixture: { model: { id: "model", provider: "example", api: "fixture", name: "fixture", baseUrl: "", reasoning: false, input: ["text"], contextWindow: 10, maxTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } } });
+	fixture.put("packages/ai/src/providers/data/example.json", content);
+	fixture.put("packages/ai/src/providers/data/.manifest.json", JSON.stringify({ schemaVersion: 3, generatedAt: "2026-10-04T00:00:00Z", structureHash: createHash("sha256").update(JSON.stringify({ example: { model: "fixture" } })).digest("hex"), files: { "example.json": createHash("sha256").update(content).digest("hex") } }));
+}
+
+for (const path of ["docs", "docs/deep", "packages/astra", "packages/astra/package.json", "packages/ai/scripts", "packages/ai/scripts/check-model-data.ts", "packages/ai/scripts/model-data.ts", "packages/ai/src", "packages/ai/src/models.generated.ts", "packages/ai/src/providers", "packages/ai/src/providers/data", "packages/ai/src/providers/data/.manifest.json", "packages/ai/src/providers/data/example.json"]) {
+	test(`L1 refuses physical source link ${path} before external read or execution`, () => {
+		const fixture = exportFixture();
+		const external = mkdtempSync(join(tmpdir(), "astra-source-physical-"));
+		try {
+			realModelData(fixture);
+			fixture.put("docs/deep/guide.txt", "outside guide bytes\n");
+			execFileSync("git", ["add", "packages", "docs"], { cwd: fixture.root });
+			execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "physical fixture"], { cwd: fixture.root });
+			const source = join(fixture.root, path);
+			const target = join(external, "payload");
+			renameSync(source, target);
+			symlinkSync(target, source);
+			const result = fixture.run(`const read = fs.readFileSync; const list = fs.readdirSync; const exec = execFileSync;
+fs.readFileSync = (path, ...args) => { if (typeof path === "string" && path.startsWith(root + "/${path}")) throw new Error("external read happened before physical rejection"); return read(path, ...args); };
+fs.readdirSync = (path, ...args) => { if (typeof path === "string" && path === root + "/${path}") throw new Error("external enumeration happened before physical rejection"); return list(path, ...args); };`, fixture.target, true);
+			assert.notEqual(result.status, 0);
+			assert.match(result.stderr, /Non-regular/);
+			assert.doesNotMatch(result.stderr, /external .* happened/);
+			assert.equal(existsSync(fixture.target), false);
+		} finally { fixture.close(); rmSync(external, { recursive: true, force: true }); }
+	});
+}
+
+test("L1 real validator preserves root aliases, unrelated links, bytes, concurrent publication and retry", async () => {
+	const fixture = exportFixture();
+	const external = mkdtempSync(join(tmpdir(), "astra-source-alias-"));
+	try {
+		realModelData(fixture);
+		symlinkSync(external, join(fixture.root, "unselected-link"));
+		const alias = join(external, "root-alias");
+		symlinkSync(fixture.root, alias);
+		const args = [join(alias, "scripts/prepare-astra-source.mjs"), fixture.target];
+		const children = [spawn(process.execPath, args, { cwd: external }), spawn(process.execPath, args, { cwd: external })];
+		const results = await Promise.all(children.map((child) => new Promise((resolve) => { let stderr = ""; child.stdout.resume(); child.stderr.on("data", (chunk) => { stderr += chunk; }); child.on("close", (status) => resolve({ status, stderr })); })));
+		assert.equal(results.filter((result) => result.status === 0).length, 1, JSON.stringify(results));
+		const manifest = JSON.parse(readFileSync(join(fixture.target, "SOURCE_MANIFEST.json")));
+		for (const file of manifest.files) assert.equal(file.sha256, createHash("sha256").update(readFileSync(join(fixture.target, file.path))).digest("hex"));
+		assert.equal(manifest.files.some((file) => file.path.startsWith("unselected-link")), false);
+		assert.deepEqual(readdirSync(fixture.root).filter((name) => name.includes(".stage-")), []);
+		assert.notEqual(fixture.run().status, 0);
+	} finally { fixture.close(); rmSync(external, { recursive: true, force: true }); }
+});
+
 function exportFixture() {
 	const root = mkdtempSync(join(tmpdir(), "astra-export-integrity-"));
 	const put = (path, bytes) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), bytes); };
@@ -52,6 +108,8 @@ function exportFixture() {
 	put(".gitignore", "output/\n");
 	put("packages/astra/package.json", '{"version":"0.1.0-fixture"}');
 	put("packages/ai/scripts/check-model-data.ts", "// Catalog validator is outside export consistency tests.\n");
+	put("packages/ai/scripts/model-data.ts", "// Export consistency fixture.\n");
+	put("packages/ai/src/models.generated.ts", "// Export consistency fixture.\n");
 	put("packages/ai/src/providers/data/example.json", "{}");
 	put("README.md", "original README\n");
 	put("scripts/executable.sh", "#!/bin/sh\nexit 0\n");
@@ -63,14 +121,16 @@ function exportFixture() {
 	const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 	const hooks = mkdtempSync(join(tmpdir(), "astra-export-hook-"));
 	const target = join(root, "output");
-	const run = (hook, destination = target) => {
+	const run = (hook, destination = target, inheritHook = false) => {
 		const args = [];
+		let hookPath;
 		if (hook) {
 			const path = join(hooks, "hook.mjs");
+			hookPath = path;
 			writeFileSync(path, `import fs from "node:fs";\nimport { syncBuiltinESMExports } from "node:module";\nimport { execFileSync } from "node:child_process";\nconst root = ${JSON.stringify(root)};\n${hook}\nsyncBuiltinESMExports();\n`);
 			args.push("--import", path);
 		}
-		return spawnSync(process.execPath, [...args, join(root, "scripts/prepare-astra-source.mjs"), destination], { encoding: "utf8" });
+		return spawnSync(process.execPath, [...args, join(root, "scripts/prepare-astra-source.mjs"), destination], { encoding: "utf8", env: inheritHook ? { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${hookPath}` } : process.env });
 	};
 	return { root, target, put, run, baseCommit, close: () => { rmSync(root, { recursive: true, force: true }); rmSync(hooks, { recursive: true, force: true }); } };
 }

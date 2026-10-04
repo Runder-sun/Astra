@@ -7,6 +7,7 @@ import { Value } from "typebox/value";
 import { classifyProviderErrorMessage } from "./provider-errors.ts";
 import { ReviewIntegrityError } from "./review-validation.ts";
 import { NonRetryableResearchError, ProviderCapacityError } from "./supervisor.ts";
+import { textTail } from "./text-tail.ts";
 
 export interface CodexTool {
 	name: string;
@@ -119,8 +120,9 @@ class AppServerConnection {
 			},
 		);
 		this.exited = new Promise((resolveExit) => this.child.once("close", () => resolveExit()));
-		this.child.stderr.on("data", (chunk) => {
-			this.stderr = `${this.stderr}${chunk}`.slice(-8192);
+		this.child.stderr.setEncoding("utf8");
+		this.child.stderr.on("data", (chunk: string) => {
+			this.stderr = textTail(`${this.stderr}${chunk}`, 8192);
 		});
 		this.child.on("error", (error) =>
 			this.fail(new NonRetryableResearchError(`Cannot start official Codex CLI: ${error.message}`)),

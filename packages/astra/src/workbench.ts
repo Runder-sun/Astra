@@ -14,6 +14,7 @@ import type { ResearchControlRequest } from "./research-control.ts";
 import { DEFAULT_STAGES } from "./stages.ts";
 import { JsonlAstraStore } from "./store.ts";
 import { readVersionedFile, taskWorkspacePath } from "./task-workspace.ts";
+import { textTail } from "./text-tail.ts";
 import type { JobSnapshot } from "./types.ts";
 
 interface Entry {
@@ -113,7 +114,7 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 			const size = (await file.stat()).size;
 			const bytes = Buffer.alloc(Math.min(size, 64_000));
 			await file.read(bytes, 0, bytes.length, Math.max(0, size - bytes.length));
-			return bytes.toString().slice(-16000);
+			return textTail(bytes.toString(), 16000);
 		} finally {
 			await file.close();
 		}
@@ -157,12 +158,12 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 		);
 		const state: RunState = { child, output: "", jobId: request.jobId };
 		running.set(entry.id, state);
-		const collect = (chunk: Buffer) => {
-			state.output = (state.output + chunk.toString()).slice(-16000);
+		const collect = (chunk: string) => {
+			state.output = textTail(state.output + chunk, 16000);
 			state.flush = persistLog(entry, state);
 		};
-		child.stdout?.on("data", collect);
-		child.stderr?.on("data", collect);
+		child.stdout?.setEncoding("utf8").on("data", collect);
+		child.stderr?.setEncoding("utf8").on("data", collect);
 		child.on("message", (message: unknown) => {
 			if (
 				!message ||
@@ -308,7 +309,10 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				const path = resolve(ref.startsWith(".astra/") ? entry.root : workspace, ref);
 				if (task.jobId !== state!.frame.jobId) throw new Error("下载来源任务不属于当前作业");
 				const local = relative(workspace, path);
-				if (local === ".." || local.startsWith("../") || local.startsWith("..\\") || isAbsolute(local))
+				if (
+					!evidence.files?.some((file) => file.sourceRef === ref) &&
+					(local === ".." || local.startsWith("../") || local.startsWith("..\\") || isAbsolute(local))
+				)
 					throw new Error("下载文件不属于来源任务");
 				const bytes = await readVersionedFile(
 					{ ...task, scope: { ...task.scope, workspaceRoot: entry.root } },
@@ -334,12 +338,14 @@ export async function startWorkbench(options: { root: string; watch?: string[]; 
 				json(403, { error: "请刷新工作台后再操作" });
 				return;
 			}
-			let body = "";
+			const chunks: Buffer[] = [];
+			let bodyBytes = 0;
 			for await (const chunk of req) {
-				body += chunk.toString();
-				if (Buffer.byteLength(body) > 20000) throw new Error("输入过长");
+				bodyBytes += chunk.length;
+				if (bodyBytes > 20000) throw new Error("输入过长");
+				chunks.push(chunk);
 			}
-			const input = JSON.parse(body) as Record<string, unknown>;
+			const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
 			if (url.pathname === "/api/run") {
 				if (
 					typeof input.objective !== "string" ||

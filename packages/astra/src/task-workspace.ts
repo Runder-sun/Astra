@@ -325,6 +325,7 @@ export async function freezeEvidenceFiles(
 	task: TaskPacket,
 	refs: string[],
 	boundSources?: OutputRef[],
+	inheritedEvidence?: Evidence,
 ): Promise<EvidenceFileVersion[]> {
 	const projectRoot = resolve(task.scope.workspaceRoot);
 	let manifest: WorkerOutputManifest | undefined;
@@ -338,8 +339,16 @@ export async function freezeEvidenceFiles(
 	const files: EvidenceFileVersion[] = [];
 	for (const sourceRef of new Set(refs)) {
 		const receipt = sourceReceiptFilename(sourceRef);
+		const binding = boundSources?.find((ref) => ref.kind === "source" && ref.ref === sourceRef);
+		const inherited = inheritedEvidence?.refs.includes(sourceRef)
+			? inheritedEvidence.files?.find((file) => file.sourceRef === sourceRef)
+			: undefined;
+		if (inherited && (!receipt || !binding || binding.sha256 === inherited.sha256)) {
+			await readVersionedFile(task, inheritedEvidence!, sourceRef, "", "");
+			files.push({ ...inherited });
+			continue;
+		}
 		if (receipt) {
-			const binding = boundSources?.find((ref) => ref.kind === "source" && ref.ref === sourceRef);
 			if (binding && !binding.sha256) throw new Error(`source snapshot binding is missing: ${sourceRef}`);
 			const snapshot = await readSourceReceipt(projectRoot, task.jobId, sourceRef, binding?.sha256);
 			if (!snapshot) throw new Error(`source requires an intact retrieval receipt: ${sourceRef}`);
@@ -386,6 +395,13 @@ export async function readVersionedFile(
 	if (!content || createHash("sha256").update(content).digest("hex") !== file.sha256)
 		throw new Error(`evidence version integrity failure: ${sourceRef}`);
 	return content;
+}
+
+function evidenceBundleFilePath(sourceRef: string, source: string, workspace: string): string {
+	// Inherited references keep their identity without using another task's relative path.
+	return isInside(workspace, source)
+		? relative(workspace, source)
+		: join("files", createHash("sha256").update(sourceRef).digest("hex"), basename(source));
 }
 
 async function writeEvidenceFile(root: string, path: string, content: Buffer): Promise<void> {
@@ -528,15 +544,22 @@ async function materializeInputFiles(
 			if (!source) continue;
 			const content = await readVersionedFile(task, evidence, sourceRef, source, allowedRoot);
 			if (!content) continue;
-			const path = join("inputs", artifactRef, receipt ? join("sources", receipt) : relative(sourceRoot, source))
+			const path = join(
+				"inputs",
+				artifactRef,
+				receipt ? join("sources", receipt) : evidenceBundleFilePath(sourceRef, source, sourceRoot),
+			)
 				.split("\\")
 				.join("/");
+			const sha256 = createHash("sha256").update(content).digest("hex");
+			if (inputs.some((file) => file.path === path && (file.sourceRef !== sourceRef || file.sha256 !== sha256)))
+				throw new Error(`conflicting input file bindings: ${path}`);
 			await writeEvidenceFile(workspace, path, content);
 			inputs.push({
 				artifactId: artifactRef,
 				sourceRef,
 				path,
-				sha256: createHash("sha256").update(content).digest("hex"),
+				sha256,
 			});
 		}
 	}
@@ -731,6 +754,8 @@ async function collectReviewEvidenceBundle(
 		const copyKey = `${sourceRef}\0${sha256}`;
 		if (copiedSources.has(copyKey)) return;
 		if (sourceReceiptFilename(originalRef)) path = join("sources", sha256, basename(path));
+		if (bundle.some((file) => file.path === path && (file.sourceRef !== sourceRef || file.sha256 !== sha256)))
+			throw new Error(`conflicting review file bindings: ${path}`);
 		if (publish) await writeEvidenceFile(reviewRoot, path, content);
 		copiedSources.add(copyKey);
 		bundle.push({
@@ -751,7 +776,7 @@ async function collectReviewEvidenceBundle(
 				source,
 				sourceWorkspace,
 				sourceRef,
-				join("evidence", evidence.id, relative(sourceWorkspace, source)),
+				join("evidence", evidence.id, evidenceBundleFilePath(sourceRef, source, sourceWorkspace)),
 				evidence,
 			);
 	}
@@ -823,7 +848,9 @@ async function collectReviewEvidenceBundle(
 			}
 			const source = evidenceFileSource(projectRoot, upstreamWorkspace, sourceRef);
 			if (!source) continue;
-			const materializedRef = join("inputs", inputRef, relative(upstreamWorkspace, source)).split("\\").join("/");
+			const materializedRef = join("inputs", inputRef, evidenceBundleFilePath(sourceRef, source, upstreamWorkspace))
+				.split("\\")
+				.join("/");
 			await copyIntoBundle(source, upstreamWorkspace, materializedRef, materializedRef, upstreamEvidence, sourceRef);
 		}
 	}

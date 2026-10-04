@@ -38,6 +38,7 @@ import {
 	taskRecoveryMaterials,
 	taskResourcePath,
 } from "./task-workspace.ts";
+import { textTail } from "./text-tail.ts";
 import type {
 	CandidateEvaluation,
 	CanonicalArtifact,
@@ -429,7 +430,7 @@ export class PiChildSessionRunner {
 			};
 			child.stdout.on("data", (chunk: Buffer) => {
 				const value = decoder.write(chunk);
-				stdout = `${stdout}${value}`.slice(-this.maxOutputBytes);
+				stdout = textTail(`${stdout}${value}`, this.maxOutputBytes);
 				lineBuffer += value;
 				let end = lineBuffer.indexOf("\n");
 				while (end !== -1) {
@@ -440,10 +441,10 @@ export class PiChildSessionRunner {
 			});
 			child.stderr.setEncoding("utf8");
 			child.stderr.on("data", (value: string) => {
-				stderr = `${stderr}${value}`.slice(-this.maxOutputBytes);
+				stderr = textTail(`${stderr}${value}`, this.maxOutputBytes);
 			});
 			child.stdin.on("error", (error) => {
-				stderr = `${stderr}Pi child stdin error: ${error.message}`.slice(-this.maxOutputBytes);
+				stderr = textTail(`${stderr}Pi child stdin error: ${error.message}`, this.maxOutputBytes);
 			});
 			child.stdin.end(prompt);
 			child.on("error", (error) => {
@@ -455,7 +456,7 @@ export class PiChildSessionRunner {
 			});
 			child.on("close", (exitCode) => {
 				const remainder = decoder.end();
-				stdout = `${stdout}${remainder}`.slice(-this.maxOutputBytes);
+				stdout = textTail(`${stdout}${remainder}`, this.maxOutputBytes);
 				recordLine(`${lineBuffer}${remainder}`);
 				lineBuffer = "";
 				untrackChild(child);
@@ -589,7 +590,7 @@ export class PiWorkerAdapter implements ResearchWorkerAdapter {
 			if (failureLog !== retainedSessionFile)
 				await writeFile(
 					failureLog,
-					`${JSON.stringify({ taskId: task.id, attempt: task.attempt, exitCode: result.exitCode, error: error.slice(-4096), stdoutTail: result.stdout.slice(-4096), stderrTail: result.stderr.slice(-4096) })}\n`,
+					`${JSON.stringify({ taskId: task.id, attempt: task.attempt, exitCode: result.exitCode, error: textTail(error, 4096), stdoutTail: textTail(result.stdout, 4096), stderrTail: textTail(result.stderr, 4096) })}\n`,
 					"utf8",
 				);
 			return failureLog;

@@ -5,9 +5,20 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
+function physicalSource(path, directory = false) {
+	const parts = path.split("/");
+	let current = root;
+	for (const [index, part] of parts.entries()) {
+		current = join(current, part);
+		const metadata = lstatSync(current);
+		if (metadata.isSymbolicLink() || (index < parts.length - 1 || directory ? !metadata.isDirectory() : !metadata.isFile()))
+			throw new Error(`Non-regular file or directory requires review: ${path}`);
+		if (index === parts.length - 1) return metadata;
+	}
+}
 const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root }).toString().trim();
 const packagePath = join(root, "packages/astra/package.json");
-if (!lstatSync(packagePath).isFile()) throw new Error("Non-regular file requires review: packages/astra/package.json");
+physicalSource("packages/astra/package.json");
 const packageBytes = readFileSync(packagePath);
 const { version } = JSON.parse(packageBytes.toString("utf8"));
 const target = resolve(process.argv[2] ?? join(root, `.artifacts/astra-v${version}/source`));
@@ -50,10 +61,15 @@ const commitFiles = new Map(execFileSync("git", ["ls-tree", "-rz", baseCommit], 
 const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: root }).toString().split("\0").filter(Boolean);
 const added = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z", "packages/astra", "scripts", "docs", ".github", ...rootFiles], { cwd: root }).toString().split("\0").filter(Boolean);
 // Offline compilation needs the validated catalog data normally excluded by Git.
-execFileSync(process.execPath, ["packages/ai/scripts/check-model-data.ts"], { cwd: root, stdio: "inherit" });
+for (const path of ["packages/ai/scripts/check-model-data.ts", "packages/ai/scripts/model-data.ts", "packages/ai/src/models.generated.ts"])
+	physicalSource(path);
+physicalSource("packages/ai/src/providers", true);
+physicalSource("packages/ai/src/providers/data", true);
 const modelData = readdirSync(join(root, "packages/ai/src/providers/data"))
 	.filter((name) => name.endsWith(".json"))
 	.map((name) => `packages/ai/src/providers/data/${name}`);
+for (const path of modelData) physicalSource(path);
+execFileSync(process.execPath, ["packages/ai/scripts/check-model-data.ts"], { cwd: root, stdio: "inherit" });
 const paths = [...new Set([...tracked, ...added, ...modelData])]
 	.filter((path) => selected(path) && existsSync(join(root, path)))
 	.sort();
@@ -66,8 +82,7 @@ const staging = mkdtempSync(join(stagingParent, `.${basename(target)}.stage-`));
 try {
 	for (const path of paths) {
 		const source = join(root, path);
-		const metadata = lstatSync(source);
-		if (!metadata.isFile()) throw new Error(`Non-regular file requires review: ${path}`);
+		const metadata = physicalSource(path);
 		const bytes = path === "packages/astra/package.json" ? packageBytes : readFileSync(source);
 		if (forbidden.test(bytes.toString())) throw new Error(`Potential private data requires review: ${path}`);
 		const mode = metadata.mode & 0o777;
