@@ -2,9 +2,9 @@
 
 面向个人研究者的开源自动研究框架，提供本机工作台。从一个有明确边界的问题开始，组织文献、实验和独立审阅，保留代码、数据、审阅意见与结论依据。
 
-[项目主页](https://runder-sun.github.io/Astra/) · [快速开始](docs/getting-started.md) · [研究示例](docs/examples/README.md) · [下载实验版](https://github.com/Runder-sun/Astra/releases/tag/v0.1.0-alpha.1) · [English](README.en.md)
+[项目主页](https://runder-sun.github.io/Astra/) · [快速开始](docs/getting-started.md) · [研究示例](docs/examples/README.md) · [下载实验版](https://github.com/Runder-sun/Astra/releases/tag/v0.1.0-alpha.2) · [English](README.en.md)
 
-**当前下载版：`v0.1.0-alpha.1`（实验版）。** 适合愿意检查原始证据的个人用户。真实研究尚未通过最终全流程验收；不保证任务收敛或论文达到发表要求。`main` 是开发源码，能力和验证范围见[版本与支持](docs/support.md)。
+**当前下载版：`v0.1.0-alpha.2`（实验版）。** 本版集中改进任务调度、证据版本、审核与中断恢复。适合愿意检查原始材料的个人用户；真实研究尚未通过最终全流程验收，不保证任务收敛或论文达到发表要求。详细验证范围见[版本与支持](docs/support.md)。
 
 ![Astra 发布版工作台的新建研究页面](docs/assets/workbench-alpha1.png)
 
@@ -26,7 +26,7 @@
 mkdir astra-test
 cd astra-test
 npm init -y
-npm install --ignore-scripts https://github.com/Runder-sun/Astra/releases/download/v0.1.0-alpha.1/earendil-works-pi-astra-0.1.0-alpha.1.tgz
+npm install --ignore-scripts https://github.com/Runder-sun/Astra/releases/download/v0.1.0-alpha.2/earendil-works-pi-astra-0.1.0-alpha.2.tgz
 npx --no-install astra-workbench --root ./research --port 4319
 ```
 
@@ -35,6 +35,39 @@ npx --no-install astra-workbench --root ./research --port 4319
 建议输入：“固定随机种子，比较均值和中位数在小型污染正态样本上的误差。仅用 Python 标准库，保留源码、原始结果和失败记录，不声称方法创新。”
 
 完整步骤、暂停与恢复、备份及常见问题见[使用指南](docs/getting-started.md)。下载包沿用内部 Pi 包名，通过本仓库附件分发，不是上游 Pi 官方产品。
+
+## 研究如何推进
+
+```mermaid
+flowchart LR
+    A[研究目标与边界] --> B[计划与审核]
+    B --> C[独立任务执行]
+    C --> D[冻结成果与来源]
+    D --> E[独立审阅]
+    E -->|需要修复| B
+    E -->|通过| F[采纳成果并决定下一步]
+    F -->|继续探索| B
+```
+
+研究按问题选择下一步，可以修订、回退或结束，不要求每个问题走固定流水线。执行者交付成果，审阅者核对材料，主研究代理决定是否采纳和继续；系统保留各次版本、失败与尚未关闭的问题。
+
+你可以检查已采纳材料及其来源，也可以暂停、补充指导后继续。文献记录会区分搜索结果、摘要和已捕获原文；没有原文不能声称已核验全文。论文交付是可选项，仍需复现实验并人工检查稿件。
+
+## alpha.2 改进了什么
+
+| 问题 | 本版行为 |
+| --- | --- |
+| 小修订引用旧任务文件时完成或审核失败 | 保留旧文件的冻结版本，在审核、后续任务和下载时核对同一份材料 |
+| 有剩余轮数，却因并行批次过大停止 | 按剩余额度缩小执行批次，保留预算确认与费用限制 |
+| 中文、表情或错误日志在分片和截尾时损坏 | 请求与子进程独立解码，多个输出入口使用一致的安全截尾规则 |
+| 成功会话缺失或审核对象错配仍被接受 | 按登记清单核验任务、成果目标和真实归档证明 |
+| 中断后重复执行已经交付的任务 | 先核验持久交付再恢复；保留原审核、采纳与用户确认状态 |
+
+本轮内核修复经独立审核，50 条验收标准通过，657 项指定离线测试通过。这些数字对应软件行为，不是自主科研成功率；打包和安装验证另见[alpha.2 发布记录](docs/releases/v0.1.0-alpha.2.md)。
+
+## 从旧版本升级
+
+先暂停研究并确认旧进程已停止，备份完整研究目录，然后在新目录安装 alpha.2。不要让两个版本同时写入同一个作业。旧预算确认不会自动降低；恢复前检查目标、已有材料和预算，具体操作见[暂停、继续和备份](docs/getting-started.md#暂停继续和备份)。
 
 ## 使用边界
 

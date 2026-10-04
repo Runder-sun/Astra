@@ -2,14 +2,14 @@
 
 [返回项目首页](../README.md) · [版本与支持](support.md)
 
-本页默认安装已发布的 **v0.1.0-alpha.1**。开发源码使用另一套[开发步骤](development/README.md)，不要混用源码命令和已安装的程序。
+本页默认安装已发布的 **v0.1.0-alpha.2**。开发源码使用另一套[开发步骤](development/README.md)，不要混用源码命令和已安装的程序。
 
 ## 环境要求
 
 | 项目 | 要求与验证范围 |
 | --- | --- |
 | 系统 | 当前验证范围为 Linux；macOS 和 Windows 尚未验证 |
-| Node.js | 声明最低 22.19；原始 alpha.1 发布在 25.9.0 验证，后续检查见[版本与支持](support.md) |
+| Node.js | 最低 22.19；alpha.2 已验证 22.19.0 下独立安装与工作台启动，源码检查另见[版本与支持](support.md) |
 | npm | 用于安装固定版本附件 |
 | 模型账号 | 工作台使用已登录的官方 Codex CLI；需账号具有 Codex 使用权限 |
 | CLI 与模型 | 历史真实验证：Codex CLI 0.153.4、gpt-5.6-luna；不代表其他版本或账号都可用 |
@@ -26,11 +26,11 @@
 mkdir astra-test
 cd astra-test
 npm init -y
-npm install --ignore-scripts https://github.com/Runder-sun/Astra/releases/download/v0.1.0-alpha.1/earendil-works-pi-astra-0.1.0-alpha.1.tgz
+npm install --ignore-scripts https://github.com/Runder-sun/Astra/releases/download/v0.1.0-alpha.2/earendil-works-pi-astra-0.1.0-alpha.2.tgz
 npx --no-install astra-workbench --root ./research --port 4319
 ```
 
-在本机普通浏览器打开 `http://127.0.0.1:4319`。保留安装生成的 `package-lock.json`，便于以后恢复相同依赖。也可从[发布页](https://github.com/Runder-sun/Astra/releases/tag/v0.1.0-alpha.1)手动下载 tgz 和 SHA256SUMS，校验后将安装命令中的网址换为下载文件的绝对路径。
+在本机普通浏览器打开 `http://127.0.0.1:4319`。保留安装生成的 `package-lock.json`，便于以后恢复相同依赖。也可从[发布页](https://github.com/Runder-sun/Astra/releases/tag/v0.1.0-alpha.2)手动下载 tgz 和 SHA256SUMS，校验后将安装命令中的网址换为下载文件的绝对路径。
 
 ## 第一次研究
 

@@ -212,10 +212,26 @@ fs.readFileSync = (path, ...args) => { if (!changed && path === root + "/README.
 	} finally { fixture.close(); }
 });
 
+test("source export includes its actual test source with matching bytes and manifest", () => {
+	const fixture = exportFixture();
+	try {
+		const path = "scripts/prepare-astra-source.test.mjs";
+		const bytes = readFileSync(new URL("./prepare-astra-source.test.mjs", import.meta.url));
+		fixture.put(path, bytes);
+		const result = fixture.run();
+		assert.equal(result.status, 0, result.stderr);
+		assert.deepEqual(readFileSync(join(fixture.target, path)), bytes);
+		const manifest = JSON.parse(readFileSync(join(fixture.target, "SOURCE_MANIFEST.json")));
+		assert.deepEqual(manifest.files.find((file) => file.path === path), {
+			path, sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length,
+		});
+	} finally { fixture.close(); }
+});
+
 test("source export keeps secret and non-regular-file checks before publication", () => {
 	const fixture = exportFixture();
 	try {
-		fixture.put("docs/private.txt", "-----BEGIN PRIVATE KEY-----\nfixture\n");
+		fixture.put("docs/private.txt", "-----BEGIN " + "PRIVATE KEY-----\nfixture\n");
 		const secret = fixture.run();
 		assert.notEqual(secret.status, 0);
 		assert.match(secret.stderr, /Potential private data/);

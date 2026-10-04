@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-10-04
+
 ### Changed
 
 - Supervisor ownership now uses `supervisor.lock.d` with the existing journal directory-lock protocol. Stop old versions before upgrading; concurrent old and new versions writing the same job are unsupported. Legacy `supervisor.lock` files are checked without deleting or renaming them; unknown owners fail explicitly.
@@ -11,6 +13,13 @@
 - Separated Astra packaging and source export from upstream release commands.
 
 ### Fixed
+
+- Incremental deliveries inherit exact frozen files across completion, recovery, review, downstream inputs and download; conflicting material paths are rejected.
+- Worker batches use remaining turn capacity while retaining cost limits, atomic task registration and historical budget gates.
+- HTTP requests and child streams preserve split UTF-8 text; Pi, Codex and workbench diagnostics share safe bounded Unicode tails.
+- Source export validates every physical path before reading manifests, model inputs or selected files.
+- Source export includes its regression tests without treating a synthetic private-key fixture as leaked data; runtime secret checks remain unchanged.
+- Pi session audits verify registered successful deliveries, reviewer targets, main-call history and exact completed cleanup archives without modifying the job.
 
 - Canonical adoption verifies saved content and receipts before activation; completed reviewer deliveries recover from frozen packages before retry or error handling.
 - JSONL journals preserve complete events without a trailing newline and tolerate only a syntactically valid incomplete EOF fragment on reads. The existing journal write lock repairs that tail before committing; direct append refuses a tail requiring repair. Complete corruption and sequence or job-ID mismatches remain errors.
